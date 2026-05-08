@@ -1,0 +1,1617 @@
+# pg_eddy — Implementation Plan
+
+## 1. Project Overview
+
+**pg_eddy** is a PostgreSQL 18 extension written in Rust using pgrx 0.18 that
+implements a high-performance native Labelled Property Graph (LPG) store. Its
+distinguishing features are a **custom Table Access Method** (AM) that stores
+nodes and edges in a layout optimised for graph traversal, a native
+**OpenCypher** query engine targeting the openCypher TCK conformance suite,
+and first-class **incremental view maintenance** via the
+[pg-trickle](https://github.com/trickle-labs/pg-trickle) companion extension.
+
+The design goal is to offer Neo4j-class graph traversal performance while
+remaining a fully transactional, MVCC-safe PostgreSQL extension that can be
+operated with standard PostgreSQL tooling (pg_dump, pg_restore, EXPLAIN,
+PgBouncer, CNPG).
+
+### Design Principles
+
+- **Graph-first storage**: the custom AM places adjacency information adjacent
+  to node data on disk, enabling O(degree) neighbour iteration without index
+  lookups for the common case
+- **OpenCypher conformance**: the query engine is spec-first; every supported
+  feature is validated against the official openCypher TCK
+- **PostgreSQL-native**: leverage MVCC, WAL, parallel query, AIO (PG18), and
+  the full extension ecosystem; never duplicate what PostgreSQL already does
+  well
+- **Safe Rust first**: `unsafe` only at FFI boundaries required by the AM and
+  pgrx C-interop; all query and storage logic in safe Rust
+- **Incremental adoption**: each release is independently useful; advanced
+  features layer progressively on a stable core
+- **pg-trickle as a first-class optional**: IVM-backed graph views are a key
+  product feature, not an afterthought
+
+### Target Users and Success Criteria
+
+**Target users**:
+1. Teams running PostgreSQL who need graph capabilities without operating a
+   separate Neo4j instance
+2. Applications requiring ACID transactions spanning both relational and graph
+   data in the same database
+3. Teams using pg-trickle who want incrementally-maintained graph views (live
+   friend recommendations, fraud pattern monitors, dependency graphs)
+4. Environments where operational simplicity matters: single backup procedure,
+   single monitoring stack, single connection pool
+
+**Why pg_eddy over Apache AGE?**
+- AGE stores properties as JSONB — typed property comparisons require JSONB
+  extraction rather than direct binary comparison
+- AGE uses heap tables with B-tree indexes for traversal — multi-hop MATCH is
+  O(k × log N) per hop; pg_eddy's adjacency-follow is O(degree) per hop
+- AGE has no incremental view maintenance story
+- AGE TCK compliance has known gaps in temporal types, null semantics, and
+  subquery handling
+
+**Why pg_eddy over a standalone Neo4j for some users?**
+- One system to operate instead of two: one backup, one monitoring stack, one
+  connection pool
+- Full ACID transactions spanning graph and relational data in the same
+  transaction
+- pg-trickle IVM for incrementally-maintained graph views with no equivalent
+  in Neo4j
+
+**Honest benchmark expectations**: every adjacency-follow hop in pg_eddy goes
+through PostgreSQL's buffer manager (`ReadBuffer` + `LockBuffer` + slot read +
+`ReleaseBuffer`). Neo4j's native store uses memory-mapped files with direct
+byte-offset arithmetic. The structural per-hop cost is real:
+- For graphs that fit in `shared_buffers`: expect 5–10× slower than Neo4j on
+  pure traversal microbenchmarks
+- For I/O-bound graphs (larger than shared_buffers): both systems are I/O-
+  dominated; the gap narrows to 2–3×
+- vs AGE and other heap-based PostgreSQL graph tools: adjacency-follow should
+  be 2–5× faster on multi-hop MATCH patterns starting from a known node
+
+**Success at v1.0**:
+- ≥95% openCypher TCK pass rate; deviations documented with upstream references
+- Adjacency-follow measurably faster than AGE on LDBC SNB multi-hop queries;
+  published baselines with hardware, dataset size, and raw output
+- pg-trickle DIFFERENTIAL and IMMEDIATE graph views pass a 72-hour soak test
+  with zero drift
+- `pg_dump`/restore round-trip lossless on 10M+ node graphs
+- `pg_eddy.health_check()` returns OK on a clean install
+- Docker image and CNPG extension image published
+
+---
+
+## 2. Technology Stack
+
+| Layer | Technology |
+|---|---|
+| Language | Rust (Edition 2024) |
+| PG binding | `pgrx` 0.18 (`pg18` feature flag) |
+| PostgreSQL | 18.x (primary target) |
+| Cypher parser | Custom recursive-descent parser in Rust (`src/cypher/parser.rs`) |
+| Cypher IR | In-house algebra IR (`src/cypher/algebra.rs`) |
+| Property encoding | Compact binary format: type-tagged values inlined up to 48 bytes, overflow to property store |
+| Hashing | `xxhash-rust` (XXH3-64) — node/edge ID generation, internal dedup |
+| Serialization | `serde` + `serde_json` — query results, error reports, config |
+| Testing | pgrx `#[pg_test]`, `cargo pgrx regress`, `proptest`, `cargo-fuzz`, openCypher TCK harness |
+| IVM (optional) | `pg_trickle` — stream tables, incremental graph view maintenance |
+| Benchmarks | `criterion` — micro-benchmarks; custom harness vs. Neo4j Community for end-to-end |
+
+---
+
+## 3. Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     Client Layer                        │
+│  pgEddy.cypher(query, params)  │  SQL / SPI interface   │
+└───────────────────┬─────────────────────────────────────┘
+                    │
+┌───────────────────▼─────────────────────────────────────┐
+│              OpenCypher Query Engine                     │
+│  Lexer → Parser → AST → Logical Plan → Physical Plan    │
+│  Pattern rewriting · Filter pushdown · Index selection  │
+└───────────────────┬─────────────────────────────────────┘
+                    │
+┌───────────────────▼─────────────────────────────────────┐
+│               Native Graph Storage AM                   │
+│  Node Store (custom pages) │ Edge Store (CSR pages)     │
+│  Property Store (inline + overflow)                     │
+│  Label Index (B-tree)  │  Rel-type Index (B-tree)       │
+│  Property Index (B-tree per indexed property)           │
+└───────────────────┬─────────────────────────────────────┘
+                    │
+┌───────────────────▼─────────────────────────────────────┐
+│              Reactivity Layer (optional — pg_trickle)   │
+│  Graph stream tables: MATCH views, path aggregates      │
+│  IVM engine · DAG scheduler · CDC change capture        │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. LPG Data Model
+
+### 4.1 Nodes
+
+A **node** has:
+- A globally unique `node_id BIGINT` (dense sequential integer from a shared
+  sequence)
+- Zero or more **labels** (string set, stored compactly as integer label IDs)
+- A **property map**: a set of typed key-value pairs
+
+### 4.2 Relationships (Edges)
+
+A **relationship** has:
+- A globally unique `rel_id BIGINT`
+- A **type** (single string; stored as integer type ID)
+- A directed `(source_node_id, target_node_id)` pair
+- A **property map** identical in structure to node properties
+
+### 4.3 Properties
+
+Properties are typed values. Supported types (aligned with the openCypher type
+system):
+- `Integer` (64-bit signed)
+- `Float` (64-bit IEEE 754)
+- `Boolean`
+- `String` (UTF-8, unbounded length; inlined up to 48 bytes, overflow to
+  property store pages)
+- `Date`, `LocalTime`, `LocalDateTime`, `DateTime`, `Duration`
+- `Point` (2D/3D; backed by PostGIS `geometry` when available, binary fallback)
+- `List` of any uniform type
+- `Map` (nested, for complex sub-structures)
+- `Null`
+
+Properties are encoded as a compact binary array, not JSONB, to minimise storage
+overhead and enable direct numeric comparisons without decode.
+
+### 4.4 Catalogs
+
+Two catalog tables (in the `_pg_eddy` internal schema) store the label and type
+string registries:
+
+```sql
+CREATE TABLE _pg_eddy.label_registry (
+    label_id   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name       TEXT   NOT NULL UNIQUE
+);
+
+CREATE TABLE _pg_eddy.rel_type_registry (
+    type_id    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name       TEXT   NOT NULL UNIQUE
+);
+
+CREATE TABLE _pg_eddy.property_key_registry (
+    key_id     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name       TEXT   NOT NULL UNIQUE
+);
+```
+
+These are small, warmed into shared_buffers at `_PG_init`, and cached in a
+per-backend `HashMap<String, i64>` (label/type names → IDs).
+
+---
+
+## 5. Custom Storage Access Method
+
+> **Design constraint**: The custom AM is the foundation of pg_eddy from
+> v0.1.0. There is no heap-based prototype phase — if the AM cannot be made to
+> work correctly with PostgreSQL's MVCC, WAL, buffer management, and
+> pg-trickle CDC, the project stops. All phases build on a working custom AM.
+> `shared_preload_libraries = 'pg_eddy'` is required from v0.1.0.
+
+### 5.1 Motivation
+
+PostgreSQL's heap AM stores tuples in pages with no awareness of graph
+topology. A neighbour-iteration query (`MATCH (n)-[r]->(m) WHERE id(n) = $1`)
+on a heap store requires an index scan on the edge table (O(log N + degree)),
+followed by degree random reads for the target nodes. On a 100 M-edge graph
+with average degree 20, this is 20 index lookups per hop.
+
+Neo4j's native graph storage achieves O(degree) per-hop by storing each node
+with a pointer to its first relationship record, and each relationship record
+with forward/backward pointers forming a doubly-linked list per node. Following
+the list requires sequential reads of fixed-size records — cache-friendly and
+predictable.
+
+pg_eddy's AM adapts this insight to PostgreSQL's page-based architecture while
+preserving full MVCC semantics.
+
+### 5.2 Page Formats
+
+#### 5.2.1 Node Pages (`PGAT_NODE`)
+
+Each node page (8 KB) is split into **two physically distinct regions** to
+solve the MVCC adjacency-pointer update problem: storing adjacency head
+pointers inside an MVCC-versioned node record means every edge insert creates
+a new node tuple version. On a high-degree node (1M edges), this causes severe
+tuple bloat and VACUUM pressure. The split avoids this entirely.
+
+**Region 1 — Adjacency Header Array** (at page start, fixed-size, NOT
+MVCC-versioned): one 20-byte entry per node slot on the page. Updated
+**in-place under exclusive buffer lock** when edges are inserted or deleted —
+WAL-logged as a compact `XLOG_PG_EDDY_ADJ_UPDATE` record (~28 bytes). Never
+creates new tuple versions.
+
+```
+┌─────────────────────────────────────────────────┐  ← page offset 0
+│ adj[0]: out_head_pg(4) out_head_sl(2)           │
+│         in_head_pg(4)  in_head_sl(2)            │
+│         out_degree(4)  in_degree(4)   20 B/entry│
+│ adj[1]: ...                                     │
+│ adj[N-1]: ...                                   │
+└─────────────────────────────────────────────────┘  ← offset N×20
+```
+
+**Region 2 — MVCC Node Records** (variable-length, standard MVCC visibility
+via `HeapTupleIsVisible`):
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ xmin (4B) │ xmax (4B) │ infomask (2B) │ infomask2 (2B)   │
+│ node_id (8B) │ adj_header_idx (2B)                       │
+│ label_count (1B) │ prop_inline_len (2B)                  │
+│ prop_overflow_page (4B)                                  │
+│ label_ids[label_count × 4B]  (variable, max 32 labels)  │
+│ prop_inline_data[≤48B]                                   │
+└──────────────────────────────────────────────────────────┘
+```
+
+- `adj_header_idx`: index into Region 1 for this node's adjacency heads.
+  Written once at node creation; never changes across property/label updates
+  (which create new MVCC versions of Region 2 only).
+- `prop_inline_data`: up to 48 bytes of encoded properties (see §5.3); if
+  properties exceed 48 bytes, `prop_overflow_page` points to a Property
+  Overflow Page.
+
+**Why this split matters**: inserting an edge updates only two adjacency
+headers (in-place, ~28 bytes WAL each), never the MVCC node records. A
+high-degree node (1M edges) does not cause tuple bloat when new edges are
+added. Updating node properties creates a new MVCC version of Region 2 only,
+leaving adjacency headers untouched.
+
+Node pages are allocated by `pg_eddy_node_am`.
+
+#### 5.2.2 Edge Pages (`PGAT_EDGE`)
+
+Each edge page packs **edge slot records**:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ xmin (4B) │ xmax (4B) │ infomask (2B) │ infomask2 (2B)       │
+│ rel_id (8B) │ rel_type_id (4B)                               │
+│ source_node_id (8B) │ target_node_id (8B)                    │
+│ prev_out_page (4B) │ prev_out_slot (2B)                      │
+│ next_out_page (4B) │ next_out_slot (2B)                      │
+│ prev_in_page  (4B) │ prev_in_slot  (2B)                      │
+│ next_in_page  (4B) │ next_in_slot  (2B)                      │
+│ prop_inline_len (2B) │ prop_overflow_page (4B)               │
+│ prop_inline_data[48B]                                        │
+└──────────────────────────────────────────────────────────────┘
+```
+
+- `prev_out_*/next_out_*`: doubly-linked list of all outgoing edges of
+  `source_node_id`; the head is stored in the source node's
+  `out_edge_first_page`/`out_edge_first_slot`
+- `prev_in_*/next_in_*`: doubly-linked list of all incoming edges of
+  `target_node_id`
+- The doubly-linked-list design allows O(1) edge deletion (unlink without
+  scanning) and O(degree) neighbour iteration with no additional index lookup
+
+#### 5.2.3 Property Overflow Pages (`PGAT_PROP`)
+
+When a node or edge has properties exceeding 48 bytes, the inline portion is
+the first 48 bytes and `prop_overflow_page` points to a chain of property
+overflow pages:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ owner_id (8B) │ owner_type (1B: NODE=0, REL=1)             │
+│ next_overflow_page (4B)                                     │
+│ prop_data[8K − 13B]                                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+- Pages are chained; a single property chain is bounded by
+  `pg_eddy.max_property_chain_pages` GUC (default: 64, i.e. max ~500 KB per
+  entity)
+
+### 5.3 Property Binary Encoding
+
+Properties are stored as a packed array of typed value cells:
+
+```
+[key_id: 4B][type_tag: 1B][value: variable]...
+```
+
+Type tags and value encodings:
+
+| Tag | Type | Encoding |
+|---|---|---|
+| `0x01` | `Integer` | 8-byte little-endian signed |
+| `0x02` | `Float` | 8-byte IEEE 754 little-endian |
+| `0x03` | `Boolean` | 1 byte (`0x00` = false, `0x01` = true) |
+| `0x04` | `String ≤ 255B` | 1-byte length prefix + UTF-8 bytes |
+| `0x05` | `String > 255B` | 4-byte length prefix + UTF-8 bytes |
+| `0x06` | `Date` | 4-byte days since Unix epoch |
+| `0x07` | `LocalDateTime` | 8-byte microseconds since Unix epoch |
+| `0x08` | `DateTime` | 8-byte UTC microseconds + 2-byte TZ offset |
+| `0x09` | `Duration` | 16 bytes (months: 4B, days: 4B, nanos: 8B) |
+| `0x0A` | `Point2D` | 4-byte SRID + 8B X + 8B Y |
+| `0x0B` | `Point3D` | 4-byte SRID + 8B X + 8B Y + 8B Z |
+| `0x0C` | `List` | 4-byte element count + elements (recursive encoding) |
+| `0x0D` | `Map` | 4-byte pair count + (key_id 4B + value recursive) pairs |
+| `0x0E` | `Null` | 0 bytes of payload |
+
+This encoding avoids JSONB parse overhead for numeric comparisons and type
+checks in Cypher `WHERE` clauses.
+
+### 5.4 Table AM Registration
+
+The AM is registered in `_PG_init` via a raw `TableAmRoutine` struct:
+
+```rust
+// src/storage/am.rs
+static NODE_AM_ROUTINES: TableAmRoutine = TableAmRoutine {
+    type_: NodeTag::T_TableAmRoutine,
+    slot_callbacks:    pg_eddy_slot_callbacks,
+    scan_begin:        pg_eddy_scan_begin,
+    scan_end:          pg_eddy_scan_end,
+    scan_rescan:       pg_eddy_scan_rescan,
+    scan_getnextslot:  pg_eddy_scan_getnextslot,
+    // ... MVCC, tuple insert/update/delete, index build callbacks
+};
+```
+
+The `pg_eddy` extension creates two AM objects at `CREATE EXTENSION` time:
+
+```sql
+CREATE ACCESS METHOD pg_eddy_node TYPE TABLE HANDLER pg_eddy_node_handler;
+CREATE ACCESS METHOD pg_eddy_edge TYPE TABLE HANDLER pg_eddy_edge_handler;
+```
+
+Internal node and edge heap tables are then created `USING pg_eddy_node` and
+`USING pg_eddy_edge` respectively.
+
+**pgrx interop**: The AM callbacks are `unsafe extern "C"` functions written in
+Rust, exposing `pg_sys` types directly. Safe wrappers in `src/storage/am.rs`
+validate all pointers before use. This is the primary `unsafe` boundary in the
+codebase.
+
+### 5.5 MVCC and WAL
+
+**MVCC visibility**: pg_eddy uses PostgreSQL's standard visibility rules.
+`xmin`/`xmax`/`infomask*` fields in MVCC node/edge records are written and
+interpreted identically to heap tuples via `HeapTupleIsVisible()`. Adjacency
+headers (§5.2.1) are not MVCC-versioned — they reflect the current structural
+state; dead edges in the adjacency list are filtered during traversal by
+checking each edge slot's MVCC visibility.
+
+**WAL — custom resource manager, not GenericXLog**: pg_eddy registers a
+custom WAL resource manager via `RegisterCustomRmgr()` (available since PG14,
+well-supported in PG18). `GenericXLogStart`/`GenericXLogFinish` is explicitly
+rejected: it logs entire 8 KB pages. A single edge insert would produce ~24 KB
+of WAL (edge page + two adjacency-header page images) — roughly 400× more
+than necessary. Custom records are 28–200 bytes per operation.
+
+Custom WAL record types (`src/storage/wal_records.rs`):
+
+| Record type | Payload | Typical size |
+|---|---|---|
+| `XLOG_PG_EDDY_NODE_INSERT` | page_id, slot_idx, node_id, label_ids[], prop_data[] | 80–200 B |
+| `XLOG_PG_EDDY_NODE_UPDATE_PROPS` | page_id, slot_idx, new_prop_data[] | 50–200 B |
+| `XLOG_PG_EDDY_NODE_DELETE` | page_id, slot_idx, xmax, xmax_xid | 30 B |
+| `XLOG_PG_EDDY_EDGE_INSERT` | page_id, slot_idx, full edge slot | 100 B |
+| `XLOG_PG_EDDY_EDGE_DELETE` | page_id, slot_idx, xmax, xmax_xid | 30 B |
+| `XLOG_PG_EDDY_ADJ_UPDATE` | node_page, adj_slot_idx, new_out_head (page+slot), new_in_head (page+slot) | 28 B |
+| `XLOG_PG_EDDY_LABEL_SET` | node_page, node_slot, new_label_ids[] | 20–80 B |
+
+Each record type has a redo function registered in the rmgr's `rm_redo`
+callback. Redo functions are pure page-level operations: pin buffer, apply
+delta, mark dirty, unpin.
+
+**Full-page writes (FPW)**: on the first write to a page after a checkpoint,
+PostgreSQL prepends the full page image to the WAL record. pg_eddy uses
+`XLogRegisterBuffer()` with `REGBUF_STANDARD` on all record types so FPW is
+handled correctly.
+
+**Logical decoding / CDC**: the WAL decode callback
+(`src/storage/wal_decode.rs`) intercepts pg_eddy WAL records and emits
+structured change events for pg-trickle's WAL-based CDC mode:
+- `NodeInserted { node_id, labels, properties }`
+- `NodeUpdated { node_id, changed_properties }`
+- `NodeDeleted { node_id }`
+- `EdgeInserted { rel_id, rel_type, source_node_id, target_node_id, properties }`
+- `EdgeDeleted { rel_id }`
+
+For trigger-based CDC (the pg-trickle default before `wal_level = logical` is
+confirmed available), see §7.2.
+
+### 5.6 Indexes
+
+pg_eddy registers standard PostgreSQL B-tree indexes on top of the custom AM:
+
+| Index | Key | Purpose |
+|---|---|---|
+| `idx_node_label` | `(label_id, node_id)` | MATCH by label |
+| `idx_rel_type_out` | `(rel_type_id, source_node_id)` | MATCH outgoing by type |
+| `idx_rel_type_in` | `(rel_type_id, target_node_id)` | MATCH incoming by type |
+| `idx_node_prop_{key}` | `(encoded_value, node_id)` | WHERE on indexed property |
+| `idx_rel_prop_{key}` | `(encoded_value, rel_id)` | WHERE on indexed relationship property |
+
+User-defined property indexes are created via:
+```sql
+SELECT pg_eddy.create_node_index('Person', 'email');
+SELECT pg_eddy.create_rel_index('FOLLOWS', 'since');
+```
+
+---
+
+## 6. OpenCypher Query Engine
+
+### 6.1 Parser (`src/cypher/parser.rs`)
+
+A hand-written recursive-descent parser that produces a concrete syntax tree
+(CST) and then lowers it to an abstract syntax tree (AST). The grammar follows
+the [openCypher Reference Grammar](https://s3.amazonaws.com/artifacts.opencypher.org/openCypher9.pdf)
+(the canonical grammar used by the TCK).
+
+Key parser choices:
+- No external parser generator; hand-written for predictable error messages and
+  easy integration with the Rust type system
+- Unicode-aware lexer: handles the full openCypher identifier character set
+  (including non-ASCII)
+- Error recovery: the parser records errors and attempts to continue to surface
+  multiple diagnostics in one pass
+- Lexer and parser are `#[cfg(test)]`-fuzzed from v0.4.0 (see §10.4)
+
+### 6.2 AST (`src/cypher/ast.rs`)
+
+```rust
+pub enum Expr {
+    Integer(i64),
+    Float(f64),
+    Boolean(bool),
+    Str(String),
+    Null,
+    Variable(String),
+    PropertyAccess { base: Box<Expr>, key: String },
+    FunctionCall { name: String, args: Vec<Expr>, distinct: bool },
+    BinaryOp { op: BinaryOp, left: Box<Expr>, right: Box<Expr> },
+    UnaryOp { op: UnaryOp, expr: Box<Expr> },
+    ListExpr(Vec<Expr>),
+    MapExpr(Vec<(String, Expr)>),
+    Pattern(NodePattern, Vec<RelChain>),
+    Case { operand: Option<Box<Expr>>, whens: Vec<(Expr, Expr)>, else_: Option<Box<Expr>> },
+    // ...
+}
+
+pub enum Clause {
+    Match  { pattern: Vec<Pattern>, optional: bool, where_: Option<Expr> },
+    Return { items: Vec<ReturnItem>, distinct: bool, order_by: Vec<OrderItem>, skip: Option<Expr>, limit: Option<Expr> },
+    With   { items: Vec<ReturnItem>, distinct: bool, where_: Option<Expr>, order_by: Vec<OrderItem>, skip: Option<Expr>, limit: Option<Expr> },
+    Create { pattern: Vec<Pattern> },
+    Merge  { pattern: Pattern, on_match: Vec<SetClause>, on_create: Vec<SetClause> },
+    Set    (Vec<SetClause>),
+    Remove (Vec<RemoveClause>),
+    Delete { expressions: Vec<Expr>, detach: bool },
+    Unwind { expr: Expr, alias: String },
+    Call   { procedure: String, args: Vec<Expr>, yield_: Option<Vec<YieldItem>> },
+    Foreach { variable: String, list: Expr, clauses: Vec<Clause> },
+    LoadCsv { url: Expr, alias: String, with_headers: bool, field_terminator: Option<Expr> },
+}
+```
+
+### 6.3 Logical Plan (`src/cypher/logical_plan.rs`)
+
+The AST is lowered to a relational algebra IR:
+
+- `Scan(NodeScan | RelScan | LabelScan | ...)` — leaf nodes
+- `Expand(dir: Dir, rel_type: Option<TypeSpec>)` — neighbour expansion
+- `Filter(expr)` — WHERE predicates
+- `Project(items)` — SELECT / WITH
+- `Aggregate(groups, aggregates)` — GROUP BY equivalent
+- `Sort(items)` / `Limit(n)` / `Skip(n)`
+- `Apply(lhs, rhs)` — correlated sub-pattern (for OPTIONAL MATCH etc.)
+- `Union(lhs, rhs, all: bool)`
+- `Unwind(expr, alias)`
+- `Create(pattern)` / `Merge(pattern, on_match, on_create)` / `Delete(exprs, detach)`
+- `Set(clauses)` / `Remove(clauses)`
+
+The planner applies rewrites in a fixed order:
+1. Label and type inference: propagate label constraints from WHERE into Scan nodes
+2. Predicate pushdown: move filter expressions as close to scan sources as possible
+3. Pattern decomposition: split complex patterns into binary joins
+4. **Node isomorphism enforcement**: for every pair of distinct node variables
+   in a single MATCH pattern, the SQL generator emits `a.node_id <> b.node_id`
+   inequality predicates. A pattern with N node variables produces N(N-1)/2
+   inequalities. This enforces the openCypher requirement that distinct node
+   variables cannot bind to the same node — omitting it produces subtly wrong
+   results on patterns like `MATCH (a)-->(b)-->(a)`. Relationship isomorphism
+   within a single path (no repeated relationship) is enforced separately in
+   variable-length paths via the `rel_ids` exclusion array (see §6.5).
+5. Variable-length path planning (see §6.5)
+
+### 6.4 Physical Plan and SQL Generation (`src/cypher/sql_gen.rs`)
+
+The physical planner selects execution strategies and emits SQL (executed via
+SPI):
+
+| Logical Operator | Physical Strategy | SQL Produced |
+|---|---|---|
+| `LabelScan(label, where)` | Index scan on `idx_node_label` | `SELECT ... FROM pg_eddy.nodes WHERE label_id = $1 AND ...` |
+| `Expand(OUT, type)` | Adjacency list follow or index | `JOIN pg_eddy.edges ON source = n.id WHERE type_id = $1` |
+| `Expand(ALL, *)` | Union of OUT + IN | `UNION ALL` of both directions |
+| `Filter(expr)` | SPI parameter binding | `WHERE <encoded_predicate>` |
+| `Aggregate` | PostgreSQL `GROUP BY` | Standard aggregate SQL |
+| `Sort/Limit/Skip` | PostgreSQL `ORDER BY` / `LIMIT` / `OFFSET` | Direct pushdown |
+| `VarLengthExpand` | `WITH RECURSIVE` CTE + CYCLE | See §6.5 |
+
+All user-supplied string values (node/rel properties used in comparisons) are
+passed as SPI bind parameters (`$N`), never interpolated into SQL text.
+SQL injection via Cypher property values is structurally impossible.
+
+### 6.5 Variable-Length Paths
+
+Cypher patterns like `(a)-[:KNOWS*1..5]->(b)` compile to bounded recursive CTEs:
+
+```sql
+WITH RECURSIVE path(start_id, end_id, rel_ids, depth) AS (
+    -- anchor
+    SELECT source, target, ARRAY[rel_id], 1
+    FROM   pg_eddy.edges
+    WHERE  source = $1 AND type_id = $knows_type_id
+  UNION ALL
+    -- recursive
+    SELECT p.start_id, e.target, p.rel_ids || e.rel_id, p.depth + 1
+    FROM   path p
+    JOIN   pg_eddy.edges e ON e.source = p.end_id
+    WHERE  e.type_id = $knows_type_id
+      AND  p.depth < $max_hops
+      AND  NOT (e.rel_id = ANY(p.rel_ids))   -- no repeated relationships
+)
+CYCLE end_id SET is_cycle USING path_ids
+SELECT start_id, end_id, rel_ids FROM path WHERE NOT is_cycle;
+```
+
+- PG18's `CYCLE` clause gives hash-based cycle detection (O(1) per step)
+- `NOT (e.rel_id = ANY(p.rel_ids))` enforces openCypher's no-repeated-edges
+  semantics within a single path
+- Unbounded (`*`) paths are capped by `pg_eddy.max_path_depth` GUC (default: 100)
+
+**`shortestPath()` and `allShortestPaths()`** are implemented in Rust
+(`src/cypher/path_search.rs`) as BFS over the native AM adjacency lists, not
+via SQL. Three correctness and safety requirements that must be met:
+
+- **`CHECK_FOR_INTERRUPTS()`** is called at the top of every BFS iteration
+  loop. Without this, a traversal on a large graph cannot be cancelled and will
+  hold its backend until completion.
+- **Buffer pin discipline**: each adjacency page is pinned with `ReadBuffer()`,
+  the required adjacency header and edge slot data is copied into a
+  stack-allocated buffer, then `ReleaseBuffer()` is called before processing.
+  The BFS never holds more than one buffer pin simultaneously. Holding pins
+  across loop iterations would exhaust `max_locks_per_transaction` on
+  high-degree nodes.
+- **Memory budget**: BFS state (visited set, frontier queue) is allocated from
+  a `MemoryContext` bounded by `pg_eddy.traversal_work_mem`. When the frontier
+  exceeds this budget, the query raises `PE320` ("traversal memory budget
+  exceeded") with the current frontier size. Spill-to-disk is a post-v1.0
+  optimization.
+- **Relationship uniqueness in `allShortestPaths()`**: the spec requires that
+  no relationship appears twice in a single returned path. The visited set
+  tracks `(node_id, frozenset(rel_ids_on_path))` rather than node IDs alone.
+
+### 6.6 Null Semantics
+
+OpenCypher null semantics align with SQL in most cases (three-valued logic,
+null propagation through arithmetic and comparison) but diverge in list/map
+operations and string functions that have no SQL equivalent.
+
+**Translation strategy**:
+- Expressions with exact SQL null semantics (`=`, `<>`, `<`, `IS NULL`, `AND`,
+  `OR`, `NOT`, arithmetic): translated directly to SQL. SQL and openCypher
+  agree on null propagation for these.
+- String predicates with null inputs (`STARTS WITH`, `ENDS WITH`, `CONTAINS`,
+  `=~`): translated to SQL `LIKE` / `~` with explicit `IS NOT NULL` guards;
+  matches openCypher semantics.
+- **List and map operations** (`IN [...]`, list indexing, list equality, list
+  concatenation): evaluated by the Rust expression evaluator
+  (`src/cypher/expressions.rs`), not translated to SQL. Example:
+  `[1, null] = [1, null]` returns `null` per spec; SQL has no list equality.
+- `COLLECT` aggregate: maps to `array_agg(expr) FILTER (WHERE expr IS NOT NULL)`
+  — correctly skips nulls per spec.
+- `NULL IN [null, 1]`: openCypher returns `null`; SQL `NULL = ANY(ARRAY[NULL,
+  1])` also returns `null`. These align.
+
+**Expression evaluator** (`src/cypher/expressions.rs`): each expression node
+in the logical plan carries an `EvalStrategy` flag — `SqlTranslatable`
+(emitted into the SQL string) or `RustEvaluated` (called via a PostgreSQL SRF
+callback after SQL rows are returned). Mixed plans are supported: SQL generates
+the row set, and the Rust evaluator post-filters any `RustEvaluated`
+predicates on the returned rows.
+
+**Regression coverage**: `sql/regress/null_semantics.sql` must cover every
+scenario in the TCK `NullAcceptance` feature group before v1.0.
+
+### 6.7 SQL Function API
+
+```sql
+-- Primary Cypher query interface
+pg_eddy.cypher(
+    query  TEXT,
+    params JSONB DEFAULT '{}'
+) RETURNS SETOF JSONB
+
+-- Inspect the generated SQL for a Cypher query (for debugging and EXPLAIN)
+pg_eddy.cypher_explain(
+    query   TEXT,
+    params  JSONB DEFAULT '{}',
+    analyze BOOL DEFAULT FALSE
+) RETURNS TEXT
+
+-- Node CRUD (used by the Cypher engine and available directly)
+pg_eddy.create_node(labels TEXT[], properties JSONB) RETURNS BIGINT
+pg_eddy.get_node(node_id BIGINT) RETURNS JSONB
+pg_eddy.update_node(node_id BIGINT, properties JSONB) RETURNS VOID
+pg_eddy.delete_node(node_id BIGINT, detach BOOL DEFAULT FALSE) RETURNS VOID
+
+-- Edge CRUD
+pg_eddy.create_edge(source BIGINT, target BIGINT, type TEXT, properties JSONB) RETURNS BIGINT
+pg_eddy.get_edge(rel_id BIGINT) RETURNS JSONB
+pg_eddy.update_edge(rel_id BIGINT, properties JSONB) RETURNS VOID
+pg_eddy.delete_edge(rel_id BIGINT) RETURNS VOID
+
+-- Graph management
+pg_eddy.clear() RETURNS VOID          -- truncate all nodes and edges
+pg_eddy.node_count() RETURNS BIGINT
+pg_eddy.edge_count() RETURNS BIGINT
+pg_eddy.schema_info() RETURNS JSONB   -- label/type/property key registry summary
+```
+
+---
+
+## 7. pg-trickle Integration (IVM)
+
+> **Dependency**: all features in this section require
+> `pg_trickle` to be installed. Core pg_eddy functionality works without it.
+> Detection uses:
+> ```rust
+> fn has_pg_trickle() -> bool {
+>     Spi::get_one::<bool>(
+>         "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_trickle')"
+>     ).unwrap_or(Some(false)).unwrap_or(false)
+> }
+> ```
+
+### 7.1 Incremental Graph Views
+
+A Cypher MATCH query can be registered as a pg-trickle stream table:
+
+```sql
+SELECT pg_eddy.create_graph_view(
+    name     => 'friends_of_alice',
+    cypher   => 'MATCH (a:Person {name: $name})-[:KNOWS]->(b:Person)
+                 RETURN b.name AS friend, b.age AS age',
+    params   => '{"name": "Alice"}',
+    schedule => '1s'
+);
+```
+
+Internally:
+1. `create_graph_view()` translates the Cypher query to SQL via the existing
+   query engine
+2. A pg-trickle stream table is created over the generated SQL
+3. pg-trickle's CDC layer captures writes to `pg_eddy.nodes` and
+   `pg_eddy.edges` and incrementally maintains the stream table
+
+Graph stream table schema (auto-created):
+
+```sql
+pg_eddy.view_{name}(
+    <variable_name>  JSONB  -- one column per RETURN variable
+    ...
+)
+```
+
+When `decode = TRUE`, a view with human-readable property values is also created.
+
+### 7.2 pg-trickle CDC Mode
+
+**Executor path requirement (critical)**: pg-trickle's trigger-based CDC fires
+`AFTER INSERT/UPDATE/DELETE` row-level triggers, which are invoked by
+PostgreSQL's executor in `nodeModifyTable.c` via `ExecARInsertTriggers()`,
+`ExecARUpdateTriggers()`, and `ExecARDeleteTriggers()` — **only when writes go
+through the standard executor path**.
+
+All Cypher write clauses (CREATE, MERGE, SET, DELETE) must therefore be
+executed as standard SQL DML via SPI. The Cypher SQL generator emits
+`INSERT`/`UPDATE`/`DELETE` SQL; SPI routes through the executor, which calls
+the trigger manager automatically. No special pg_eddy code is needed to fire
+triggers — as long as every write path goes through SPI.
+
+Any future bulk-import fast path that bypasses SPI (e.g., direct
+`table_tuple_insert()` calls for performance) must either explicitly call
+`ExecARInsertTriggers()` itself, or route writes through the logical decoding
+plugin so pg-trickle can use WAL-based CDC instead.
+
+**WAL-based CDC** (preferred when `wal_level = logical`): pg-trickle
+transitions from trigger-based to WAL-based CDC, consuming pg_eddy's custom
+WAL records via the logical decoding plugin (`src/storage/wal_decode.rs`). This
+is the preferred production mode: ~5 µs/row overhead vs 20–55 µs for triggers,
+and no SPI indirection required for bulk operations.
+
+**Verification gate** (Phase 3, v0.4.0): before writing the Cypher query
+engine, verify that:
+1. A pg-trickle stream table can be defined over a SQL SELECT on
+   `pg_eddy.nodes` and `pg_eddy.edges`
+2. A Cypher `CREATE (n:Person {name:'Alice'})` (executed via SPI INSERT) causes
+   the stream table to update on the next pg-trickle tick
+3. WAL-based CDC (with `wal_level = logical`) also updates the stream table
+
+Failing this verification gate means the project cannot proceed.
+
+### 7.3 Constraint Graph Views (IMMEDIATE mode)
+
+Graph integrity constraints can be expressed as Cypher MATCH patterns using
+`IMMEDIATE` refresh mode:
+
+```sql
+SELECT pg_eddy.create_graph_view(
+    name         => 'persons_without_email',
+    cypher       => 'MATCH (p:Person) WHERE p.email IS NULL RETURN p',
+    refresh_mode => 'IMMEDIATE'
+);
+-- Any row in this view is a constraint violation, caught in-transaction.
+```
+
+### 7.4 SQL API
+
+```sql
+pg_eddy.create_graph_view(
+    name         TEXT,
+    cypher       TEXT,
+    params       JSONB  DEFAULT '{}',
+    schedule     TEXT   DEFAULT '1s',
+    refresh_mode TEXT   DEFAULT 'AUTO',
+    decode       BOOL   DEFAULT FALSE
+) RETURNS VOID
+
+pg_eddy.drop_graph_view(name TEXT) RETURNS VOID
+pg_eddy.list_graph_views() RETURNS TABLE(name TEXT, cypher TEXT, schedule TEXT, ...)
+pg_eddy.refresh_graph_view(name TEXT) RETURNS VOID
+```
+
+---
+
+## 8. Module Breakdown
+
+### 8.1 Extension Bootstrap (`src/lib.rs`)
+
+- pgrx `#[pg_extern]` entry points for all public SQL functions
+- `_PG_init()`: shared memory registration (v0.6.0+), AM registration, label
+  cache warm-up, background worker startup
+- GUC parameters: see §13 for the canonical GUC reference
+- Error taxonomy: `src/error.rs` — `thiserror`-based `PgEddyError` enum with
+  `PE###` error codes (see §14)
+- `shared_preload_libraries = 'pg_eddy'` required from v0.1.0 (custom AM and
+  WAL resource manager must be registered at postmaster start via `_PG_init`)
+
+### 8.2 Catalog (`src/catalog/`)
+
+- `src/catalog/labels.rs` — label registry CRUD + in-memory cache
+- `src/catalog/types.rs` — rel-type registry CRUD + in-memory cache
+- `src/catalog/property_keys.rs` — property key registry CRUD + in-memory cache
+- `src/catalog/schema.rs` — schema creation / upgrade SQL helpers
+
+### 8.3 Storage (`src/storage/`)
+
+- `src/storage/am.rs` — AM registration, unsafe C callback functions
+- `src/storage/node_store.rs` — node page layout, insert/update/delete
+- `src/storage/edge_store.rs` — edge page layout, insert/update/delete,
+  doubly-linked list maintenance
+- `src/storage/prop_store.rs` — property binary encoding/decoding, overflow pages
+- `src/storage/scan.rs` — custom scan implementations (full scan, label scan,
+  adjacency-follow scan)
+- `src/storage/wal_decode.rs` — logical decoding output plugin for CDC
+- `src/storage/mvcc.rs` — MVCC visibility helpers (wrappers over `HeapTupleIsVisible`)
+
+### 8.4 Cypher Engine (`src/cypher/`)
+
+- `src/cypher/lexer.rs` — tokeniser
+- `src/cypher/parser.rs` — recursive-descent parser → AST
+- `src/cypher/ast.rs` — AST types
+- `src/cypher/algebra.rs` — logical plan IR
+- `src/cypher/planner.rs` — AST → logical plan; predicate pushdown; label inference
+- `src/cypher/sql_gen.rs` — logical plan → SQL text
+- `src/cypher/executor.rs` — SPI execution + result decoding
+- `src/cypher/functions.rs` — built-in Cypher functions (`id()`, `labels()`,
+  `type()`, `keys()`, `size()`, `length()`, `range()`, string functions, math functions, etc.)
+- `src/cypher/expressions.rs` — expression evaluation (for non-SQL-translatable
+  expressions computed in Rust)
+- `src/cypher/plan_cache.rs` — Cypher→SQL translation cache (keyed on
+  structural hash of normalised AST; default size 512 entries)
+
+### 8.5 Ecosystem (`src/ecosystem/`)
+
+- `src/ecosystem/trickle.rs` — pg-trickle detection and graph view management
+
+### 8.6 Statistics & Monitoring (`src/stats/`)
+
+- `src/stats/mod.rs` — label/type counts, property distribution, scan stats
+- `src/stats/monitoring.rs` — `pg_eddy.stats()` JSONB function
+
+### 8.7 Admin (`src/admin/`)
+
+- `src/admin/maintenance.rs` — `pg_eddy.vacuum()`, `pg_eddy.reindex()`
+- `src/admin/constraints.rs` — uniqueness and existence constraint management
+
+---
+
+## 9. Phased Roadmap
+
+### Phase 0 — AM Skeleton (v0.1.0)
+
+**Goal**: The custom AM is registered and the extension loads. Prove AM
+registration works end-to-end before writing any storage logic. If this phase
+fails, stop and reconsider the approach.
+
+**Deliverables**:
+- [ ] Cargo workspace: `pg_eddy/` (extension), `pg_eddy_http/` (placeholder
+      HTTP binary for future Bolt/REST API)
+- [ ] `pg_eddy.control` with `trusted = false`, `schema = 'pg_eddy'`
+- [ ] `shared_preload_libraries = 'pg_eddy'` required from this version
+- [ ] Custom WAL resource manager skeleton registered via `RegisterCustomRmgr()`
+      at `_PG_init` (no-op redo; proves the registration path works; appears
+      in `pg_stat_wal`)
+- [ ] `CREATE ACCESS METHOD pg_eddy_node TYPE TABLE HANDLER pg_eddy_node_handler`
+      and `pg_eddy_edge` in the extension SQL
+- [ ] Node and edge backing tables created `USING pg_eddy_node` /
+      `USING pg_eddy_edge` at `CREATE EXTENSION` time
+- [ ] All AM callbacks registered as stubs returning "not implemented" except
+      full-table scan (`scan_begin` / `scan_getnextslot` / `scan_end`), which
+      returns empty
+- [ ] Internal schema `_pg_eddy` created; label/type/property key registry
+      tables (standard heap)
+- [ ] CI: GitHub Actions with `cargo pgrx test pg18`, `cargo clippy`,
+      `cargo deny`
+- [ ] `justfile` with `dev`, `test`, `lint`, `package` targets
+- [ ] `rust-toolchain.toml` pinned to pgrx 0.18-required stable toolchain
+- [ ] `AGENTS.md`, `CONTRIBUTING.md`, `LICENSE` (Apache 2.0)
+
+**Exit criteria**: `CREATE EXTENSION pg_eddy` succeeds with
+`shared_preload_libraries = 'pg_eddy'`; `SELECT * FROM pg_eddy.nodes` returns
+empty without panicking; WAL resource manager appears in `pg_stat_wal`.
+
+---
+
+### Phase 1 — Node Storage (v0.2.0)
+
+**Goal**: Nodes can be created, read back, and survive crash recovery. The
+split-region page layout (§5.2.1) and custom WAL records (§5.5) are proven
+correct before adding edges.
+
+**Deliverables**:
+- [ ] Node page layout: Region 1 (fixed-size adjacency header array, in-place
+      updated under exclusive buffer lock) + Region 2 (MVCC node records,
+      variable-length, see §5.2.1)
+- [ ] `tuple_insert` for nodes: allocate slot in Region 2, initialise
+      adjacency header in Region 1, WAL-log `XLOG_PG_EDDY_NODE_INSERT`
+- [ ] WAL redo function for `XLOG_PG_EDDY_NODE_INSERT`
+- [ ] Full sequential scan with MVCC visibility via `HeapTupleIsVisible()`
+- [ ] Property binary encoding (`src/storage/prop_store.rs`): all scalar types
+      (Integer, Float, Boolean, String, Date, LocalDateTime, Duration), List,
+      Map, Null — encode/decode round-trip tests via `proptest`
+- [ ] Property overflow pages for properties exceeding 48 bytes
+- [ ] Label registry tables + backend-local `HashMap<String, i64>` cache
+- [ ] `pg_eddy.create_node(labels TEXT[], properties JSONB) RETURNS BIGINT`
+- [ ] `pg_eddy.get_node(node_id BIGINT) RETURNS JSONB`
+- [ ] `pg_eddy.node_count() RETURNS BIGINT`
+- [ ] Crash-safe test: insert 10K nodes, `pg_ctl stop -m immediate`, verify
+      all nodes recovered correctly
+
+**Exit criteria**: 1M nodes created and read back correctly; crash-recovery
+test passes; WAL records are exclusively `XLOG_PG_EDDY_NODE_INSERT` (verify
+with `pg_waldump` — no `Generic` record type present).
+
+---
+
+### Phase 2 — Edge Storage + Adjacency Lists (v0.3.0)
+
+**Goal**: Edges are stored with doubly-linked adjacency lists. `XLOG_PG_EDDY_ADJ_UPDATE`
+is proven correct: insert an edge, crash, recover, verify the adjacency list is intact.
+
+**Deliverables**:
+- [ ] Edge page layout: MVCC records + doubly-linked list pointers (see §5.2.2)
+- [ ] `tuple_insert` for edges: write edge slot, update source/target adjacency
+      headers in-place under exclusive buffer lock; WAL-log
+      `XLOG_PG_EDDY_EDGE_INSERT` + two `XLOG_PG_EDDY_ADJ_UPDATE` records
+- [ ] `tuple_delete` for edges: set xmax, unlink from both adjacency lists;
+      WAL-log `XLOG_PG_EDDY_EDGE_DELETE` + two `XLOG_PG_EDDY_ADJ_UPDATE`
+- [ ] WAL redo functions for all three new record types
+- [ ] Lock ordering: always acquire source node page lock before target node
+      page lock when updating two adjacency headers (prevents deadlocks)
+- [ ] Adjacency-follow sequential scan: given a node ID and direction, iterate
+      the doubly-linked edge list from the adjacency header without an index
+- [ ] `pg_eddy.create_edge(source BIGINT, target BIGINT, type TEXT, properties JSONB) RETURNS BIGINT`
+- [ ] `pg_eddy.delete_edge(rel_id BIGINT) RETURNS VOID`
+- [ ] `pg_eddy.neighbours(node_id BIGINT, direction TEXT, rel_type TEXT) RETURNS SETOF BIGINT`
+- [ ] Concurrency test: 4 parallel workers inserting edges to the same hub
+      node; no deadlock, no lost updates, adjacency list count matches
+- [ ] Crash-safe edge test: insert 50K edges, crash, recover, verify all
+      adjacency lists are intact
+
+**Exit criteria**: edge CRUD works; adjacency-follow returns the correct
+neighbour set; crash recovery preserves adjacency list integrity; lock ordering
+prevents deadlocks under concurrent edge inserts to the same node.
+
+---
+
+### Phase 3 — MVCC, VACUUM, and pg-trickle Verification (v0.4.0)
+
+**Goal**: Prove MVCC correctness and prove that pg-trickle works on the
+custom AM. **This is the go/no-go gate for the project.** Build nothing further
+until all six CDC verification tests pass.
+
+**Deliverables**:
+- [ ] Node update: `tuple_update` callback — new MVCC version of Region 2;
+      adjacency headers unchanged; WAL-log `XLOG_PG_EDDY_NODE_UPDATE_PROPS`
+- [ ] Node delete: `tuple_delete` — set xmax, null out adjacency header,
+      WAL-log `XLOG_PG_EDDY_NODE_DELETE` + `XLOG_PG_EDDY_ADJ_UPDATE`
+- [ ] MVCC isolation test: T1 inserts a node; T2's concurrent snapshot does
+      not see it until T1 commits
+- [ ] VACUUM: `relation_vacuum` callback — identify dead slots (xmax visible
+      to all active transactions), reclaim slot space, remove dead-edge pointers
+      from adjacency lists
+- [ ] Logical decoding output plugin (`src/storage/wal_decode.rs`): intercepts
+      pg_eddy WAL records, emits `NodeInserted`, `NodeUpdated`, `NodeDeleted`,
+      `EdgeInserted`, `EdgeDeleted` change events
+- [ ] **pg-trickle CDC integration — all six tests must pass**:
+  - [ ] Create a pg-trickle stream table over a SQL SELECT on `pg_eddy.nodes`
+        using trigger-based CDC (pg-trickle default)
+  - [ ] `pg_eddy.create_node(ARRAY['Person'], '{"name":"Alice"}')` causes the
+        stream table to update on the next pg-trickle tick
+  - [ ] `pg_eddy.delete_node(id)` causes the row to be removed from the
+        stream table
+  - [ ] DIFFERENTIAL mode: only the changed rows are processed per tick
+  - [ ] IMMEDIATE mode: stream table updates within the same transaction as
+        the write (verified via `BEGIN; create_node; SELECT FROM stream_table`)
+  - [ ] WAL-based CDC (test container with `wal_level = logical`): stream
+        table updates via the logical decoding plugin, not triggers
+- [ ] `pg_eddy.am_stats() RETURNS JSONB` — page utilisation, slot density,
+      fragmentation, dead-slot count
+
+**Exit criteria**: all six pg-trickle CDC tests pass; MVCC isolation test
+passes; VACUUM reclaims dead slots and cleans adjacency lists. If any CDC test
+fails, diagnose and fix before proceeding to Phase 4.
+
+---
+
+### Phase 4 — Indexes, Constraints, and Full CRUD API (v0.5.0–v0.5.1)
+
+**Goal**: Complete the storage layer. Everything needed to build the query
+engine on top.
+
+**v0.5.0 deliverables**:
+- [ ] Label B-tree index: `(label_id, node_id)` via AM's index integration
+- [ ] Rel-type B-tree indexes: `(type_id, source_node_id)` and
+      `(type_id, target_node_id)`
+- [ ] `pg_eddy.create_node_index(label TEXT, property_key TEXT)` — per-property
+      B-tree index on binary-encoded values
+- [ ] `pg_eddy.create_rel_index(type TEXT, property_key TEXT)`
+- [ ] Multi-label nodes (up to 32 labels); `pg_eddy.add_label()`,
+      `pg_eddy.remove_label()`; `XLOG_PG_EDDY_LABEL_SET` WAL record
+- [ ] Detach-delete: `pg_eddy.delete_node(id, detach := TRUE)` removes all
+      incident edges before deleting the node
+- [ ] `pg_eddy.find_nodes(label TEXT, property_filter JSONB) RETURNS SETOF BIGINT`
+- [ ] `pg_eddy.schema_info() RETURNS JSONB`
+- [ ] Bulk CSV import: `pg_eddy.load_csv_nodes(path, label, id_column)`,
+      `pg_eddy.load_csv_edges(path, type, source_column, target_column)`
+- [ ] `pg_dump` / `pg_restore` round-trip test on 1M-node graph
+
+**v0.5.1 deliverables**:
+- [ ] Property constraints: `pg_eddy.create_unique_constraint(label, property_key)`,
+      `pg_eddy.create_existence_constraint(label, property_key)`
+- [ ] `pg_eddy.export_cypher_script()` — export graph as CREATE statements
+- [ ] Performance CI gate: `>100K node inserts/sec` (bulk via
+      `pg_eddy.load_csv_nodes`); label-scan `<5ms` on 1M nodes;
+      adjacency-follow `<1ms` per 1-hop expansion on a 10M-edge graph
+- [ ] All `sql/regress/` tests pass
+
+**Exit criteria**: complete CRUD API; pg_dump round-trip lossless; performance
+CI gate passes.
+
+---
+
+### Phase 5 — Cypher Parser and Basic Query Engine (v0.6.0–v0.7.0)
+
+**Goal**: `pg_eddy.cypher()` executes MATCH/RETURN queries using the native
+AM. Node isomorphism and null semantics are correct from the first release.
+
+**v0.6.0 deliverables**:
+- [ ] Cypher lexer: all openCypher token types, Unicode identifiers, numeric
+      literals, string escapes
+- [ ] Cypher parser: single-clause `MATCH`/`RETURN`; node and relationship
+      patterns; `WHERE` with comparisons, `IS NULL`, `AND`/`OR`/`NOT`
+- [ ] AST types (`src/cypher/ast.rs`)
+- [ ] Logical planner: `LabelScan` + `Expand(OUT/IN/BOTH)` + `Filter` + `Project`
+- [ ] **Node isomorphism**: SQL generator emits `a.node_id <> b.node_id` for
+      every distinct node variable pair (see §6.3)
+- [ ] SQL generator targeting adjacency-follow scans on the custom AM tables
+- [ ] `pg_eddy.cypher(query TEXT, params JSONB) RETURNS SETOF JSONB`
+- [ ] `pg_eddy.cypher_explain(query TEXT, params JSONB) RETURNS TEXT`
+- [ ] TCK harness (`tests/tck/`): runs `.feature` files from the openCypher
+      TCK, reports pass/fail per scenario; runs in CI on every PR
+- [ ] Fuzz targets for lexer and parser in CI nightly
+- [ ] Target: pass `MatchAcceptance` TCK group
+
+**v0.7.0 deliverables**:
+- [ ] Multi-clause queries (`MATCH … WITH … MATCH … RETURN`)
+- [ ] `OPTIONAL MATCH` (left outer join in SQL)
+- [ ] Pattern variables on relationships
+- [ ] `WHERE` extended: `IN [...]`, `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `=~`
+- [ ] `ORDER BY`, `SKIP`, `LIMIT`, `RETURN DISTINCT`
+- [ ] Null semantics evaluator (`src/cypher/expressions.rs`) for list/map
+      operations where SQL semantics diverge from openCypher (see §6.6)
+- [ ] Cypher plan cache (`src/cypher/plan_cache.rs`)
+- [ ] Built-in functions: `id()`, `labels()`, `type()`, `keys()`,
+      `properties()`, `size()`, `length()`, `head()`, `tail()`, `last()`,
+      `coalesce()`, `toString()`, `toInteger()`, `toFloat()`, `toBoolean()`
+- [ ] Target: pass `ReturnAcceptance`, `WithAcceptance`, `FunctionsAcceptance`
+
+**Exit criteria**: `pg_eddy.cypher()` executes MATCH patterns including node
+isomorphism; TCK pass rate ≥25%; no SQL injection possible via crafted Cypher
+property values; parser fuzz runs without panics.
+
+---
+
+### Phase 6 — Full Query Language (v0.8.0–v0.10.0)
+
+**Goal**: Complete the read language. Variable-length paths, aggregation, all
+built-in functions, subqueries.
+
+**v0.8.0 deliverables**:
+- [ ] `UNWIND expr AS var`
+- [ ] `CASE` expressions (simple and searched)
+- [ ] List comprehensions: `[x IN list WHERE ... | expr]`
+- [ ] String functions: `toLower()`, `toUpper()`, `trim()`, `ltrim()`,
+      `rtrim()`, `substring()`, `replace()`, `split()`, `left()`, `right()`
+- [ ] Math functions: `abs()`, `ceil()`, `floor()`, `round()`, `sqrt()`,
+      `sign()`, `log()`, `log10()`, `exp()`, `sin()`, `cos()`, `tan()`,
+      `asin()`, `acos()`, `atan()`, `atan2()`, `toRadians()`, `toDegrees()`
+- [ ] `rand()`, `randomUUID()`
+- [ ] `EXISTS { ... }` pattern predicate, scalar subqueries
+- [ ] Target: pass `ExpressionAcceptance`, `UnwindAcceptance`,
+      `TypeConversionAcceptance`, `NullAcceptance`
+
+**v0.9.0 deliverables**:
+- [ ] Variable-length paths via bounded `WITH RECURSIVE` + PG18 `CYCLE` clause
+      (see §6.5); no-repeated-edges enforced via `rel_ids` exclusion array
+- [ ] `shortestPath()` and `allShortestPaths()` in Rust BFS with
+      `CHECK_FOR_INTERRUPTS()`, single-pin-at-a-time buffer discipline, and
+      `traversal_work_mem` memory budget (see §6.5)
+- [ ] Path expressions: `nodes(path)`, `relationships(path)`, `length(path)`
+- [ ] Target: pass `VarLengthExpand`, `PathExpression` TCK groups
+
+**v0.10.0 deliverables**:
+- [ ] Aggregation: `COUNT(*)`, `COUNT(DISTINCT)`, `SUM`, `AVG`, `MIN`, `MAX`,
+      `COLLECT`, `COLLECT(DISTINCT)`, `stDev()`, `stDevP()`,
+      `percentileCont()`, `percentileDisc()`
+- [ ] Pattern comprehensions: `[(n)-[:KNOWS]->(m) | m.name]`
+- [ ] `CALL { ... }` subqueries (correlated and uncorrelated)
+- [ ] `CALL procedure(args) YIELD ...`
+- [ ] Target: pass `AggregationAcceptance`, `PatternComprehensionAcceptance`,
+      `CallSubqueryAcceptance`
+
+**Exit criteria**: TCK pass rate ≥60%; `shortestPath()` is cancellable and
+memory-bounded; aggregation matches Neo4j for all TCK scenarios.
+
+---
+
+### Phase 7 — Write Language and IVM (v0.11.0–v0.13.0)
+
+**Goal**: Full openCypher write language. pg-trickle graph views are
+incrementally maintained correctly.
+
+**v0.11.0 — Write clauses**:
+- [ ] `CREATE (n:Label {prop: value})`, `CREATE (a)-[:TYPE]->(b)`
+- [ ] `MERGE ... ON CREATE SET ... ON MATCH SET ...` with uniqueness constraint
+      enforcement
+- [ ] `SET n.prop = value`, `SET n += {map}`, `SET n = {map}`
+- [ ] `SET n:Label`, `REMOVE n:Label`, `REMOVE n.prop`
+- [ ] `DELETE n`, `DETACH DELETE n`
+- [ ] All write clauses go through SPI → executor → triggers fire → pg-trickle
+      CDC stays up to date automatically (see §7.2)
+- [ ] Target: `CreateAcceptance`, `MergeAcceptance`, `SetAcceptance`,
+      `DeleteAcceptance`
+
+**v0.12.0 — IVM graph views**:
+- [ ] `pg_eddy.create_graph_view()`: Cypher MATCH → SQL → pg-trickle stream
+      table
+- [ ] `pg_eddy.drop_graph_view()`, `pg_eddy.list_graph_views()`,
+      `pg_eddy.refresh_graph_view()`
+- [ ] `_pg_eddy.graph_views` catalog
+- [ ] DIFFERENTIAL refresh: changed nodes/edges only
+- [ ] IMMEDIATE refresh: view updated within the same transaction as the write
+- [ ] Constraint views (IMMEDIATE mode): any row = violation caught
+      in-transaction
+- [ ] DAG-aware scheduling: dependent graph views refreshed in topological order
+- [ ] 72-hour soak test: no drift after sustained concurrent writes + reads
+
+**v0.13.0 — Schema DDL**:
+- [ ] `CREATE CONSTRAINT ON (n:Label) ASSERT n.prop IS UNIQUE`
+- [ ] `CREATE CONSTRAINT ON (n:Label) ASSERT EXISTS(n.prop)`
+- [ ] `CREATE INDEX ON :Label(prop)` / `DROP INDEX`
+- [ ] `SHOW CONSTRAINTS`, `SHOW INDEXES`
+- [ ] `FOREACH (x IN list | clause)`
+- [ ] Target: `SchemaAcceptance`, `ForeachAcceptance`; TCK ≥80%
+
+**Exit criteria**: ≥80% TCK pass; pg-trickle 72-hour soak test passes with
+zero drift; all write clauses work correctly under concurrent access; IMMEDIATE
+constraint views catch violations in-transaction.
+
+---
+
+### Phase 8 — Performance Hardening and TCK ≥95% (v0.14.0–v0.16.0)
+
+**v0.14.0 — Query optimisation**:
+- [ ] Cost model for AM scan operators: adjacency-follow O(degree) vs B-tree
+      O(log N + degree) using `pg_class.reltuples` for label selectivity
+- [ ] Join order enumeration for multi-hop MATCH patterns
+- [ ] Predicate pushdown into the AM scan (WHERE on indexed properties as scan
+      predicates, not post-filters)
+- [ ] `pg_eddy.cypher_explain(analyze := TRUE)` with per-operator timings
+- [ ] Parallel label scan via PostgreSQL parallel worker infrastructure
+
+**v0.15.0 — TCK gap closure**:
+- [ ] Temporal type arithmetic (`src/cypher/temporal.rs`): ISO 8601 duration
+      arithmetic, timezone-aware datetime operations (see §10.7 — the hardest
+      feature group in the entire TCK; budget accordingly)
+- [ ] `LOAD CSV FROM 'path' AS row` (local filesystem only)
+- [ ] All remaining TCK group failures fixed; target: ≥95% pass rate
+- [ ] `null_semantics.sql` regression suite covers all `NullAcceptance`
+      scenarios
+
+**v0.16.0 — Production readiness**:
+- [ ] LDBC SNB IS-1 through IS-7 and IC-1 through IC-14 benchmarked; published
+      baselines with hardware spec, dataset size, and raw output; compared
+      against AGE on identical hardware
+- [ ] CI performance gate: LDBC SNB IS regression `>10%` fails build
+- [ ] `pg_eddy.stats()`, `pg_eddy.health_check()`, `pg_eddy.query_log`
+- [ ] `pg_stat_pg_eddy` view
+- [ ] Prometheus metrics via `pg_eddy_http` companion binary
+- [ ] `NOTIFY`-based alerting: `pg_eddy.alert_channel` GUC
+- [ ] Security: `cargo audit --deny warnings`, SBOM (CycloneDX), fuzz coverage
+      report; `pg_eddy.max_cypher_depth` GUC (DoS prevention)
+- [ ] mdBook documentation site: installation, quickstart, Cypher reference,
+      storage AM internals, pg-trickle integration, performance cookbook,
+      security guide, troubleshooting
+- [ ] Docker image + CNPG CloudNativePG extension image published
+- [ ] `justfile` release workflow: tag, build, publish to ghcr.io
+
+**Exit criteria** (v1.0 readiness): ≥95% TCK pass; LDBC SNB published
+baselines; pg-trickle IVM soak test passed; pg_dump round-trip verified;
+`pg_eddy.health_check()` returns OK; Docker + CNPG images published.
+
+---
+
+## 10. Testing Strategy
+- [ ] `cargo audit --deny warnings` in CI; SBOM (CycloneDX) generated per release
+- [ ] Row-level security on graph views (label-level `pg_eddy.grant_label()`)
+- [ ] Fuzz coverage report: all parser, encoder, and SQL generator entry points
+      must have fuzz target coverage in CI
+- [ ] `pg_eddy.max_cypher_depth` GUC — reject deeply nested Cypher patterns at
+      parse time (DoS prevention)
+
+**v0.26.0 — Documentation, Packaging & v1.0 Track**:
+- [ ] mdBook documentation site covering: installation, quickstart, Cypher
+      reference, storage AM internals, pg-trickle integration, performance
+      cookbook, security guide, troubleshooting
+- [ ] Docker image and CNPG CloudNativePG extension image
+- [ ] `justfile` release workflow: tag, build, publish to ghcr.io
+- [ ] TCK target: ≥95% pass rate; document remaining gaps with upstream issues
+- [ ] LDBC SNB published benchmark baselines with hardware, dataset size,
+      raw output
+
+**Exit criteria** (Phase 7): `pg_eddy.health_check()` returns OK on a clean
+install; all CI gates pass (tests, fuzz, security, performance, TCK); Docker
+image published; documentation site live.
+
+---
+
+## 10. Testing Strategy
+
+### 10.1 Unit Tests
+
+- pgrx `#[pg_test]` for every `#[pg_extern]` function
+- Pure Rust unit tests (`#[test]`) for: property encoder/decoder round-trips,
+  Cypher lexer tokens, parser AST correctness on golden inputs, SQL generator
+  output on fixed logical plans
+- Property-based tests (`proptest`): property encode/decode invertibility for
+  all type tags; Cypher expression normalisation idempotency
+
+### 10.2 Integration Tests
+
+`cargo pgrx regress` with pg_regress test files under `sql/regress/`:
+
+| File | Coverage |
+|---|---|
+| `schema.sql` | Extension create/drop, schema created, catalogs initialised |
+| `node_crud.sql` | Create, read, update, delete nodes; label operations |
+| `edge_crud.sql` | Create, read, update, delete edges; detach-delete |
+| `properties.sql` | All property types, round-trip encoding, overflow |
+| `indexes.sql` | Create/drop property indexes; index-assisted queries |
+| `constraints.sql` | Unique and existence constraint enforcement |
+| `cypher_match.sql` | MATCH/RETURN queries across all plan types |
+| `cypher_write.sql` | CREATE, MERGE, SET, REMOVE, DELETE |
+| `cypher_aggregation.sql` | COUNT, SUM, AVG, COLLECT, stDev |
+| `cypher_paths.sql` | Variable-length paths, shortestPath, allShortestPaths |
+| `cypher_subquery.sql` | CALL subqueries, EXISTS patterns |
+| `cypher_functions.sql` | All built-in functions |
+| `cypher_injection.sql` | Adversarial inputs: SQL metacharacters in property values |
+| `bulk_import.sql` | CSV import of nodes and edges |
+| `concurrent.sql` | Parallel inserts and reads, no data corruption |
+| `am_scan.sql` | Adjacency-follow scan, label scan, property scan |
+| `ivm_views.sql` | Graph views with pg-trickle (skipped when not installed) |
+| `pg_dump.sql` | pg_dump/pg_restore round-trip preserves graph exactly |
+
+### 10.3 openCypher TCK Harness
+
+The TCK harness (`tests/tck/`) reads the official openCypher TCK `.feature`
+files (Gherkin scenarios), executes each scenario against pg_eddy via
+`pg_eddy.cypher()`, and compares results.
+
+- Harness runs in CI on every pull request
+- Per-feature pass/fail report published as a CI artifact
+- Newly failing scenarios cause the build to fail
+- Initially only a whitelist of known-passing features is required; the
+  whitelist grows as features are implemented
+
+### 10.4 Fuzz Testing
+
+- `cargo-fuzz` targets:
+  - `fuzz_cypher_parser`: random Cypher text → parser must not panic or produce
+    invalid ASTs
+  - `fuzz_cypher_sql_gen`: random valid ASTs → SQL generator must not panic or
+    produce SQL injection
+  - `fuzz_prop_decoder`: random byte sequences → property decoder must not panic
+  - `fuzz_am_page_reader`: random page bytes → AM scan must not panic (for
+    on-disk corruption resilience)
+- Run nightly in CI (120 s per target); panic-free required gate
+
+### 10.5 Performance Regression
+
+- LDBC SNB interactive queries IS-1 through IS-7 benchmarked on every push to
+  `main`; `>10%` regression on any query fails CI
+- Baseline: documented in `benchmarks/README.md` with hardware spec and dataset
+  size
+- Criterion micro-benchmarks for: property encode/decode throughput, adjacency
+  list follow latency, Cypher→SQL translation latency
+
+### 10.6 Concurrency Tests
+
+- Concurrent node/edge inserts while graph views are being maintained
+- Concurrent MATCH queries during bulk import
+- Deadlock detection: `SET lock_timeout = '5s'` in all concurrent tests; any
+  lock timeout is a test failure
+- MVCC isolation: verify that a MATCH query in transaction T1 does not see
+  uncommitted writes from transaction T2
+
+### 10.7 Known TCK Hard Cases
+
+The following feature groups require disproportionate implementation effort
+and are called out explicitly to avoid underestimating scope.
+
+| TCK Feature Group | Difficulty | Primary challenge |
+|---|---|---|
+| `TemporalArithmeticAcceptance` | **Very High** | ISO 8601 duration arithmetic: `P1Y2M` + `P3M` = `P1Y5M`; leap-month overflow (`Jan 31 + P1M` = `Feb 28/29`); timezone-aware datetime arithmetic. Requires a dedicated `src/cypher/temporal.rs` module. ~80 scenarios. |
+| `NullAcceptance` | **High** | Null semantics in list operations, pattern predicates, and string functions (see §6.6). All ~50 scenarios must pass before v1.0. |
+| `MatchAcceptance2` | **High** | Complex optional patterns, double-optional, optional-with-WHERE, matched-but-unbound variables. ~40 scenarios. |
+| `SubqueryAcceptanceTest` | **High** | Correlated `CALL { }` subqueries with complex outer variable bindings; aggregation inside subqueries. ~30 scenarios. |
+| `SyntaxExceptionAcceptance` | **Medium** | Tests that specific invalid queries raise specific error types matching the openCypher error taxonomy exactly. ~30 scenarios. |
+| `ListComprehensionAcceptance` | **Medium** | Nested list comprehensions with WHERE clauses; comprehensions over pattern expressions. ~25 scenarios. |
+| `PatternComprehensionAcceptance` | **Medium** | Pattern expressions as values in RETURN; comprehensions with named path variables. ~20 scenarios. |
+| Relationship uniqueness in path results | **Medium** | `MATCH p = (a)-[*]-(b)` — the same relationship may not appear twice in a single path result row (separate from node isomorphism; separate from the per-path `rel_ids` exclusion used during traversal; must hold across join-expanded result rows). |
+
+**Known deviations from the openCypher specification** (documented, not bugs):
+- Neo4j-specific built-in procedures (`db.labels()`, `db.schema()`, `apoc.*`)
+  are not part of the openCypher specification and will not be implemented
+- `LOAD CSV` from remote HTTP URLs is disabled by default; local filesystem
+  paths only (security: prevents SSRF via crafted Cypher queries)
+
+**Temporal arithmetic note**: this is the single most implementation-intensive
+feature group. The ISO 8601 arithmetic rules for months and years are
+non-trivial (adding a duration to a date at month-end uses different semantics
+than adding to a mid-month date). Budget a full version cycle for this work.
+
+---
+
+## 11. Project Structure
+
+```
+pg-eddy/                               # Repository root
+├── Cargo.toml                         # [workspace] manifest
+├── pg_eddy/                           # Extension crate
+│   ├── Cargo.toml
+│   ├── pg_eddy.control
+│   ├── sql/
+│   │   ├── pg_eddy--0.1.0.sql        # Initial extension SQL
+│   │   └── pg_eddy--X.Y.Z--X.Y+1.0.sql  # Upgrade scripts
+│   └── src/
+│       ├── lib.rs                     # Entry point, GUCs, _PG_init
+│       ├── error.rs                   # PE### error taxonomy (thiserror)
+│       ├── catalog/
+│       │   ├── mod.rs
+│       │   ├── labels.rs
+│       │   ├── types.rs
+│       │   └── property_keys.rs
+│       ├── storage/
+│       │   ├── mod.rs
+│       │   ├── am.rs                  # AM registration, unsafe C callbacks
+│       │   ├── node_store.rs          # Node page layout (split-region design)
+│       │   ├── edge_store.rs          # Edge page layout, linked-list ops
+│       │   ├── prop_store.rs          # Property encoding/overflow
+│       │   ├── wal_records.rs         # Custom WAL record types + redo functions
+│       │   ├── scan.rs                # Custom scan paths (full, label, adjacency-follow)
+│       │   ├── mvcc.rs                # MVCC visibility helpers
+│       │   └── wal_decode.rs          # Logical decoding output plugin
+│       ├── cypher/
+│       │   ├── mod.rs
+│       │   ├── lexer.rs
+│       │   ├── parser.rs
+│       │   ├── ast.rs
+│       │   ├── algebra.rs             # Logical plan IR
+│       │   ├── planner.rs             # AST → logical plan (node isomorphism here)
+│       │   ├── sql_gen.rs             # Logical plan → SQL
+│       │   ├── executor.rs            # SPI execution + decoding
+│       │   ├── expressions.rs         # Rust expression evaluator (null semantics)
+│       │   ├── functions.rs           # Built-in Cypher functions
+│       │   ├── path_search.rs         # shortestPath/allShortestPaths BFS in Rust
+│       │   ├── temporal.rs            # ISO 8601 duration/datetime arithmetic
+│       │   └── plan_cache.rs
+│       ├── ecosystem/
+│       │   └── trickle.rs
+│       ├── stats/
+│       │   ├── mod.rs
+│       │   └── monitoring.rs
+│       └── admin/
+│           ├── mod.rs
+│           ├── maintenance.rs
+│           └── constraints.rs
+├── pg_eddy_http/                      # Companion HTTP binary (placeholder)
+│   ├── Cargo.toml
+│   └── src/
+│       └── main.rs
+├── benchmarks/
+│   ├── README.md                      # Hardware spec, dataset, methodology
+│   ├── ldbc_snb/                      # LDBC SNB query scripts
+│   └── neo4j_compare/                 # Comparison scripts
+├── fuzz/
+│   ├── Cargo.toml
+│   └── fuzz_targets/
+│       ├── fuzz_cypher_parser.rs
+│       ├── fuzz_cypher_sql_gen.rs
+│       ├── fuzz_prop_decoder.rs
+│       └── fuzz_am_page_reader.rs
+├── tests/
+│   ├── tck/                           # openCypher TCK harness
+│   │   ├── runner.rs
+│   │   └── features/                  # Symlink or copy of openCypher TCK .feature files
+│   └── integration/
+│       └── ...
+├── sql/
+│   ├── regress/
+│   │   ├── sql/                       # pg_regress input SQL
+│   │   └── expected/                  # Expected output
+│   └── bench/
+│       └── ldbc_snb.sql
+├── plans/
+│   └── implementation_plan.md         # This document
+├── docs/
+│   ├── book.toml
+│   └── src/
+│       ├── introduction.md
+│       ├── installation.md
+│       ├── quickstart.md
+│       ├── cypher-reference/
+│       ├── storage-am/
+│       ├── ivm-views/
+│       ├── performance/
+│       └── reference/
+├── AGENTS.md
+├── CHANGELOG.md
+├── ROADMAP.md
+├── CONTRIBUTING.md
+├── LICENSE
+└── justfile
+```
+
+---
+
+## 12. Build & Development Setup
+
+```bash
+# Prerequisites
+rustup update stable                 # Rust 1.85+ (pgrx 0.18 requirement)
+cargo install cargo-pgrx --version 0.18.0 --locked
+cargo pgrx init --pg18 download      # Download and compile PG18
+
+# Development cycle
+cargo pgrx run pg18                  # Start psql with pg_eddy loaded
+cargo pgrx test pg18                 # Run #[pg_test] tests
+cargo pgrx regress pg18              # Run pg_regress test suite
+cargo pgrx package --pg18            # Build installable .so + SQL
+
+# Benchmarks
+just bench-ldbc                      # Run LDBC SNB benchmark suite
+just bench-compare-neo4j             # Run comparison benchmark
+
+# TCK
+just test-tck                        # Run openCypher TCK harness
+just test-tck-feature MatchAcceptance  # Run a single feature group
+
+# Fuzz (requires cargo-fuzz and nightly)
+cargo +nightly fuzz run fuzz_cypher_parser -- -max_total_time=120
+```
+
+### Root `Cargo.toml`
+
+```toml
+[workspace]
+members  = ["pg_eddy", "pg_eddy_http"]
+resolver = "3"
+```
+
+### `pg_eddy/Cargo.toml`
+
+```toml
+[package]
+name    = "pg_eddy"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["pg18"]
+pg18    = ["pgrx/pg18"]
+
+[dependencies]
+pgrx          = "0.18"
+xxhash-rust   = { version = "0.8", features = ["xxh3"] }
+serde         = { version = "1", features = ["derive"] }
+serde_json    = "1"
+thiserror     = "2"
+
+[dev-dependencies]
+pgrx-tests = "0.18"
+proptest   = "1"
+criterion  = { version = "0.5", features = ["html_reports"] }
+```
+
+### `pg_eddy/pg_eddy.control`
+
+```
+default_version = '0.1.0'
+module_pathname = '$libdir/pg_eddy'
+comment         = 'Native LPG graph database with OpenCypher and incremental view maintenance'
+schema          = 'pg_eddy'
+relocatable     = false
+superuser       = false
+trusted         = false
+```
+
+- `trusted = false` from v0.1.0: the custom AM and WAL resource manager
+  require registration at postmaster start via `shared_preload_libraries`
+
+---
+
+## 13. Canonical GUC Reference
+
+All GUCs exposed by pg_eddy, listed alphabetically. **Startup** GUCs must be
+set in `postgresql.conf`; all others can be changed per-session.
+
+| GUC | Type | Default | Range | Introduced | Notes |
+|---|---|---|---|---|---|
+| `pg_eddy.adjacency_cache_size` | INT | 65536 | 1–10,000,000 | v0.6.0 | Per-backend in-memory cache of recently visited node adjacency heads (page + slot). |
+| `pg_eddy.alert_channel` | TEXT | `'pg_eddy_alerts'` | Any NOTIFY channel name | v0.24.0 | PostgreSQL NOTIFY channel for health alerts. |
+| `pg_eddy.label_cache_size` | INT | 4096 | 1–100,000 | v0.1.0 | Per-backend label name→ID cache entries. |
+| `pg_eddy.max_cypher_depth` | INT | 200 | 1–10,000 | v0.25.0 | Maximum AST depth for a Cypher query; deeper queries rejected at parse time. |
+| `pg_eddy.max_path_depth` | INT | 100 | 1–10,000 | v0.5.0 | Maximum recursion depth for variable-length path queries (`*`). |
+| `pg_eddy.max_property_chain_pages` | INT | 64 | 1–1,024 | v0.6.0 | Maximum overflow property page chain length per node or relationship. |
+| `pg_eddy.plan_cache_size` | INT | 512 | 0–100,000 | v0.4.0 | Per-backend Cypher→SQL plan cache entries. `0` disables. |
+| `pg_eddy.prop_inline_bytes` | INT | 48 | 16–4096 | v0.6.0 | **Startup.** Maximum inline property bytes per slot record. Values exceeding this go to overflow pages. Cannot be changed without reinitialising storage. |
+| `pg_eddy.shared_memory_size` | INT | 134217728 | 1 MB–system limit | v0.6.0 | **Startup.** Total shared memory block size declared to PostgreSQL. Must be ≥ `adjacency_cache_size × 24`. |
+| `pg_eddy.traversal_work_mem` | INT | 65536 | 1,024–1,073,741,824 (bytes) | v0.10.0 | Per-query memory budget for BFS/DFS traversal buffers. |
+| `pg_eddy.vacuum_freeze_threshold` | INT | 50000 | 1–10,000,000 | v0.8.0 | Minimum dead tuple count before a page is considered for VACUUM. |
+
+---
+
+## 14. Error Code Taxonomy
+
+Error messages use PostgreSQL-style formatting (lowercase first word, no
+trailing period). Codes use the `PE` prefix:
+
+| Range | Category |
+|---|---|
+| `PE001`–`PE099` | Catalog errors (label/type registration, ID allocation) |
+| `PE100`–`PE199` | Storage AM errors (page corruption, write failures, MVCC) |
+| `PE200`–`PE299` | Cypher parse errors (syntax, unsupported constructs) |
+| `PE300`–`PE399` | Cypher plan/execution errors (type errors, runtime failures) |
+| `PE400`–`PE499` | Constraint errors (unique violation, existence violation) |
+| `PE500`–`PE599` | Import/export errors (CSV format, path access) |
+| `PE600`–`PE699` | IVM / pg-trickle integration errors |
+| `PE700`–`PE799` | Admin errors (vacuum, reindex, migration) |
+| `PE800`–`PE899` | Configuration errors (invalid GUC combinations) |
+
+---
+
+## 15. Security Considerations
+
+- **Cypher injection**: all user-supplied string values in Cypher property
+  comparisons are passed as SPI bind parameters (`$N`); the Cypher→SQL
+  translator never interpolates user-controlled strings into SQL text. All
+  property key names and label names go through the integer registry (no SQL
+  metacharacters possible)
+- **AM page validation**: the custom AM's page reader validates magic numbers
+  and slot offsets before dereferencing pointers; malformed pages raise a
+  `PE100` error rather than crashing
+- **Resource limits**: `pg_eddy.max_path_depth`, `pg_eddy.max_cypher_depth`,
+  and `statement_timeout` together prevent runaway recursive traversals and
+  deeply nested queries
+- **Privilege model**: `pg_eddy.*` functions default to `SECURITY INVOKER`;
+  the `_pg_eddy` internal schema is accessible only to the extension owner;
+  label-level RLS is managed via `pg_eddy.grant_label()` (v0.25.0)
+- **WAL decode plugin security**: the logical decoding output plugin only
+  processes WAL records from `pg_eddy`'s own relation OIDs; it validates OID
+  matches before decoding to prevent processing records from unrelated tables
+- **Memory safety**: all Rust code is safe except the AM callbacks (`unsafe
+  extern "C"`); every unsafe block has a safety comment documenting the
+  invariants being upheld; `cargo clippy` with `#![deny(unsafe_op_in_unsafe_fn)]`
+
+---
+
+## 16. Future Architecture (Post-v1.0)
+
+These items are documented for architectural awareness and are not in the v0.x
+scope:
+
+- **GQL support**: ISO SQL:2023 Part 16 (GQL) query language alongside
+  OpenCypher; share the same logical plan IR
+- **SPARQL / RDF bridge**: interoperability with pg-ripple — project LPG
+  subgraphs as RDF for SPARQL consumption
+- **Distributed execution via Citus**: horizontal sharding of node/edge pages
+  across Citus worker nodes; shard by community/partition for locality
+- **pg-trickle graph analytics**: PageRank, betweenness centrality, connected
+  components as pg-trickle stream tables that stay incrementally up to date
+- **Graph Neural Network embeddings**: store node/edge embeddings alongside
+  graph data; combined Cypher + vector similarity queries
+- **Bolt protocol**: native Bolt v5 wire protocol for Neo4j driver compatibility
+  without modification (`pg_eddy_http` extension)
+- **Property graph schema (PG Schema)**: declarative schema language for LPG
+  (ISO GQL standard)
+- **Temporal graph queries**: bitstring validity columns for versioned graph
+  snapshots and as-of queries
+- **`pg_upgrade` compatibility**: structural migration of custom AM pages
+  between major PostgreSQL versions
+
+---
+
+## 17. References
+
+- [openCypher Specification](https://opencypher.org/)
+- [openCypher TCK](https://github.com/opencypher/openCypher/tree/master/tck)
+- [PostgreSQL Table AM API](https://www.postgresql.org/docs/current/tableam.html)
+- [pgrx 0.18](https://github.com/pgcentralfoundation/pgrx)
+- [pg-trickle](https://github.com/trickle-labs/pg-trickle)
+- [pg-ripple](https://github.com/trickle-labs/pg-ripple) — sister project (RDF
+  triplestore on PostgreSQL using pg-trickle, similar architecture without
+  custom AM)
+- [LDBC Social Network Benchmark](https://ldbcouncil.org/benchmarks/snb/)
+- [Neo4j native graph storage whitepaper](https://neo4j.com/blog/native-vs-non-native-graph-technology/)
+- [DBSP: Incremental Computation on Streams](https://arxiv.org/abs/2203.16684)
+  (theoretical foundation for pg-trickle, relevant to incremental graph views)
