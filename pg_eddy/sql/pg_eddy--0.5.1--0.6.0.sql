@@ -1,0 +1,8 @@
+-- pg_eddy--0.5.1--0.6.0.sql
+-- Migration from v0.5.1 to v0.6.0.
+--
+-- No new catalog objects are required for v0.6.0.
+-- The cypher() and cypher_explain() functions are registered by pgrx
+-- when the shared library is loaded; no explicit CREATE FUNCTION is needed.
+--
+-- This file intentionally has no DDL statements.

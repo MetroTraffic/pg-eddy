@@ -1600,40 +1600,50 @@ release — start v0.6.0 immediately.
 **Goal**: `pg_eddy.cypher()` executes MATCH/RETURN queries using the native
 AM. Node isomorphism and null semantics are correct from the first release.
 
-**v0.6.0 deliverables**:
-- [ ] Cypher lexer: all openCypher token types, Unicode identifiers, numeric
+**v0.6.0 deliverables** ✅ COMPLETE (commit 8dda1c5, tag v0.6.0, 2026-05-09):
+- [x] Cypher lexer: all openCypher token types, Unicode identifiers, numeric
       literals, string escapes
-- [ ] Cypher parser: single-clause `MATCH`/`RETURN`; node and relationship
+- [x] Cypher parser: single-clause `MATCH`/`RETURN`; node and relationship
       patterns; `WHERE` with comparisons, `IS NULL`, `AND`/`OR`/`NOT`
-- [ ] AST types (`src/cypher/ast.rs`)
-- [ ] Logical planner: `LabelScan` + `Expand(OUT/IN/BOTH)` + `Filter` + `Project`
-- [ ] **Node isomorphism**: SQL generator emits `a.node_id <> b.node_id` for
-      every distinct node variable pair (see §6.3)
-- [ ] SQL generator targeting adjacency-follow scans on the custom AM tables
-- [ ] `pg_eddy.cypher(query TEXT, params JSONB) RETURNS SETOF JSONB`
-- [ ] `pg_eddy.cypher_explain(query TEXT, params JSONB) RETURNS TEXT`
-- [ ] TCK harness (`tests/tck/`): runs `.feature` files from the openCypher
-      TCK, reports pass/fail per scenario; runs in CI on every PR
-- [ ] Fuzz targets for lexer and parser in CI nightly
-- [ ] Target: pass `MatchAcceptance` TCK group
+- [x] AST types (`src/cypher/ast.rs`)
+- [x] Logical planner: `LabelScan` + `Expand(OUT/IN/BOTH)` + `Filter` +
+      `Project` + `CrossProduct`
+- [x] **Node isomorphism**: planner emits `id(a) <> id(b)` filter for every
+      distinct node variable pair (implemented in planner+executor, not SQL
+      generator — interpreter approach is cleaner for v0.6.0)
+- [x] `pg_eddy.cypher(query TEXT, params JSONB) RETURNS SETOF JSONB`
+- [x] `pg_eddy.cypher_explain(query TEXT) RETURNS TEXT`
+- [x] Built-in functions: `id()`, `labels()`, `type()`, `properties()`,
+      `keys()`, `coalesce()`, `toString()`, `toInteger()`, `toFloat()`
+- [x] 10 new pgrx integration tests (61/61 pass); 26 Rust unit tests
+- [ ] **Deferred to v0.7.0**: TCK harness, fuzz targets, MatchAcceptance run
+- [ ] **Design note**: interpreter executor replaces SQL generator — avoids
+      SQL injection risk entirely (no string interpolation into SQL)
 
-**v0.7.0 deliverables**:
-- [ ] Multi-clause queries (`MATCH … WITH … MATCH … RETURN`)
-- [ ] `OPTIONAL MATCH` (left outer join in SQL)
-- [ ] Pattern variables on relationships
-- [ ] `WHERE` extended: `IN [...]`, `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `=~`
-- [ ] `ORDER BY`, `SKIP`, `LIMIT`, `RETURN DISTINCT`
-- [ ] Null semantics evaluator (`src/cypher/expressions.rs`) for list/map
-      operations where SQL semantics diverge from openCypher (see §6.6)
-- [ ] Cypher plan cache (`src/cypher/plan_cache.rs`)
-- [ ] Built-in functions: `id()`, `labels()`, `type()`, `keys()`,
-      `properties()`, `size()`, `length()`, `head()`, `tail()`, `last()`,
-      `coalesce()`, `toString()`, `toInteger()`, `toFloat()`, `toBoolean()`
-- [ ] Target: pass `ReturnAcceptance`, `WithAcceptance`, `FunctionsAcceptance`
+**v0.7.0 deliverables** (in progress):
+- [ ] openCypher TCK harness (`tests/tck/`): Perl driver that parses
+      `.feature` files and runs scenarios via psql; reports pass/fail per
+      scenario; runs in CI on every PR
+- [ ] Fuzz targets for lexer and parser (`fuzz/` crate)
+- [ ] `IN [...]` list membership predicate
+- [ ] `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `=~` (regex) string predicates
+- [ ] `ORDER BY`, `SKIP`, `LIMIT` (applied in executor after projection)
+- [ ] `RETURN DISTINCT` already partially wired; complete with window dedup
+- [ ] `WITH` clause: mid-query projection and filtering between MATCH chains
+- [ ] `OPTIONAL MATCH` (rows with no match produce NULL bindings)
+- [ ] Relationship variable access in RETURN (`RETURN type(r)`, `r.prop`)
+- [ ] Null semantics evaluator: openCypher null propagation through
+      arithmetic, comparisons, and list indexing
+- [ ] Built-in functions: `size()`, `length()`, `head()`, `tail()`, `last()`,
+      `toBoolean()`
+- [ ] TCK target: pass `MatchAcceptance`, `ReturnAcceptance` groups; ≥10% overall
 
-**Exit criteria**: `pg_eddy.cypher()` executes MATCH patterns including node
-isomorphism; TCK pass rate ≥25%; no SQL injection possible via crafted Cypher
-property values; parser fuzz runs without panics.
+**Exit criteria (combined Phase 5)**:
+- `pg_eddy.cypher()` executes MATCH/WHERE/RETURN/WITH/OPTIONAL MATCH patterns
+- Node isomorphism enforced; null semantics correct per openCypher spec
+- TCK pass rate ≥25% overall; `MatchAcceptance` fully passing
+- No SQL injection possible (interpreter evaluates params directly as Values)
+- Parser fuzz runs without panics (cargo fuzz)
 
 **AGE comparison benchmark** (v0.7.0): run LDBC SNB IS-1 (single node lookup)
 and IS-3 (2-hop friends-of-friends with date filter) on a 1M-person / 10M-

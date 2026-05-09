@@ -19,7 +19,7 @@ pgrx::pg_module_magic!();
 // ---------------------------------------------------------------------------
 // Extension SQL — schemas, registry tables, AM objects, and SQL functions.
 // ---------------------------------------------------------------------------
-extension_sql_file!("../sql/pg_eddy--0.5.1.sql", name = "pg_eddy_schema", finalize);
+extension_sql_file!("../sql/pg_eddy--0.6.0.sql", name = "pg_eddy_schema", finalize);
 
 // ---------------------------------------------------------------------------
 // _PG_init  — runs at postmaster start (shared_preload_libraries)

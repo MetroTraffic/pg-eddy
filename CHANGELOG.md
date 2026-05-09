@@ -6,12 +6,95 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.6.0](#060--2026-05-09--cypher-query-engine) — Cypher Query Engine
 - [0.5.1](#051--2026-05-09--tap-infrastructure-wal-hardening-and-age-benchmark) — TAP Infrastructure, WAL Hardening, and AGE Benchmark
 - [0.5.0](#050--2026-05-09--indexes-constraints-and-full-crud-api) — Indexes, Constraints, and Full CRUD API
 - [0.4.0](#040--2026-05-09--mvcc-and-vacuum) — MVCC and VACUUM
 - [0.3.0](#030--2026-05-09--edge-storage--adjacency-lists) — Edge Storage + Adjacency Lists
 - [0.2.0](#020--2026-05-09--node-storage) — Node Storage
 - [0.1.0](#010--2026-05-09--am-skeleton) — AM Skeleton
+
+---
+
+## [0.6.0] — 2026-05-09 — Cypher Query Engine
+
+v0.6.0 delivers the first working Cypher query engine for pg_eddy. You can now
+execute `MATCH (n:Label) RETURN n` queries via `pg_eddy.cypher()` and inspect
+the logical plan with `pg_eddy.cypher_explain()`. The engine is a recursive
+interpreter — it walks the logical plan tree and drives the native AM accessors
+directly, avoiding SQL injection risk and SQL round-trips alike. 61/61 tests pass.
+
+### New Functions
+
+**`pg_eddy.cypher(query TEXT, params JSONB DEFAULT NULL) RETURNS SETOF JSONB`**  
+Execute a Cypher query and receive JSONB rows. Each output row is a JSON object
+whose keys are the names from the `RETURN` clause.
+
+```sql
+SELECT * FROM pg_eddy.cypher('MATCH (n:Person) WHERE n.age > $min RETURN n.name',
+                              '{"min": 30}'::jsonb);
+```
+
+**`pg_eddy.cypher_explain(query TEXT) RETURNS TEXT`**  
+Return the logical query plan as a human-readable string, without executing it.
+Useful for understanding how the planner decomposed the query.
+
+```sql
+SELECT pg_eddy.cypher_explain('MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b');
+-- Project
+--   Filter (isomorphism: id(a) <> id(b))
+--     Expand a -[:KNOWS]-> b
+--       LabelScan a :Person
+```
+
+### Cypher Language Coverage
+
+The parser handles a useful subset of openCypher:
+
+- **Patterns**: node patterns `(n:Label {prop: val})`, relationship patterns
+  `(a)-[:TYPE]->(b)`, bidirectional `(a)-[:TYPE]-(b)`, any-direction `(a)-->(b)`
+- **WHERE**: equality (`=`, `<>`, `<`, `>`, `<=`, `>=`), `IS NULL`, `IS NOT NULL`,
+  `AND`, `OR`, `NOT`, arithmetic (`+`, `-`, `*`, `/`, `%`), property access
+  (`n.prop`), parameters (`$name`), string literals, numeric literals
+- **RETURN**: property access, variable projection, `RETURN DISTINCT`,
+  function calls, `AS` aliases
+- **Parameters**: `$name` mapped to the `params` JSONB argument
+
+### Built-in Functions
+
+`id(n)`, `labels(n)`, `type(r)`, `properties(n)`, `keys(n)`,
+`coalesce(a, b, …)`, `toString(v)`, `toInteger(v)`, `toFloat(v)`
+
+### Logical Planner
+
+The planner (`src/cypher/planner.rs`) builds a tree of:
+
+- **LabelScan** — iterates all nodes matching a label via `_pg_eddy.label_index`
+- **Expand** — follows edges in `OUT`, `IN`, or `BOTH` directions via the
+  adjacency-follow AM accessors
+- **CrossProduct** — joins two independent patterns (no shared variables)
+- **Filter** — evaluates a WHERE predicate or isomorphism constraint
+- **Project** — evaluates the RETURN items and selects output columns
+
+### Node Isomorphism
+
+Per the openCypher specification, two distinct node variables in a MATCH pattern
+must not be bound to the same physical node. pg_eddy enforces this by
+automatically injecting `id(a) <> id(b)` filter nodes in the plan for every
+pair of distinct node variables in the pattern.
+
+### Tests
+
+10 new pgrx integration tests cover end-to-end Cypher execution. 26 Rust unit
+tests cover the lexer, parser, and planner individually. All 61 tests pass.
+
+### Not Included in v0.6.0 (deferred to v0.7.0)
+
+- openCypher TCK harness (requires downloading TCK `.feature` files)
+- Fuzz targets for the lexer and parser
+- `WITH`, `OPTIONAL MATCH`, `ORDER BY`, `SKIP`, `LIMIT`
+- `IN [...]`, `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `=~`
+- Additional built-ins: `size()`, `length()`, `head()`, `tail()`, `toBoolean()`
 
 ---
 
