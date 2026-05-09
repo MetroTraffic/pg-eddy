@@ -1,0 +1,3 @@
+[submodule "vendor/opencypher"]
+	path = vendor/opencypher
+	url = https://github.com/opencypher/openCypher

@@ -7,15 +7,7 @@ implements a custom Table Access Method (AM) for a high-performance native
 Labelled Property Graph (LPG) store.
 
 See [plans/implementation_plan.md](plans/implementation_plan.md) for the
-complete design and phased roadmap.
-
-## Current Phase
-
-**Phase 0 — AM skeleton (v0.1.0)**
-
-The extension loads, the WAL resource manager is registered, and both AM
-objects (`pg_eddy_node`, `pg_eddy_edge`) are created. All AM callbacks are
-stubs (scan returns empty; all mutations error "not implemented").
+complete design and implementation roadmap.
 
 ## Project Layout
 
@@ -60,9 +52,16 @@ cargo pgrx run pg18                # start psql session
 
 Or use `just` (see `justfile`).
 
-## Exit Criteria for Phase 0
+## Release Checklist
 
-1. `CREATE EXTENSION pg_eddy` succeeds (with `shared_preload_libraries`).
-2. `SELECT * FROM pg_eddy.nodes` returns empty without panicking.
-3. `SELECT pg_eddy.health_check()` returns `'pg_eddy OK'`.
-4. WAL resource manager appears in `pg_stat_wal`.
+Before releasing a new version:
+
+1. **Update deliverables** — Update `Cargo.toml` version, create migration SQL
+   files if needed (`pg_eddy--X.Y.Z--X.Y.W.sql`), and update `pg_eddy.control`.
+2. **Update CHANGELOG.md** — Document all changes, fixes, and features for the
+   release.
+3. **Run tests** — Execute `cargo pgrx test pg18` to ensure all tests pass.
+4. **Run clippy** — Execute `cargo clippy --features pg18` to check for linting
+   issues.
+5. **Create git tag** — Tag the release with `git tag vX.Y.Z` and push to
+   repository.
