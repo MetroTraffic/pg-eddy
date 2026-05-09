@@ -78,7 +78,7 @@ impl Parser {
         }
     }
 
-    /// Parse: MATCH pattern [WHERE expr] RETURN items
+    /// Parse: MATCH pattern [WHERE expr] RETURN items [ORDER BY ...] [SKIP n] [LIMIT n]
     fn parse_query(&mut self) -> Result<Query, ParseError> {
         self.expect(&Token::Match)?;
         let match_clause = self.parse_match_clause()?;
@@ -93,6 +93,50 @@ impl Parser {
         self.expect(&Token::Return)?;
         let return_clause = self.parse_return_clause()?;
 
+        // ORDER BY
+        let order_by = if *self.peek() == Token::OrderBy {
+            self.advance();
+            let mut items = Vec::new();
+            loop {
+                let expr = self.parse_expr()?;
+                let ascending = match self.peek().clone() {
+                    Token::Ident(ref s) if s.eq_ignore_ascii_case("DESC")
+                                       || s.eq_ignore_ascii_case("DESCENDING") => {
+                        self.advance();
+                        false
+                    }
+                    Token::Ident(ref s) if s.eq_ignore_ascii_case("ASC")
+                                       || s.eq_ignore_ascii_case("ASCENDING") => {
+                        self.advance();
+                        true
+                    }
+                    _ => true,
+                };
+                items.push(crate::cypher::ast::OrderItem { expr, ascending });
+                if *self.peek() != Token::Comma { break; }
+                self.advance();
+            }
+            items
+        } else {
+            Vec::new()
+        };
+
+        // SKIP
+        let skip = if *self.peek() == Token::Skip {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        // LIMIT
+        let limit = if *self.peek() == Token::Limit {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
         if *self.peek() != Token::Eof {
             return Err(ParseError {
                 message: format!("unexpected token after RETURN: {:?}", self.peek()),
@@ -104,6 +148,9 @@ impl Parser {
             match_clause,
             where_clause,
             return_clause,
+            order_by,
+            skip,
+            limit,
         })
     }
 
@@ -361,6 +408,45 @@ impl Parser {
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
         let left = self.parse_addition()?;
 
+        // String predicates: STARTS WITH, ENDS WITH, CONTAINS
+        if let Token::Ident(s) = self.peek().clone() {
+            let upper = s.to_ascii_uppercase();
+            match upper.as_str() {
+                "STARTS" => {
+                    self.advance();
+                    self.expect(&Token::With)?;
+                    let right = self.parse_addition()?;
+                    return Ok(Expr::StartsWith(Box::new(left), Box::new(right)));
+                }
+                "ENDS" => {
+                    self.advance();
+                    self.expect(&Token::With)?;
+                    let right = self.parse_addition()?;
+                    return Ok(Expr::EndsWith(Box::new(left), Box::new(right)));
+                }
+                "CONTAINS" => {
+                    self.advance();
+                    let right = self.parse_addition()?;
+                    return Ok(Expr::Contains(Box::new(left), Box::new(right)));
+                }
+                _ => {}
+            }
+        }
+
+        // IN list membership
+        if *self.peek() == Token::In {
+            self.advance();
+            let list_expr = self.parse_primary()?;
+            return Ok(Expr::InList(Box::new(left), Box::new(list_expr)));
+        }
+
+        // =~ regex match
+        if *self.peek() == Token::RegexMatch {
+            self.advance();
+            let right = self.parse_addition()?;
+            return Ok(Expr::Regex(Box::new(left), Box::new(right)));
+        }
+
         let op = match self.peek() {
             Token::Eq => Some(CmpOp::Eq),
             Token::Neq => Some(CmpOp::Neq),
@@ -480,6 +566,20 @@ impl Parser {
                 let inner = self.parse_expr()?;
                 self.expect(&Token::RParen)?;
                 inner
+            }
+            Token::LBracket => {
+                // List literal: [expr, expr, ...]
+                self.advance();
+                let mut elems = Vec::new();
+                if *self.peek() != Token::RBracket {
+                    elems.push(self.parse_expr()?);
+                    while *self.peek() == Token::Comma {
+                        self.advance();
+                        elems.push(self.parse_expr()?);
+                    }
+                }
+                self.expect(&Token::RBracket)?;
+                Expr::List(elems)
             }
             Token::Ident(name) => {
                 self.advance();

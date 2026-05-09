@@ -37,11 +37,14 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         predicate: Expr,
     },
-    /// Project: compute output columns.
+    /// Project: compute output columns (also applies ORDER BY / SKIP / LIMIT).
     Project {
         input: Box<LogicalPlan>,
         items: Vec<ReturnItem>,
         distinct: bool,
+        order_by: Vec<crate::cypher::ast::OrderItem>,
+        skip: Option<Expr>,
+        limit: Option<Expr>,
     },
 }
 
@@ -96,11 +99,14 @@ pub fn plan(query: &Query) -> Result<LogicalPlan, PlanError> {
         };
     }
 
-    // Step 5: Project (RETURN clause).
+    // Step 5: Project (RETURN clause + ORDER BY / SKIP / LIMIT).
     plan = LogicalPlan::Project {
         input: Box::new(plan),
         items: query.return_clause.items.clone(),
         distinct: query.return_clause.distinct,
+        order_by: query.order_by.clone(),
+        skip: query.skip.clone(),
+        limit: query.limit.clone(),
     };
 
     Ok(plan)
@@ -281,7 +287,7 @@ pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
             let child = explain(input, indent + 1);
             format!("{prefix}Filter({predicate:?})\n{child}")
         }
-        LogicalPlan::Project { input, items, distinct } => {
+        LogicalPlan::Project { input, items, distinct, .. } => {
             let cols: Vec<String> = items.iter().map(|it| {
                 let base = format!("{:?}", it.expr);
                 match &it.alias {

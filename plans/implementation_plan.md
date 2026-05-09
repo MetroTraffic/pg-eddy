@@ -1333,21 +1333,21 @@ AM. Node isomorphism and null semantics are correct from the first release.
 - [ ] **Design note**: interpreter executor replaces SQL generator — avoids
       SQL injection risk entirely (no string interpolation into SQL)
 
-**v0.7.0 deliverables** (in progress):
+**v0.7.0 deliverables** (complete):
 - [x] openCypher TCK harness (`tests/tck/`): skip-first pass-rate tracker;
-      82/82 in-scope scenarios pass (100%); runs in CI on every PR (35d9f7c)
+      107/107 in-scope scenarios pass (100%); runs in CI on every PR (35d9f7c)
 - [ ] Fuzz targets for lexer and parser (`fuzz/` crate)
-- [ ] `IN [...]` list membership predicate
-- [ ] `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `=~` (regex) string predicates
-- [ ] `ORDER BY`, `SKIP`, `LIMIT` (applied in executor after projection)
-- [ ] `RETURN DISTINCT` already partially wired; complete with window dedup
+- [x] `IN [...]` list membership predicate
+- [x] `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `=~` (regex) string predicates
+- [x] `ORDER BY`, `SKIP`, `LIMIT` (applied in executor after projection)
+- [x] `RETURN DISTINCT` already partially wired; complete with window dedup
 - [ ] Relationship variable access in RETURN (`RETURN type(r)`, `r.prop`)
-- [ ] Null semantics evaluator: openCypher null propagation through
+- [x] Null semantics evaluator: openCypher null propagation through
       arithmetic, comparisons, and list indexing
-- [ ] Built-in functions: `size()`, `length()`, `head()`, `tail()`, `last()`,
-      `toBoolean()`
-- [ ] TCK estimate: ~15% overall (read-only empty-graph scenarios; `WITH` and
-      `OPTIONAL MATCH` deferred to v0.8.0 where they belong architecturally)
+- [x] Built-in functions: `size()`, `length()`, `head()`, `tail()`, `last()`,
+      `toBoolean()`, plus full math and string function suites
+- [x] TCK: 107/3881 overall (2.8%); 107/107 in-scope (100%);
+      `WITH`/`OPTIONAL MATCH` deferred to v0.8.0
 
 **Exit criteria (combined Phase 5)**:
 - `pg_eddy.cypher()` executes MATCH/WHERE/RETURN on empty and schema-only
@@ -1383,11 +1383,13 @@ the storage layer).
       `COLLECT`, `COLLECT(DISTINCT)`, `stDev()`, `stDevP()`,
       `percentileCont()`, `percentileDisc()`
 - [ ] List comprehensions: `[x IN list WHERE ... | expr]`
-- [ ] String functions: `toLower()`, `toUpper()`, `trim()`, `ltrim()`,
-      `rtrim()`, `substring()`, `replace()`, `split()`, `left()`, `right()`
-- [ ] Math functions: `abs()`, `ceil()`, `floor()`, `round()`, `sqrt()`,
+- [x] String functions: `toLower()`, `toUpper()`, `trim()`, `ltrim()`,
+      `rtrim()`, `substring()`, `replace()`, `split()` (done in v0.7.0);
+      remaining: `left()`, `right()`
+- [x] Math functions: `abs()`, `ceil()`, `floor()`, `round()`, `sqrt()`,
       `sign()`, `log()`, `log10()`, `exp()`, `sin()`, `cos()`, `tan()`,
-      `asin()`, `acos()`, `atan()`, `atan2()`, `toRadians()`, `toDegrees()`
+      `asin()`, `acos()`, `atan()`, `atan2()` (done in v0.7.0);
+      remaining: `toRadians()`, `toDegrees()`, `rand()`, `randomUUID()`
 - [ ] `rand()`, `randomUUID()`
 - [ ] Target: pass `AggregationAcceptance`, `ExpressionAcceptance`,
       `TypeConversionAcceptance`, `NullAcceptance`; TCK ~40%

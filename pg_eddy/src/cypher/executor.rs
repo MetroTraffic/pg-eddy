@@ -158,8 +158,8 @@ pub fn execute(
         LogicalPlan::Filter { input, predicate } => {
             exec_filter(input, predicate, params)
         }
-        LogicalPlan::Project { input, items, distinct } => {
-            exec_project(input, items, *distinct, params)
+        LogicalPlan::Project { input, items, distinct, order_by, skip, limit } => {
+            exec_project(input, items, *distinct, order_by, skip, limit, params)
         }
     }
 }
@@ -487,33 +487,74 @@ fn exec_project(
     input: &LogicalPlan,
     items: &[ReturnItem],
     distinct: bool,
+    order_by: &[crate::cypher::ast::OrderItem],
+    skip: &Option<Expr>,
+    limit: &Option<Expr>,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<Vec<Row>, ExecError> {
     let rows = execute(input, params)?;
-    let mut result = Vec::new();
+
+    // Build (projected_row, input_row) pairs; keep input rows for ORDER BY alias resolution.
+    let mut projected: Vec<(Row, Row)> = Vec::with_capacity(rows.len());
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for row in &rows {
+    for row in rows {
         let mut out_row = Row::new();
         for (idx, item) in items.iter().enumerate() {
-            let val = eval_expr(&item.expr, row, params)?;
+            let val = eval_expr(&item.expr, &row, params)?;
             let key = item.alias.clone().unwrap_or_else(|| {
                 expr_default_name(&item.expr, idx)
             });
             out_row.insert(key, val);
         }
-
-        if distinct {
-            let fingerprint = row_fingerprint(&out_row);
-            if !seen.insert(fingerprint) {
-                continue;
-            }
-        }
-
-        result.push(out_row);
+        projected.push((out_row, row));
     }
 
-    Ok(result)
+    // ORDER BY — sort before DISTINCT/SKIP/LIMIT
+    if !order_by.is_empty() {
+        projected.sort_by(|(proj_a, in_a), (proj_b, in_b)| {
+            for item in order_by {
+                // Try projected (alias) first, then input (pattern variable)
+                let av = eval_expr(&item.expr, proj_a, params)
+                    .or_else(|_| eval_expr(&item.expr, in_a, params))
+                    .unwrap_or(Value::Null);
+                let bv = eval_expr(&item.expr, proj_b, params)
+                    .or_else(|_| eval_expr(&item.expr, in_b, params))
+                    .unwrap_or(Value::Null);
+                let cmp = value_ordering(&av, &bv);
+                if cmp != std::cmp::Ordering::Equal {
+                    return if item.ascending { cmp } else { cmp.reverse() };
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+
+    // DISTINCT
+    if distinct {
+        projected.retain(|(out_row, _)| {
+            let fp = row_fingerprint(out_row);
+            seen.insert(fp)
+        });
+    }
+
+    // SKIP
+    if let Some(skip_expr) = skip {
+        let n = eval_const_usize(skip_expr, params);
+        if n >= projected.len() {
+            projected.clear();
+        } else {
+            projected.drain(0..n);
+        }
+    }
+
+    // LIMIT
+    if let Some(limit_expr) = limit {
+        let n = eval_const_usize(limit_expr, params);
+        projected.truncate(n);
+    }
+
+    Ok(projected.into_iter().map(|(out_row, _)| out_row).collect())
 }
 
 /// Evaluate an expression against a row of bindings.
@@ -551,24 +592,53 @@ pub fn eval_expr(
             Ok(Value::Bool(compare_values(&l, op, &r)))
         }
         Expr::And(left, right) => {
+            // openCypher 3-valued logic: null AND false = false; null AND true = null
             let l = eval_expr(left, row, params)?;
-            if !l.is_truthy() {
-                return Ok(Value::Bool(false));
+            match truthy3(&l) {
+                Some(false) => Ok(Value::Bool(false)),
+                Some(true) => {
+                    let r = eval_expr(right, row, params)?;
+                    match truthy3(&r) {
+                        Some(b) => Ok(Value::Bool(b)),
+                        None => Ok(Value::Null),
+                    }
+                }
+                None => {
+                    let r = eval_expr(right, row, params)?;
+                    match truthy3(&r) {
+                        Some(false) => Ok(Value::Bool(false)),
+                        _ => Ok(Value::Null),
+                    }
+                }
             }
-            let r = eval_expr(right, row, params)?;
-            Ok(Value::Bool(r.is_truthy()))
         }
         Expr::Or(left, right) => {
+            // openCypher 3-valued logic: null OR true = true; null OR false = null
             let l = eval_expr(left, row, params)?;
-            if l.is_truthy() {
-                return Ok(Value::Bool(true));
+            match truthy3(&l) {
+                Some(true) => Ok(Value::Bool(true)),
+                Some(false) => {
+                    let r = eval_expr(right, row, params)?;
+                    match truthy3(&r) {
+                        Some(b) => Ok(Value::Bool(b)),
+                        None => Ok(Value::Null),
+                    }
+                }
+                None => {
+                    let r = eval_expr(right, row, params)?;
+                    match truthy3(&r) {
+                        Some(true) => Ok(Value::Bool(true)),
+                        _ => Ok(Value::Null),
+                    }
+                }
             }
-            let r = eval_expr(right, row, params)?;
-            Ok(Value::Bool(r.is_truthy()))
         }
         Expr::Not(inner) => {
             let v = eval_expr(inner, row, params)?;
-            Ok(Value::Bool(!v.is_truthy()))
+            match truthy3(&v) {
+                Some(b) => Ok(Value::Bool(!b)),
+                None => Ok(Value::Null),
+            }
         }
         Expr::IsNull(inner) => {
             let v = eval_expr(inner, row, params)?;
@@ -602,6 +672,81 @@ pub fn eval_expr(
             }
             Ok(Value::Json(serde_json::Value::Object(m)))
         }
+        Expr::List(exprs) => {
+            let vals: Vec<serde_json::Value> = exprs
+                .iter()
+                .map(|e| eval_expr(e, row, params).map(|v| v.to_json()))
+                .collect::<Result<_, _>>()?;
+            Ok(Value::Json(serde_json::Value::Array(vals)))
+        }
+        Expr::InList(left, right_list) => {
+            let val = eval_expr(left, row, params)?;
+            if matches!(val, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let list = eval_expr(right_list, row, params)?;
+            let arr = match &list {
+                Value::Json(serde_json::Value::Array(a)) => a.clone(),
+                Value::Null => return Ok(Value::Null),
+                _ => return Ok(Value::Bool(false)),
+            };
+            let mut has_null = false;
+            for item in &arr {
+                let item_val = json_to_value(item);
+                if matches!(item_val, Value::Null) {
+                    has_null = true;
+                } else if values_equal(&val, &item_val) {
+                    return Ok(Value::Bool(true));
+                }
+            }
+            if has_null { Ok(Value::Null) } else { Ok(Value::Bool(false)) }
+        }
+        Expr::StartsWith(left, right) => {
+            let l = eval_expr(left, row, params)?;
+            let r = eval_expr(right, row, params)?;
+            match (&l, &r) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Str(s), Value::Str(prefix)) => Ok(Value::Bool(s.starts_with(prefix.as_str()))),
+                _ => Ok(Value::Null),
+            }
+        }
+        Expr::EndsWith(left, right) => {
+            let l = eval_expr(left, row, params)?;
+            let r = eval_expr(right, row, params)?;
+            match (&l, &r) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Str(s), Value::Str(suffix)) => Ok(Value::Bool(s.ends_with(suffix.as_str()))),
+                _ => Ok(Value::Null),
+            }
+        }
+        Expr::Contains(left, right) => {
+            let l = eval_expr(left, row, params)?;
+            let r = eval_expr(right, row, params)?;
+            match (&l, &r) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Str(s), Value::Str(sub)) => Ok(Value::Bool(s.contains(sub.as_str()))),
+                _ => Ok(Value::Null),
+            }
+        }
+        Expr::Regex(left, right) => {
+            let l = eval_expr(left, row, params)?;
+            let r = eval_expr(right, row, params)?;
+            match (&l, &r) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Str(s), Value::Str(pattern)) => {
+                    // Use PostgreSQL's regexp_like via SPI for full POSIX regex support.
+                    let result = Spi::get_one_with_args::<bool>(
+                        "SELECT $1 ~ $2",
+                        &[
+                            pgrx::datum::DatumWithOid::from(s.as_str()),
+                            pgrx::datum::DatumWithOid::from(pattern.as_str()),
+                        ],
+                    ).unwrap_or(Some(false)).unwrap_or(false);
+                    Ok(Value::Bool(result))
+                }
+                _ => Ok(Value::Null),
+            }
+        }
     }
 }
 
@@ -614,6 +759,14 @@ impl Value {
             Value::Str(s) => !s.is_empty(),
             _ => true,
         }
+    }
+}
+
+/// Three-valued logic for openCypher: returns None for NULL.
+fn truthy3(v: &Value) -> Option<bool> {
+    match v {
+        Value::Null => None,
+        other => Some(other.is_truthy()),
     }
 }
 
@@ -831,9 +984,328 @@ fn eval_function(
             }
             Ok(Value::Null)
         }
+        // --- Type conversion ---
+        "toboolean" => {
+            if args.len() != 1 {
+                return Err(ExecError { message: "toBoolean() takes exactly 1 argument".into() });
+            }
+            let val = eval_expr(&args[0], row, params)?;
+            match val {
+                Value::Bool(b) => Ok(Value::Bool(b)),
+                Value::Str(s) => match s.to_ascii_lowercase().as_str() {
+                    "true" => Ok(Value::Bool(true)),
+                    "false" => Ok(Value::Bool(false)),
+                    _ => Ok(Value::Null),
+                },
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        // --- Size / length ---
+        "size" => {
+            if args.len() != 1 {
+                return Err(ExecError { message: "size() takes exactly 1 argument".into() });
+            }
+            let val = eval_expr(&args[0], row, params)?;
+            match val {
+                Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
+                Value::Json(serde_json::Value::Array(a)) => Ok(Value::Int(a.len() as i64)),
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "length" => {
+            if args.len() != 1 {
+                return Err(ExecError { message: "length() takes exactly 1 argument".into() });
+            }
+            let val = eval_expr(&args[0], row, params)?;
+            match val {
+                Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
+                Value::Json(serde_json::Value::Array(a)) => Ok(Value::Int(a.len() as i64)),
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        // --- List functions ---
+        "head" => {
+            if args.len() != 1 {
+                return Err(ExecError { message: "head() takes exactly 1 argument".into() });
+            }
+            let val = eval_expr(&args[0], row, params)?;
+            match val {
+                Value::Json(serde_json::Value::Array(mut a)) => {
+                    if a.is_empty() { Ok(Value::Null) } else { Ok(json_to_value(&a.remove(0))) }
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "tail" => {
+            if args.len() != 1 {
+                return Err(ExecError { message: "tail() takes exactly 1 argument".into() });
+            }
+            let val = eval_expr(&args[0], row, params)?;
+            match val {
+                Value::Json(serde_json::Value::Array(a)) => {
+                    if a.is_empty() {
+                        Ok(Value::Json(serde_json::Value::Array(vec![])))
+                    } else {
+                        Ok(Value::Json(serde_json::Value::Array(a[1..].to_vec())))
+                    }
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "last" => {
+            if args.len() != 1 {
+                return Err(ExecError { message: "last() takes exactly 1 argument".into() });
+            }
+            let val = eval_expr(&args[0], row, params)?;
+            match val {
+                Value::Json(serde_json::Value::Array(a)) => {
+                    match a.last() {
+                        Some(v) => Ok(json_to_value(v)),
+                        None => Ok(Value::Null),
+                    }
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "reverse" => {
+            if args.len() != 1 {
+                return Err(ExecError { message: "reverse() takes exactly 1 argument".into() });
+            }
+            let val = eval_expr(&args[0], row, params)?;
+            match val {
+                Value::Str(s) => Ok(Value::Str(s.chars().rev().collect())),
+                Value::Json(serde_json::Value::Array(mut a)) => {
+                    a.reverse();
+                    Ok(Value::Json(serde_json::Value::Array(a)))
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "range" => {
+            let (start, end, step) = match args.len() {
+                2 => {
+                    let s = eval_expr(&args[0], row, params)?;
+                    let e = eval_expr(&args[1], row, params)?;
+                    (s, e, Value::Int(1))
+                }
+                3 => {
+                    let s = eval_expr(&args[0], row, params)?;
+                    let e = eval_expr(&args[1], row, params)?;
+                    let st = eval_expr(&args[2], row, params)?;
+                    (s, e, st)
+                }
+                _ => return Err(ExecError { message: "range() takes 2 or 3 arguments".into() }),
+            };
+            let (s, e, st) = match (start, end, step) {
+                (Value::Int(s), Value::Int(e), Value::Int(st)) => (s, e, st),
+                _ => return Ok(Value::Null),
+            };
+            if st == 0 {
+                return Err(ExecError { message: "range() step cannot be 0".into() });
+            }
+            let mut result = Vec::new();
+            let mut cur = s;
+            while (st > 0 && cur <= e) || (st < 0 && cur >= e) {
+                result.push(serde_json::Value::Number(cur.into()));
+                cur += st;
+            }
+            Ok(Value::Json(serde_json::Value::Array(result)))
+        }
+        // --- String functions ---
+        "trim" => {
+            if args.len() != 1 { return Err(ExecError { message: "trim() takes exactly 1 argument".into() }); }
+            let v = eval_expr(&args[0], row, params)?;
+            match v {
+                Value::Str(s) => Ok(Value::Str(s.trim().to_string())),
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "ltrim" => {
+            if args.len() != 1 { return Err(ExecError { message: "ltrim() takes exactly 1 argument".into() }); }
+            let v = eval_expr(&args[0], row, params)?;
+            match v {
+                Value::Str(s) => Ok(Value::Str(s.trim_start().to_string())),
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "rtrim" => {
+            if args.len() != 1 { return Err(ExecError { message: "rtrim() takes exactly 1 argument".into() }); }
+            let v = eval_expr(&args[0], row, params)?;
+            match v {
+                Value::Str(s) => Ok(Value::Str(s.trim_end().to_string())),
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "upper" | "toupper" => {
+            if args.len() != 1 { return Err(ExecError { message: "upper() takes exactly 1 argument".into() }); }
+            let v = eval_expr(&args[0], row, params)?;
+            match v {
+                Value::Str(s) => Ok(Value::Str(s.to_uppercase())),
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "lower" | "tolower" => {
+            if args.len() != 1 { return Err(ExecError { message: "lower() takes exactly 1 argument".into() }); }
+            let v = eval_expr(&args[0], row, params)?;
+            match v {
+                Value::Str(s) => Ok(Value::Str(s.to_lowercase())),
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "substring" => {
+            if args.len() < 2 { return Err(ExecError { message: "substring() takes 2 or 3 arguments".into() }); }
+            let s = eval_expr(&args[0], row, params)?;
+            let start = eval_expr(&args[1], row, params)?;
+            let len_val = if args.len() >= 3 { Some(eval_expr(&args[2], row, params)?) } else { None };
+            match (s, start) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Str(s), Value::Int(start)) => {
+                    let chars: Vec<char> = s.chars().collect();
+                    let start = start.max(0) as usize;
+                    let start = start.min(chars.len());
+                    let result: String = match len_val {
+                        Some(Value::Int(len)) => chars[start..].iter().take(len.max(0) as usize).collect(),
+                        Some(Value::Null) => return Ok(Value::Null),
+                        None => chars[start..].iter().collect(),
+                        _ => chars[start..].iter().collect(),
+                    };
+                    Ok(Value::Str(result))
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+        "replace" => {
+            if args.len() != 3 { return Err(ExecError { message: "replace() takes exactly 3 arguments".into() }); }
+            let original = eval_expr(&args[0], row, params)?;
+            let search = eval_expr(&args[1], row, params)?;
+            let replacement = eval_expr(&args[2], row, params)?;
+            match (original, search, replacement) {
+                (Value::Null, _, _) | (_, Value::Null, _) | (_, _, Value::Null) => Ok(Value::Null),
+                (Value::Str(s), Value::Str(from), Value::Str(to)) => {
+                    Ok(Value::Str(s.replace(&from as &str, &to as &str)))
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+        "split" => {
+            if args.len() != 2 { return Err(ExecError { message: "split() takes exactly 2 arguments".into() }); }
+            let s = eval_expr(&args[0], row, params)?;
+            let delim = eval_expr(&args[1], row, params)?;
+            match (s, delim) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Str(s), Value::Str(d)) => {
+                    let parts: Vec<serde_json::Value> = s.split(&d as &str)
+                        .map(|p| serde_json::Value::String(p.to_string()))
+                        .collect();
+                    Ok(Value::Json(serde_json::Value::Array(parts)))
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+        // --- Math functions ---
+        "abs" => math1(args, row, params, |x| x.abs(), |x: f64| x.abs()),
+        "ceil" | "ceiling" => math1(args, row, params, |x| x, |x: f64| x.ceil()),
+        "floor" => math1(args, row, params, |x| x, |x: f64| x.floor()),
+        "round" => math1(args, row, params, |x| x, |x: f64| x.round()),
+        "sign" => math1(args, row, params, |x: i64| x.signum(), |x: f64| x.signum()),
+        "sqrt" => {
+            if args.len() != 1 { return Err(ExecError { message: "sqrt() takes exactly 1 argument".into() }); }
+            let v = eval_expr(&args[0], row, params)?;
+            match v {
+                Value::Int(i) => Ok(Value::Float((i as f64).sqrt())),
+                Value::Float(f) => Ok(Value::Float(f.sqrt())),
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "log" => math1f(args, row, params, |x: f64| x.ln()),
+        "log10" => math1f(args, row, params, |x: f64| x.log10()),
+        "exp" => math1f(args, row, params, |x: f64| x.exp()),
+        "sin" => math1f(args, row, params, |x: f64| x.sin()),
+        "cos" => math1f(args, row, params, |x: f64| x.cos()),
+        "tan" => math1f(args, row, params, |x: f64| x.tan()),
+        "asin" => math1f(args, row, params, |x: f64| x.asin()),
+        "acos" => math1f(args, row, params, |x: f64| x.acos()),
+        "atan" => math1f(args, row, params, |x: f64| x.atan()),
+        "atan2" => {
+            if args.len() != 2 { return Err(ExecError { message: "atan2() takes exactly 2 arguments".into() }); }
+            let y = to_f64(&eval_expr(&args[0], row, params)?);
+            let x = to_f64(&eval_expr(&args[1], row, params)?);
+            match (y, x) {
+                (Some(y), Some(x)) => Ok(Value::Float(y.atan2(x))),
+                _ => Ok(Value::Null),
+            }
+        }
+        "pi" => {
+            if !args.is_empty() { return Err(ExecError { message: "pi() takes no arguments".into() }); }
+            Ok(Value::Float(std::f64::consts::PI))
+        }
+        "e" => {
+            if !args.is_empty() { return Err(ExecError { message: "e() takes no arguments".into() }); }
+            Ok(Value::Float(std::f64::consts::E))
+        }
         _ => Err(ExecError {
             message: format!("unknown function: {name}()"),
         }),
+    }
+}
+
+fn to_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(i) => Some(*i as f64),
+        Value::Float(f) => Some(*f),
+        _ => None,
+    }
+}
+
+/// Helper for math functions that accept int or float and return int for int input.
+fn math1(
+    args: &[Expr],
+    row: &Row,
+    params: &HashMap<String, serde_json::Value>,
+    int_fn: impl Fn(i64) -> i64,
+    float_fn: impl Fn(f64) -> f64,
+) -> Result<Value, ExecError> {
+    if args.len() != 1 {
+        return Err(ExecError { message: "math function takes exactly 1 argument".into() });
+    }
+    let v = eval_expr(&args[0], row, params)?;
+    match v {
+        Value::Int(i) => Ok(Value::Int(int_fn(i))),
+        Value::Float(f) => Ok(Value::Float(float_fn(f))),
+        Value::Null => Ok(Value::Null),
+        _ => Ok(Value::Null),
+    }
+}
+
+/// Helper for math functions that always return float.
+fn math1f(
+    args: &[Expr],
+    row: &Row,
+    params: &HashMap<String, serde_json::Value>,
+    float_fn: impl Fn(f64) -> f64,
+) -> Result<Value, ExecError> {
+    if args.len() != 1 {
+        return Err(ExecError { message: "math function takes exactly 1 argument".into() });
+    }
+    let v = eval_expr(&args[0], row, params)?;
+    match v {
+        Value::Int(i) => Ok(Value::Float(float_fn(i as f64))),
+        Value::Float(f) => Ok(Value::Float(float_fn(f))),
+        Value::Null => Ok(Value::Null),
+        _ => Ok(Value::Null),
     }
 }
 
@@ -859,6 +1331,32 @@ fn row_fingerprint(row: &Row) -> String {
     }).collect();
     parts.sort();
     parts.join("|")
+}
+
+/// Compare two Values for ordering (used by ORDER BY).
+/// NULL sorts last (greater than any non-null).
+fn value_ordering(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Null, _) => std::cmp::Ordering::Greater,
+        (_, Value::Null) => std::cmp::Ordering::Less,
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Int(x), Value::Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Float(x), Value::Int(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Str(x), Value::Str(y)) => x.cmp(y),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+/// Evaluate a SKIP/LIMIT expression to a usize (params available, no row context needed).
+fn eval_const_usize(expr: &Expr, params: &HashMap<String, serde_json::Value>) -> usize {
+    let dummy = Row::new();
+    match eval_expr(expr, &dummy, params).unwrap_or(Value::Null) {
+        Value::Int(n) => n.max(0) as usize,
+        _ => 0,
+    }
 }
 
 /// Convert result rows to JSONB output format.

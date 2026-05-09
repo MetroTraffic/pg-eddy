@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.7.0](#070--2026-05-09--cypher-predicates-ordering-and-built-in-functions) — Cypher Predicates, Ordering, and Built-in Functions
 - [0.6.0](#060--2026-05-09--cypher-query-engine) — Cypher Query Engine
 - [0.5.1](#051--2026-05-09--tap-infrastructure-wal-hardening-and-age-benchmark) — TAP Infrastructure, WAL Hardening, and AGE Benchmark
 - [0.5.0](#050--2026-05-09--indexes-constraints-and-full-crud-api) — Indexes, Constraints, and Full CRUD API
@@ -13,6 +14,53 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 - [0.3.0](#030--2026-05-09--edge-storage--adjacency-lists) — Edge Storage + Adjacency Lists
 - [0.2.0](#020--2026-05-09--node-storage) — Node Storage
 - [0.1.0](#010--2026-05-09--am-skeleton) — AM Skeleton
+
+---
+
+## [0.7.0] — 2026-05-09 — Cypher Predicates, Ordering, and Built-in Functions
+
+v0.7.0 substantially expands the Cypher query engine with string predicates,
+list operations, result ordering and pagination, correct null semantics, and a
+large suite of built-in functions. 107/107 in-scope TCK scenarios pass (100%).
+
+### New Cypher Features
+
+**String predicates**: `STARTS WITH`, `ENDS WITH`, `CONTAINS`, and `=~` (POSIX
+regular expression match, evaluated via PostgreSQL's native regex engine).
+
+**List membership**: `x IN [a, b, c]` — list literals and membership tests with
+openCypher null semantics (null IN list containing a match → true; no match →
+null if list contains null, else false).
+
+**Result ordering and pagination**: `ORDER BY expr [ASC|DESC], ...`, `SKIP n`,
+`LIMIT n`. ORDER BY resolves aliases from both the RETURN clause and the MATCH
+bindings; NULL sorts last per openCypher spec.
+
+**Corrected null semantics**: `AND`, `OR`, and `NOT` now use 3-valued logic
+exactly as specified in the openCypher standard (`null AND false = false`,
+`null AND true = null`, `null OR true = true`, etc.).
+
+### Built-in Functions Added
+
+**Type conversion**: `toBoolean(value)`
+
+**Size/length**: `size(string|list)`, `length(string|list)`
+
+**List functions**: `head(list)`, `tail(list)`, `last(list)`, `reverse(list)`,
+`range(start, end[, step])`
+
+**String functions**: `trim(s)`, `ltrim(s)`, `rtrim(s)`, `upper(s)` / `toUpper(s)`,
+`lower(s)` / `toLower(s)`, `substring(s, start[, length])`,
+`replace(s, search, replacement)`, `split(s, delimiter)`, `reverse(s)`
+
+**Math functions**: `abs()`, `ceil()` / `ceiling()`, `floor()`, `round()`,
+`sign()`, `sqrt()`, `log()` (natural log), `log10()`, `exp()`, `sin()`,
+`cos()`, `tan()`, `asin()`, `acos()`, `atan()`, `atan2(y, x)`, `pi()`, `e()`
+
+### Test Results
+
+- **Unit tests**: 61/61 pass
+- **TCK**: 107/3881 overall (2.8%); 107/107 in-scope (100%)
 
 ---
 

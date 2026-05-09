@@ -63,6 +63,7 @@ pub enum Token {
     Gt,         // >  (context-dependent with RArrow)
     Le,         // <=
     Ge,         // >=
+    RegexMatch, // =~
     Plus,       // +
     Star,       // *
     Slash,      // /
@@ -370,8 +371,13 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
                 }
             }
             b'=' => {
-                tokens.push(SpannedToken { token: Token::Eq, offset: start });
-                pos += 1;
+                if pos + 1 < len && bytes[pos + 1] == b'~' {
+                    tokens.push(SpannedToken { token: Token::RegexMatch, offset: start });
+                    pos += 2;
+                } else {
+                    tokens.push(SpannedToken { token: Token::Eq, offset: start });
+                    pos += 1;
+                }
             }
             b'<' => {
                 if pos + 1 < len && bytes[pos + 1] == b'>' {

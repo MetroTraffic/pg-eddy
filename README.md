@@ -4,7 +4,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![PostgreSQL 18+](https://img.shields.io/badge/PostgreSQL-18%2B-336791.svg)](https://www.postgresql.org/)
 [![Rust 1.85+](https://img.shields.io/badge/Rust-1.85%2B-CE4624.svg)](https://www.rust-lang.org/)
-[![OpenCypher TCK](https://img.shields.io/badge/OpenCypher%20TCK-82%2F3881%20passed-orange.svg)](tests/tck/)
+[![OpenCypher TCK](https://img.shields.io/badge/OpenCypher%20TCK-107%2F3881%20passed-orange.svg)](tests/tck/)
 
 A PostgreSQL 18 extension implementing a high-performance native **Labelled Property Graph (LPG)** store via a custom Table Access Method, enabling graph queries directly inside PostgreSQL without a separate database.
 

@@ -1,13 +1,24 @@
 /// Cypher AST — typed intermediate representation for parsed Cypher queries.
 ///
-/// v0.6.0 scope: single-clause MATCH/RETURN with WHERE, node and relationship
-/// patterns, property comparisons, AND/OR/NOT, IS NULL.
-/// A complete Cypher query (v0.6.0: single MATCH … RETURN).
+/// v0.7.0 scope: MATCH/WHERE/RETURN + ORDER BY/SKIP/LIMIT, string predicates,
+/// IN list membership, list literals, additional built-in functions.
+
+/// A sort key in ORDER BY.
+#[derive(Debug, Clone)]
+pub struct OrderItem {
+    pub expr: Expr,
+    pub ascending: bool,
+}
+
+/// A complete Cypher query (single MATCH … RETURN with optional ORDER BY / SKIP / LIMIT).
 #[derive(Debug, Clone)]
 pub struct Query {
     pub match_clause: MatchClause,
     pub where_clause: Option<Expr>,
     pub return_clause: ReturnClause,
+    pub order_by: Vec<OrderItem>,
+    pub skip: Option<Expr>,
+    pub limit: Option<Expr>,
 }
 
 /// MATCH clause: one or more comma-separated patterns.
@@ -109,6 +120,18 @@ pub enum Expr {
     FunctionCall(String, Vec<Expr>),
     /// Star expression (for COUNT(*))
     Star,
+    /// List literal: [e1, e2, e3]
+    List(Vec<Expr>),
+    /// IN list membership: expr IN list_expr
+    InList(Box<Expr>, Box<Expr>),
+    /// STARTS WITH string predicate
+    StartsWith(Box<Expr>, Box<Expr>),
+    /// ENDS WITH string predicate
+    EndsWith(Box<Expr>, Box<Expr>),
+    /// CONTAINS string predicate
+    Contains(Box<Expr>, Box<Expr>),
+    /// Regular expression match: str =~ pattern
+    Regex(Box<Expr>, Box<Expr>),
 }
 
 /// Comparison operators.
