@@ -12,15 +12,28 @@
 /// Each header maps 1:1 to an item slot (adj_slot_idx in the node record).
 
 // ---------------------------------------------------------------------------
-// WAL record info bytes (high nibble = 0x0_ for node ops, 0x1_ for edge ops)
+// WAL record info bytes.
+//
+// PostgreSQL only allows bits 0-1 in the low nibble of xl_info when calling
+// XLogInsert (bit 0 = XLR_SPECIAL_REL_UPDATE, bit 1 = XLR_CHECK_CONSISTENCY).
+// Bits 2-3 are reserved; setting them causes a PANIC ("invalid xlog info mask").
+// The RMGR opcode MUST therefore live entirely in the HIGH nibble (bits 4-7).
+//
+// The redo dispatcher strips the low nibble with `& !XLR_INFO_MASK` before
+// matching, so each record type needs a unique HIGH-nibble value.
 // ---------------------------------------------------------------------------
-pub const XLOG_PG_EDDY_NODE_INSERT: u8 = 0x00;
-pub const XLOG_PG_EDDY_NODE_UPDATE_PROPS: u8 = 0x01;
-pub const XLOG_PG_EDDY_NODE_DELETE: u8 = 0x02;
-pub const XLOG_PG_EDDY_EDGE_INSERT: u8 = 0x10; // Phase 2
-pub const XLOG_PG_EDDY_EDGE_DELETE: u8 = 0x11; // Phase 2
-pub const XLOG_PG_EDDY_ADJ_UPDATE: u8 = 0x20;  // Phase 2
-pub const XLOG_PG_EDDY_VACUUM_PAGE: u8 = 0x30;  // Phase 3
+pub const XLOG_PG_EDDY_NODE_INSERT: u8     = 0x00; // high nibble 0
+pub const XLOG_PG_EDDY_NODE_INSERT_OVF: u8 = 0x10; // high nibble 1 (node + overflow block)
+pub const XLOG_PG_EDDY_NODE_DELETE: u8     = 0x20; // high nibble 2
+pub const XLOG_PG_EDDY_NODE_COMPACT: u8    = 0x30; // high nibble 3 (FPI after PageRepairFragmentation)
+pub const XLOG_PG_EDDY_EDGE_INSERT: u8     = 0x40; // high nibble 4
+pub const XLOG_PG_EDDY_EDGE_DELETE: u8     = 0x50; // high nibble 5
+pub const XLOG_PG_EDDY_ADJ_UPDATE: u8      = 0x60; // high nibble 6
+pub const XLOG_PG_EDDY_VACUUM_PAGE: u8     = 0x70; // high nibble 7
+
+/// The pd_special offset for node pages (= BLCKSZ − PD_NODE_SPECIAL_SIZE).
+/// Overflow pages (no special area) have pd_special = BLCKSZ (8192).
+pub const PD_NODE_SPECIAL_OFFSET: usize = 8192 - PD_NODE_SPECIAL_SIZE; // 5792
 
 // ---------------------------------------------------------------------------
 // Page geometry

@@ -1297,12 +1297,15 @@ correct before adding edges.
       (Integer, Float, Boolean, String, Date, LocalDateTime, Duration), List,
       Map, Null — encode/decode round-trip tests via `proptest`
 - [ ] Property overflow pages for properties exceeding 48 bytes
+      (implementing in Phase 4 — overflow blocks in same node relation,
+       `prop_overflow_page` field already reserved in node record layout)
 - [x] Label registry tables + backend-local `HashMap<String, i64>` cache
 - [x] `pg_eddy.create_node(labels TEXT[], properties JSONB) RETURNS BIGINT`
 - [x] `pg_eddy.get_node(node_id BIGINT) RETURNS JSONB`
 - [x] `pg_eddy.node_count() RETURNS BIGINT`
 - [ ] Crash-safe test: insert 10K nodes, `pg_ctl stop -m immediate`, verify
-      all nodes recovered correctly
+      all nodes recovered correctly (requires TAP test infrastructure;
+      deferred to Phase 4 infrastructure work)
 
 **Exit criteria**: 1M nodes created and read back correctly; crash-recovery
 test passes; WAL records are exclusively `XLOG_PG_EDDY_NODE_INSERT` (verify
@@ -1399,39 +1402,77 @@ correct live/dead counts ✅; 17/17 tests pass ✅.
 
 ---
 
-### Phase 4 — Indexes, Constraints, and Full CRUD API (v0.5.0–v0.5.1)
+### Phase 4 — Indexes, Constraints, and Full CRUD API (v0.5.0)
 
 **Goal**: Complete the storage layer. Everything needed to build the query
-engine on top.
+engine on top. Also delivers deferred items from Phases 1–3.
 
-**v0.5.0 deliverables**:
-- [ ] Label B-tree index: `(label_id, node_id)` via AM's index integration
-- [ ] Rel-type B-tree indexes: `(type_id, source_node_id)` and
-      `(type_id, target_node_id)`
-- [ ] `pg_eddy.create_node_index(label TEXT, property_key TEXT)` — per-property
-      B-tree index on binary-encoded values
-- [ ] `pg_eddy.create_rel_index(type TEXT, property_key TEXT)`
-- [ ] Multi-label nodes (up to 32 labels); `pg_eddy.add_label()`,
-      `pg_eddy.remove_label()`; `XLOG_PG_EDDY_LABEL_SET` WAL record
-- [ ] Detach-delete: `pg_eddy.delete_node(id, detach := TRUE)` removes all
-      incident edges before deleting the node
+**Deferred items completed in v0.5.0**:
+- [ ] Property overflow pages (deferred Phase 1) — overflow blocks in the
+      same node relation; `prop_overflow_page` field stores block number;
+      REGBUF_FORCE_IMAGE WAL; vacuum skips overflow blocks
+- [ ] Physical VACUUM compaction (deferred Phase 3) — `PageRepairFragmentation`
+      on node pages after LP_DEAD marking; zero out dead adj headers;
+      WAL-logged as XLOG_PG_EDDY_NODE_COMPACT (full page image)
+- [ ] REPLICA IDENTITY — still deferred; tables have no SQL columns so
+      standard mechanism does not apply; full implementation requires slot
+      callbacks with column data (Phase 5+)
+- [ ] Crash-safe / concurrency tests — delivered once TAP infrastructure
+      below is in place
+- [ ] **TAP test infrastructure** — required before any crash-safe or
+      multi-session concurrency test can run; see §10.6 for layout:
+      - Add `Makefile` at repo root that delegates to `pg_prove` (from
+        `postgresql-18-pgtap` or `cpanm TAP::Parser::SourceHandler::pgTAP`);
+        `just tap` runs this
+      - Create `tests/tap/` directory; each test is a `.pl` Perl script using
+        `PostgreSQL::Test::Cluster` (ships with PG 18 dev package)
+      - `tests/tap/001_crash_recovery.pl` — starts a cluster, inserts 10K
+        nodes, sends `SIGQUIT` (immediate shutdown), restarts, verifies node
+        count matches
+      - `tests/tap/002_edge_crash_recovery.pl` — same pattern for edges and
+        adjacency chains
+      - `tests/tap/003_mvcc_isolation.pl` — two psql sessions via
+        `$node->background_psql()`; T1 inserts, T2 reads under snapshot;
+        verifies T2 does not see T1's uncommitted write
+      - `tests/tap/004_concurrent_inserts.pl` — N parallel psql sessions each
+        inserting M nodes; verifies total count = N×M with no duplicates
+      - CI job `.github/workflows/tap.yml` runs `just tap` against a
+        temporary PostgreSQL 18 cluster; fails on any TAP `not ok`
+
+**v0.5.0 new deliverables**:
+- [ ] Internal label B-tree index: `_pg_eddy.label_index(label_id, node_id)`
+      maintained by Rust/SPI in create_node, update_node, delete_node;
+      enables O(|matching nodes|) label scans without a full page sweep
+- [ ] `pg_eddy.add_label(node_id BIGINT, label TEXT) RETURNS BOOLEAN`
+- [ ] `pg_eddy.remove_label(node_id BIGINT, label TEXT) RETURNS BOOLEAN`
+- [ ] `pg_eddy.detach_delete_node(node_id BIGINT) RETURNS BOOLEAN` —
+      removes all incident edges then deletes the node
 - [ ] `pg_eddy.find_nodes(label TEXT, property_filter JSONB) RETURNS SETOF BIGINT`
-- [ ] `pg_eddy.schema_info() RETURNS JSONB`
-- [ ] Bulk CSV import: `pg_eddy.load_csv_nodes(path, label, id_column)`,
-      `pg_eddy.load_csv_edges(path, type, source_column, target_column)`
-- [ ] `pg_dump` / `pg_restore` round-trip test on 1M-node graph
+      — uses label_index for fast label lookup; optionally filters by props
+- [ ] `pg_eddy.schema_info() RETURNS JSONB` — label, rel-type, property-key
+      counts and names from the registry tables
+- [ ] Tests for all v0.5.0 deliverables
 
-**v0.5.1 deliverables**:
+**v0.5.1 deliverables** (deferred to next release):
+- [ ] Rel-type B-tree indexes: `(type_id, source_node_id)` and
+      `(type_id, target_node_id)` (requires AM index callback work or
+      internal catalog table approach)
+- [ ] `pg_eddy.create_node_index(label TEXT, property_key TEXT)` —
+      per-property B-tree index on binary-encoded values
+- [ ] `pg_eddy.create_rel_index(type TEXT, property_key TEXT)`
 - [ ] Property constraints: `pg_eddy.create_unique_constraint(label, property_key)`,
       `pg_eddy.create_existence_constraint(label, property_key)`
 - [ ] `pg_eddy.export_cypher_script()` — export graph as CREATE statements
-- [ ] Performance CI gate: `>100K node inserts/sec` (bulk via
-      `pg_eddy.load_csv_nodes`); label-scan `<5ms` on 1M nodes;
-      adjacency-follow `<1ms` per 1-hop expansion on a 10M-edge graph
+- [ ] Bulk CSV import: `pg_eddy.load_csv_nodes(path, label, id_column)`,
+      `pg_eddy.load_csv_edges(path, type, source_column, target_column)`
+- [ ] `pg_dump` / `pg_restore` round-trip test on 1M-node graph
+- [ ] Performance CI gate: `>100K node inserts/sec`; label-scan `<5ms` on
+      1M nodes; adjacency-follow `<1ms` per 1-hop expansion on 10M edges
 - [ ] All `sql/regress/` tests pass
 
-**Exit criteria**: complete CRUD API; pg_dump round-trip lossless; performance
-CI gate passes.
+**Exit criteria v0.5.0**: property overflow, physical VACUUM, label index,
+add/remove label, detach-delete, find_nodes, schema_info all work and tested;
+20+ pgrx tests pass.
 
 **AGE benchmark baseline** (run after Phase 4 exit, before starting Phase 5):
 run the adjacency-follow microbenchmark and a 2-hop neighbour expansion on a
@@ -1691,14 +1732,50 @@ files (Gherkin scenarios), executes each scenario against pg_eddy via
 - Criterion micro-benchmarks for: property encode/decode throughput, adjacency
   list follow latency, Cypher→SQL translation latency
 
-### 10.6 Concurrency Tests
+### 10.6 Concurrency and Crash-Recovery Tests (TAP)
 
-- Concurrent node/edge inserts while graph views are being maintained
-- Concurrent MATCH queries during bulk import
-- Deadlock detection: `SET lock_timeout = '5s'` in all concurrent tests; any
-  lock timeout is a test failure
-- MVCC isolation: verify that a MATCH query in transaction T1 does not see
-  uncommitted writes from transaction T2
+These tests require a real multi-process PostgreSQL cluster and cannot run
+inside pgrx unit tests. They use the `PostgreSQL::Test::Cluster` Perl module
+that ships with the PG 18 dev package (`postgresql-server-dev-18`).
+
+**Infrastructure setup** (delivered in Phase 4 / v0.5.0):
+
+```
+tests/tap/
+  001_crash_recovery.pl      # node WAL durability
+  002_edge_crash_recovery.pl # edge + adjacency chain WAL durability
+  003_mvcc_isolation.pl      # snapshot isolation across sessions
+  004_concurrent_inserts.pl  # parallel inserts, no duplicates
+Makefile                     # `pg_prove -r tests/tap/` target
+justfile task: `tap`         # alias for `make tap`
+.github/workflows/tap.yml    # CI job
+```
+
+**How to run locally**:
+```bash
+just tap                  # runs all TAP tests via pg_prove
+prove tests/tap/001_crash_recovery.pl   # single test
+```
+
+**Prerequisites** (one-time dev-container setup):
+```bash
+sudo apt-get install -y postgresql-server-dev-18 libtap-parser-sourcehandler-pgtap-perl
+```
+
+**Individual test scenarios**:
+- `001_crash_recovery.pl` — insert 10K nodes, `pg_ctl stop -m immediate`,
+  restart, verify `pg_eddy.node_count()` = 10K; uses `XLOG_PG_EDDY_NODE_INSERT`
+  redo
+- `002_edge_crash_recovery.pl` — insert 1K edges with adjacency chains,
+  crash-stop, recover, verify `pg_eddy.neighbours()` returns correct sets
+- `003_mvcc_isolation.pl` — T1 `BEGIN`; T1 inserts node; T2 `BEGIN` + `SET
+  TRANSACTION ISOLATION LEVEL REPEATABLE READ`; T1 `COMMIT`; T2
+  `pg_eddy.node_count()` must equal pre-insert count; T2 `COMMIT`; recheck
+  returns new count
+- `004_concurrent_inserts.pl` — spawn 8 background psql sessions each
+  inserting 1K nodes; join all; assert total = 8K with `am_stats()` live count
+- Deadlock detection: `SET lock_timeout = '5s'` in all concurrent tests;
+  any lock timeout is a TAP `not ok`
 
 ### 10.7 Known TCK Hard Cases
 

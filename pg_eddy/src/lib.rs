@@ -1,4 +1,4 @@
-// pg_eddy — Phase 3: MVCC and VACUUM (v0.4.0)
+// pg_eddy — Phase 4: Label index, overflow props, physical VACUUM (v0.5.0)
 //
 // This is the extension entry point.  At _PG_init we:
 //   1. Register the custom WAL resource manager.
@@ -7,6 +7,7 @@
 // shared_preload_libraries = 'pg_eddy'  is required.
 
 use pgrx::prelude::*;
+use pgrx::datum::DatumWithOid;
 
 mod catalog;
 mod error;
@@ -17,7 +18,7 @@ pgrx::pg_module_magic!();
 // ---------------------------------------------------------------------------
 // Extension SQL — schemas, registry tables, AM objects, and SQL functions.
 // ---------------------------------------------------------------------------
-extension_sql_file!("../sql/pg_eddy--0.4.0.sql", name = "pg_eddy_schema", finalize);
+extension_sql_file!("../sql/pg_eddy--0.5.0.sql", name = "pg_eddy_schema", finalize);
 
 // ---------------------------------------------------------------------------
 // _PG_init  — runs at postmaster start (shared_preload_libraries)
@@ -70,10 +71,18 @@ fn create_node(labels: Vec<String>, properties: pgrx::JsonB) -> i64 {
     // Open the nodes table and insert
     unsafe {
         use pgrx::pg_sys;
-        // Look up the _pg_eddy.nodes relation by name via SPI/catalog.
         let rel = open_nodes_relation();
         crate::storage::node_store::insert_node(rel, node_id, &label_ids, &prop_bytes);
         pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+    }
+
+    // Maintain label_index: insert one row per label.
+    for lid in &label_ids {
+        Spi::run_with_args(
+            "INSERT INTO _pg_eddy.label_index(label_id, node_id) VALUES ($1, $2)",
+            &[DatumWithOid::from(*lid), DatumWithOid::from(node_id)],
+        )
+        .unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index insert failed: {e}"));
     }
 
     node_id
@@ -96,7 +105,17 @@ fn get_node(node_id: i64) -> Option<pgrx::JsonB> {
         result
     };
 
-    record.map(|r| {
+    record.map(|mut r| {
+        // Resolve overflow props if needed.
+        if r.overflow_blkno != 0 && r.prop_bytes.is_empty() {
+            r.prop_bytes = unsafe {
+                use pgrx::pg_sys;
+                let rel = open_nodes_relation();
+                let bytes = crate::storage::node_store::read_overflow_block(rel, r.overflow_blkno);
+                pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+                bytes
+            };
+        }
         let mut out = serde_json::Map::new();
         out.insert(
             "node_id".into(),
@@ -406,14 +425,31 @@ fn update_node(node_id: i64, labels: Vec<String>, properties: pgrx::JsonB) -> bo
         })
         .unwrap_or_default();
 
-    unsafe {
+    let found = unsafe {
         use pgrx::pg_sys;
         let rel = open_nodes_relation();
-        let found =
-            crate::storage::node_store::update_node(rel, node_id, &label_ids, &prop_bytes);
+        let f = crate::storage::node_store::update_node(rel, node_id, &label_ids, &prop_bytes);
         pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
-        found
+        f
+    };
+
+    if found {
+        // Refresh label_index: delete old rows and insert new ones.
+        Spi::run_with_args(
+            "DELETE FROM _pg_eddy.label_index WHERE node_id = $1",
+            &[DatumWithOid::from(node_id)],
+        )
+        .unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index delete failed: {e}"));
+        for lid in &label_ids {
+            Spi::run_with_args(
+                "INSERT INTO _pg_eddy.label_index(label_id, node_id) VALUES ($1, $2)",
+                &[DatumWithOid::from(*lid), DatumWithOid::from(node_id)],
+            )
+            .unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index insert failed: {e}"));
+        }
     }
+
+    found
 }
 
 /// Logically delete a node by id.
@@ -422,13 +458,326 @@ fn update_node(node_id: i64, labels: Vec<String>, properties: pgrx::JsonB) -> bo
 /// during VACUUM. Returns `false` if the node was not found.
 #[pg_extern]
 fn delete_node(node_id: i64) -> bool {
-    unsafe {
+    let found = unsafe {
         use pgrx::pg_sys;
         let rel = open_nodes_relation();
-        let found = crate::storage::node_store::delete_node_by_id(rel, node_id);
+        let f = crate::storage::node_store::delete_node_by_id(rel, node_id);
         pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
-        found
+        f
+    };
+    if found {
+        Spi::run_with_args(
+            "DELETE FROM _pg_eddy.label_index WHERE node_id = $1",
+            &[DatumWithOid::from(node_id)],
+        )
+        .unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index delete failed: {e}"));
     }
+    found
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: label management, detach-delete, find_nodes, schema_info
+// ---------------------------------------------------------------------------
+
+/// Add a label to an existing node.
+///
+/// If the node already has this label, returns `false`.
+/// Returns `true` if the label was added successfully.
+#[pg_extern]
+fn add_label(node_id: i64, label: &str) -> bool {
+    use crate::catalog::labels::ensure_label;
+
+    let label_id = ensure_label(label);
+
+    // Find the current node.
+    let record = unsafe {
+        use pgrx::pg_sys;
+        let rel = open_nodes_relation();
+        let snapshot = pg_sys::GetActiveSnapshot();
+        let r = crate::storage::node_store::find_node_by_id(rel, node_id, snapshot);
+        pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        r
+    };
+    let mut r = match record {
+        Some(r) => r,
+        None => return false,
+    };
+
+    // Already has this label?
+    if r.label_ids.contains(&label_id) {
+        return false;
+    }
+
+    // Resolve overflow props.
+    if r.overflow_blkno != 0 && r.prop_bytes.is_empty() {
+        r.prop_bytes = unsafe {
+            use pgrx::pg_sys;
+            let rel = open_nodes_relation();
+            let bytes = crate::storage::node_store::read_overflow_block(rel, r.overflow_blkno);
+            pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+            bytes
+        };
+    }
+
+    let mut new_labels = r.label_ids.clone();
+    new_labels.push(label_id);
+
+    let found = unsafe {
+        use pgrx::pg_sys;
+        let rel = open_nodes_relation();
+        let f = crate::storage::node_store::update_node(rel, node_id, &new_labels, &r.prop_bytes);
+        pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        f
+    };
+
+    if found {
+        Spi::run_with_args(
+            "INSERT INTO _pg_eddy.label_index(label_id, node_id) VALUES ($1, $2)",
+            &[DatumWithOid::from(label_id), DatumWithOid::from(node_id)],
+        )
+        .unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index insert failed: {e}"));
+    }
+
+    found
+}
+
+/// Remove a label from an existing node.
+///
+/// If the node does not have this label, returns `false`.
+/// Returns `true` if the label was removed successfully.
+#[pg_extern]
+fn remove_label(node_id: i64, label: &str) -> bool {
+    use crate::catalog::labels::ensure_label;
+
+    let label_id = ensure_label(label);
+
+    let record = unsafe {
+        use pgrx::pg_sys;
+        let rel = open_nodes_relation();
+        let snapshot = pg_sys::GetActiveSnapshot();
+        let r = crate::storage::node_store::find_node_by_id(rel, node_id, snapshot);
+        pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        r
+    };
+    let mut r = match record {
+        Some(r) => r,
+        None => return false,
+    };
+
+    // Does not have this label?
+    if !r.label_ids.contains(&label_id) {
+        return false;
+    }
+
+    // Resolve overflow props.
+    if r.overflow_blkno != 0 && r.prop_bytes.is_empty() {
+        r.prop_bytes = unsafe {
+            use pgrx::pg_sys;
+            let rel = open_nodes_relation();
+            let bytes = crate::storage::node_store::read_overflow_block(rel, r.overflow_blkno);
+            pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+            bytes
+        };
+    }
+
+    let new_labels: Vec<i32> = r.label_ids.iter().copied().filter(|&l| l != label_id).collect();
+
+    let found = unsafe {
+        use pgrx::pg_sys;
+        let rel = open_nodes_relation();
+        let f = crate::storage::node_store::update_node(rel, node_id, &new_labels, &r.prop_bytes);
+        pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        f
+    };
+
+    if found {
+        Spi::run_with_args(
+            "DELETE FROM _pg_eddy.label_index WHERE label_id = $1 AND node_id = $2",
+            &[DatumWithOid::from(label_id), DatumWithOid::from(node_id)],
+        )
+        .unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index delete failed: {e}"));
+    }
+
+    found
+}
+
+/// Delete a node and all edges connected to it (detach-delete pattern).
+///
+/// First logically deletes all incoming and outgoing edges, then deletes the
+/// node itself. Returns `false` if the node was not found.
+#[pg_extern]
+fn detach_delete_node(node_id: i64) -> bool {
+    use crate::storage::edge_store::{Direction, adjacency_follow};
+    use std::collections::HashSet;
+
+    // Collect all edge ids attached to this node.
+    let all_edge_ids: Vec<i64> = unsafe {
+        use pgrx::pg_sys;
+        let node_rel = open_nodes_relation();
+        let edge_rel = open_edges_relation();
+        let snapshot = pg_sys::GetActiveSnapshot();
+
+        let out_edges = adjacency_follow(node_rel, edge_rel, node_id, Direction::Out, None, snapshot);
+        let in_edges = adjacency_follow(node_rel, edge_rel, node_id, Direction::In, None, snapshot);
+
+        pg_sys::table_close(edge_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        pg_sys::table_close(node_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+
+        let mut seen: HashSet<i64> = HashSet::new();
+        for e in out_edges.iter().chain(in_edges.iter()) {
+            seen.insert(e.edge_id);
+        }
+        seen.into_iter().collect()
+    };
+
+    // Delete each unique edge.
+    unsafe {
+        use pgrx::pg_sys;
+        let edge_rel = open_edges_relation();
+        for eid in &all_edge_ids {
+            crate::storage::edge_store::delete_edge(edge_rel, *eid);
+        }
+        pg_sys::table_close(edge_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+    }
+
+    // Delete the node.
+    let found = unsafe {
+        use pgrx::pg_sys;
+        let rel = open_nodes_relation();
+        let f = crate::storage::node_store::delete_node_by_id(rel, node_id);
+        pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        f
+    };
+
+    if found {
+        Spi::run_with_args(
+            "DELETE FROM _pg_eddy.label_index WHERE node_id = $1",
+            &[DatumWithOid::from(node_id)],
+        )
+        .unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index delete failed: {e}"));
+    }
+
+    found
+}
+
+/// Find nodes, optionally filtered by label name and/or a property sub-document.
+///
+/// `label`           — if given, only nodes with this label are returned.
+/// `property_filter` — if given, only nodes whose properties contain all
+///                     key-value pairs from the filter document are returned.
+///
+/// Returns a set of matching node_ids.
+#[pg_extern]
+fn find_nodes(
+    label: Option<String>,
+    property_filter: Option<pgrx::JsonB>,
+) -> SetOfIterator<'static, i64> {
+    use crate::catalog::labels::{label_id_by_name, prop_key_name};
+    use crate::storage::prop_store;
+
+    // Determine candidate node_ids.
+    let candidates: Vec<i64> = if let Some(lname) = label {
+        // Fast path: query label_index.
+        let lid = label_id_by_name(&lname);
+        match lid {
+            None => return SetOfIterator::new(std::iter::empty()),
+            Some(lid) => {
+                Spi::connect(|client| {
+                    let tup_table = client
+                        .select(
+                            "SELECT node_id FROM _pg_eddy.label_index WHERE label_id = $1",
+                            None,
+                            &[DatumWithOid::from(lid)],
+                        )
+                        .unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index query failed: {e}"));
+                    tup_table
+                        .filter_map(|row| row.get::<i64>(1).ok().flatten())
+                        .collect()
+                })
+            }
+        }
+    } else {
+        // Slow path: full sequential scan.
+        unsafe {
+            use pgrx::pg_sys;
+            let rel = open_nodes_relation();
+            let snapshot = pg_sys::GetActiveSnapshot();
+            let mut state = crate::storage::node_store::NodeScanState::begin(rel, snapshot);
+            let mut ids = Vec::new();
+            while let Some(r) = state.next() {
+                ids.push(r.node_id);
+            }
+            pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+            ids
+        }
+    };
+
+    // If no property filter, return all candidates.
+    let filter_obj: Option<serde_json::Map<String, serde_json::Value>> =
+        property_filter.and_then(|f| match f.0 {
+            serde_json::Value::Object(m) => Some(m),
+            _ => None,
+        });
+
+    let result: Vec<i64> = if let Some(filter) = filter_obj {
+        candidates
+            .into_iter()
+            .filter(|&nid| {
+                let record = unsafe {
+                    use pgrx::pg_sys;
+                    let rel = open_nodes_relation();
+                    let snapshot = pg_sys::GetActiveSnapshot();
+                    let r = crate::storage::node_store::find_node_by_id(rel, nid, snapshot);
+                    pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+                    r
+                };
+                match record {
+                    None => false,
+                    Some(mut r) => {
+                        if r.overflow_blkno != 0 && r.prop_bytes.is_empty() {
+                            r.prop_bytes = unsafe {
+                                use pgrx::pg_sys;
+                                let rel = open_nodes_relation();
+                                let bytes = crate::storage::node_store::read_overflow_block(
+                                    rel,
+                                    r.overflow_blkno,
+                                );
+                                pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+                                bytes
+                            };
+                        }
+                        let props =
+                            prop_store::decode(&r.prop_bytes, |kid| prop_key_name(kid));
+                        filter.iter().all(|(k, v)| props.get(k).map_or(false, |pv| pv == v))
+                    }
+                }
+            })
+            .collect()
+    } else {
+        candidates
+    };
+
+    SetOfIterator::new(result.into_iter())
+}
+
+/// Return schema information (label, rel-type, and property-key registries) as JSONB.
+#[pg_extern]
+fn schema_info() -> pgrx::JsonB {
+    use crate::catalog::labels::{all_labels, all_rel_types, all_prop_keys};
+
+    let labels = all_labels();
+    let rel_types = all_rel_types();
+    let prop_keys = all_prop_keys();
+
+    let out = serde_json::json!({
+        "label_count": labels.len(),
+        "labels": labels,
+        "rel_type_count": rel_types.len(),
+        "rel_types": rel_types,
+        "property_key_count": prop_keys.len(),
+        "property_keys": prop_keys,
+    });
+    pgrx::JsonB(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -753,6 +1102,136 @@ mod tests {
         // We created at least 2 nodes and 1 edge in this test.
         assert!(live_nodes >= 2, "live_nodes should be >= 2, got {live_nodes}");
         assert!(live_edges >= 1, "live_edges should be >= 1, got {live_edges}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4 tests
+    // -----------------------------------------------------------------------
+
+    #[pg_test]
+    fn test_add_label() {
+        let node_id = crate::create_node(
+            vec!["Person".into()],
+            pgrx::JsonB(serde_json::json!({"name": "Dave"})),
+        );
+
+        // Add a new label.
+        let added = crate::add_label(node_id, "Employee");
+        assert!(added, "add_label should return true when label is new");
+
+        let node = crate::get_node(node_id).expect("node should exist");
+        let labels = node.0["labels"].as_array().unwrap();
+        assert!(labels.contains(&serde_json::json!("Person")));
+        assert!(labels.contains(&serde_json::json!("Employee")));
+
+        // Adding the same label again should return false.
+        let again = crate::add_label(node_id, "Employee");
+        assert!(!again, "add_label should return false for duplicate label");
+    }
+
+    #[pg_test]
+    fn test_remove_label() {
+        let node_id = crate::create_node(
+            vec!["Person".into(), "Temp".into()],
+            pgrx::JsonB(serde_json::json!({})),
+        );
+
+        let removed = crate::remove_label(node_id, "Temp");
+        assert!(removed, "remove_label should return true when label exists");
+
+        let node = crate::get_node(node_id).expect("node should exist");
+        let labels = node.0["labels"].as_array().unwrap();
+        assert!(labels.contains(&serde_json::json!("Person")));
+        assert!(!labels.contains(&serde_json::json!("Temp")));
+
+        // Removing a label not present should return false.
+        let again = crate::remove_label(node_id, "Temp");
+        assert!(!again, "remove_label should return false when label is absent");
+    }
+
+    #[pg_test]
+    fn test_detach_delete_node() {
+        let alice = crate::create_node(vec!["Person".into()], pgrx::JsonB(serde_json::json!({})));
+        let bob = crate::create_node(vec!["Person".into()], pgrx::JsonB(serde_json::json!({})));
+        let e1 = crate::create_edge(alice, bob, "KNOWS", pgrx::JsonB(serde_json::json!({})));
+        let e2 = crate::create_edge(bob, alice, "LIKES", pgrx::JsonB(serde_json::json!({})));
+
+        let deleted = crate::detach_delete_node(alice);
+        assert!(deleted, "detach_delete_node should return true");
+
+        // Node should be gone.
+        assert!(crate::get_node(alice).is_none(), "alice should be deleted");
+
+        // Both edges should be gone (logically deleted).
+        assert!(crate::get_edge(e1).is_none(), "edge e1 should be deleted");
+        assert!(crate::get_edge(e2).is_none(), "edge e2 should be deleted");
+
+        // Bob should still exist.
+        assert!(crate::get_node(bob).is_some(), "bob should still exist");
+    }
+
+    #[pg_test]
+    fn test_find_nodes_by_label() {
+        let n1 = crate::create_node(vec!["Robot".into()], pgrx::JsonB(serde_json::json!({})));
+        let n2 = crate::create_node(vec!["Robot".into()], pgrx::JsonB(serde_json::json!({})));
+        crate::create_node(vec!["Human".into()], pgrx::JsonB(serde_json::json!({}))); // should not appear
+
+        let found: Vec<i64> = crate::find_nodes(Some("Robot".into()), None).collect();
+        assert!(found.contains(&n1), "n1 should be found");
+        assert!(found.contains(&n2), "n2 should be found");
+    }
+
+    #[pg_test]
+    fn test_find_nodes_by_property() {
+        let n1 = crate::create_node(
+            vec!["Widget".into()],
+            pgrx::JsonB(serde_json::json!({"color": "red"})),
+        );
+        let _n2 = crate::create_node(
+            vec!["Widget".into()],
+            pgrx::JsonB(serde_json::json!({"color": "blue"})),
+        );
+
+        let filter = pgrx::JsonB(serde_json::json!({"color": "red"}));
+        let found: Vec<i64> = crate::find_nodes(None, Some(filter)).collect();
+        assert!(found.contains(&n1), "n1 (red) should be found");
+    }
+
+    #[pg_test]
+    fn test_schema_info() {
+        // Create a node and edge to populate registries.
+        let n1 = crate::create_node(
+            vec!["SchemaTestLabel".into()],
+            pgrx::JsonB(serde_json::json!({"schema_key": 1})),
+        );
+        let n2 = crate::create_node(vec![], pgrx::JsonB(serde_json::json!({})));
+        crate::create_edge(n1, n2, "SCHEMA_REL", pgrx::JsonB(serde_json::json!({})));
+
+        let info = crate::schema_info();
+        let labels = info.0["labels"].as_array().unwrap();
+        let rel_types = info.0["rel_types"].as_array().unwrap();
+        let prop_keys = info.0["property_keys"].as_array().unwrap();
+
+        assert!(labels.iter().any(|l| l == "SchemaTestLabel"), "label should be in schema_info");
+        assert!(rel_types.iter().any(|r| r == "SCHEMA_REL"), "rel_type should be in schema_info");
+        assert!(prop_keys.iter().any(|k| k == "schema_key"), "prop_key should be in schema_info");
+    }
+
+    #[pg_test]
+    fn test_overflow_props() {
+        // Create a node with a large property value that exceeds PROP_INLINE_MAX.
+        // PROP_INLINE_MAX is ~2100 bytes. Build a string longer than that.
+        let big_value = "x".repeat(2500);
+        let node_id = crate::create_node(
+            vec!["Big".into()],
+            pgrx::JsonB(serde_json::json!({"data": big_value})),
+        );
+        assert!(node_id > 0);
+
+        // Should be retrievable with full property data.
+        let result = crate::get_node(node_id).expect("big node should be visible");
+        let data = result.0["properties"]["data"].as_str().unwrap();
+        assert_eq!(data.len(), 2500, "overflow props should be fully recovered");
     }
 }
 

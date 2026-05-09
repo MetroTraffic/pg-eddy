@@ -8,13 +8,16 @@
 /// release that users might run in production, reserve a permanent ID on the
 /// PostgreSQL Custom RMGRs wiki page.
 ///
-/// WAL record types:
+/// WAL record types (opcode in HIGH nibble; bits 2-3 of low nibble are
+/// forbidden by PostgreSQL's XLogInsert — see page.rs for details):
 ///   0x00 — XLOG_PG_EDDY_NODE_INSERT
-///   0x02 — XLOG_PG_EDDY_NODE_DELETE
-///   0x10 — XLOG_PG_EDDY_EDGE_INSERT
-///   0x11 — XLOG_PG_EDDY_EDGE_DELETE
-///   0x20 — XLOG_PG_EDDY_ADJ_UPDATE
-///   0x30 — XLOG_PG_EDDY_VACUUM_PAGE
+///   0x10 — XLOG_PG_EDDY_NODE_INSERT_OVF  (node + overflow full-page image)
+///   0x20 — XLOG_PG_EDDY_NODE_DELETE
+///   0x30 — XLOG_PG_EDDY_NODE_COMPACT     (FPI after PageRepairFragmentation)
+///   0x40 — XLOG_PG_EDDY_EDGE_INSERT
+///   0x50 — XLOG_PG_EDDY_EDGE_DELETE
+///   0x60 — XLOG_PG_EDDY_ADJ_UPDATE
+///   0x70 — XLOG_PG_EDDY_VACUUM_PAGE
 ///
 /// WAL record layout for NODE_DELETE:
 ///   Block 0:    node page (REGBUF_STANDARD)
@@ -28,8 +31,8 @@ use std::mem::size_of;
 
 use crate::storage::page::{
     ADJ_HEADER_BYTES, NodeAdjHeader, XLOG_PG_EDDY_ADJ_UPDATE, XLOG_PG_EDDY_EDGE_DELETE,
-    XLOG_PG_EDDY_EDGE_INSERT, XLOG_PG_EDDY_NODE_DELETE, XLOG_PG_EDDY_NODE_INSERT,
-    XLOG_PG_EDDY_VACUUM_PAGE,
+    XLOG_PG_EDDY_EDGE_INSERT, XLOG_PG_EDDY_NODE_COMPACT, XLOG_PG_EDDY_NODE_DELETE,
+    XLOG_PG_EDDY_NODE_INSERT, XLOG_PG_EDDY_NODE_INSERT_OVF, XLOG_PG_EDDY_VACUUM_PAGE,
 };
 
 /// Development RMGR ID.  Replace with a reserved ID before production use.
@@ -87,17 +90,23 @@ struct XLogEdgeDelete {
 
 /// WAL-log a node insert and return the resulting LSN.
 ///
+/// If `overflow_buf` is `Some(buf)`, a second block (block id 1) is registered
+/// for the overflow page using `REGBUF_FORCE_IMAGE`.  The overflow page image
+/// is sufficient for redo; no additional main-data is needed for it.
+///
 /// # Safety
 /// Must be called:
-/// - While `buf` is held exclusively locked.
+/// - While `buf` (and `overflow_buf` if any) are held exclusively locked.
 /// - Inside a critical section (caller has incremented `CritSectionCount`).
 pub unsafe fn log_node_insert(
     buf: pg_sys::Buffer,
     _page: pg_sys::Page,
     off: pg_sys::OffsetNumber,
     item_bytes: &[u8],
+    overflow_buf: Option<pg_sys::Buffer>,
 ) -> pg_sys::XLogRecPtr {
     let xlrec = XLogNodeInsert { offset_number: off, _pad: 0 };
+    let info = if overflow_buf.is_some() { XLOG_PG_EDDY_NODE_INSERT_OVF } else { XLOG_PG_EDDY_NODE_INSERT };
 
     unsafe {
         pg_sys::XLogBeginInsert();
@@ -111,8 +120,36 @@ pub unsafe fn log_node_insert(
             &xlrec as *const XLogNodeInsert as *const _,
             size_of::<XLogNodeInsert>() as u32,
         );
-        pg_sys::XLogInsert(RMGR_ID, XLOG_PG_EDDY_NODE_INSERT)
+        if let Some(ovf_buf) = overflow_buf {
+            pg_sys::XLogRegisterBuffer(
+                1,
+                ovf_buf,
+                (pg_sys::REGBUF_FORCE_IMAGE | pg_sys::REGBUF_STANDARD) as u8,
+            );
+        }
+        pg_sys::XLogInsert(RMGR_ID, info)
     }
+}
+
+// ---------------------------------------------------------------------------
+// log_node_compact — called by vacuum after PageRepairFragmentation.
+// Uses REGBUF_FORCE_IMAGE so the full compacted page is captured; no custom
+// redo logic is needed (redo restores the image automatically).
+// ---------------------------------------------------------------------------
+
+/// WAL-log a node page compaction (full page image).
+///
+/// # Safety
+/// Must be called while `buf` is held exclusively locked and inside a critical
+/// section.
+pub unsafe fn log_node_compact(buf: pg_sys::Buffer) -> pg_sys::XLogRecPtr {
+    pg_sys::XLogBeginInsert();
+    pg_sys::XLogRegisterBuffer(
+        0,
+        buf,
+        (pg_sys::REGBUF_FORCE_IMAGE | pg_sys::REGBUF_STANDARD) as u8,
+    );
+    pg_sys::XLogInsert(RMGR_ID, XLOG_PG_EDDY_NODE_COMPACT)
 }
 
 // ---------------------------------------------------------------------------
@@ -300,7 +337,8 @@ unsafe extern "C-unwind" fn rmgr_redo(record: *mut pg_sys::XLogReaderState) {
     let info = unsafe { xlog_rec_get_info(record) } & !(pg_sys::XLR_INFO_MASK as u8);
 
     match info {
-        XLOG_PG_EDDY_NODE_INSERT => unsafe { redo_node_insert(record) },
+        XLOG_PG_EDDY_NODE_INSERT | XLOG_PG_EDDY_NODE_INSERT_OVF => unsafe { redo_node_insert(record) },
+        XLOG_PG_EDDY_NODE_COMPACT => unsafe { redo_node_compact(record) },
         XLOG_PG_EDDY_NODE_DELETE => unsafe { redo_node_delete(record) },
         XLOG_PG_EDDY_EDGE_INSERT => unsafe { redo_edge_insert(record) },
         XLOG_PG_EDDY_EDGE_DELETE => unsafe { redo_edge_delete(record) },
@@ -364,8 +402,46 @@ unsafe fn redo_node_insert(record: *mut pg_sys::XLogReaderState) {
             pg_sys::PageSetLSN(page, lsn);
             pg_sys::MarkBufferDirty(buf);
         }
+    } else if action == pg_sys::XLogRedoAction::BLK_RESTORED {
+        // Full page image was restored; just mark dirty.
+        unsafe { pg_sys::MarkBufferDirty(buf) };
     }
 
+    if buf != 0 {
+        unsafe { pg_sys::UnlockReleaseBuffer(buf) };
+    }
+
+    // If this was a NODE_INSERT_OVF record, handle the overflow block (block 1).
+    // With REGBUF_FORCE_IMAGE the full overflow page image was captured;
+    // XLogReadBufferForRedo restores it automatically.
+    let mut ovf_buf: pg_sys::Buffer = 0;
+    let ovf_action = unsafe { pg_sys::XLogReadBufferForRedo(record, 1, &mut ovf_buf) };
+    if ovf_action == pg_sys::XLogRedoAction::BLK_RESTORED {
+        // Overflow page restored from full page image; mark dirty.
+        let lsn = unsafe { xlog_rec_get_lsn(record) };
+        let ovf_page = unsafe { pg_sys::BufferGetPage(ovf_buf) };
+        unsafe {
+            pg_sys::PageSetLSN(ovf_page, lsn);
+            pg_sys::MarkBufferDirty(ovf_buf);
+        }
+    }
+    if ovf_buf != 0 {
+        unsafe { pg_sys::UnlockReleaseBuffer(ovf_buf) };
+    }
+}
+
+/// Redo a node page compaction (full page image — image restores automatically).
+unsafe fn redo_node_compact(record: *mut pg_sys::XLogReaderState) {
+    let mut buf: pg_sys::Buffer = 0;
+    let action = unsafe { pg_sys::XLogReadBufferForRedo(record, 0, &mut buf) };
+    if action == pg_sys::XLogRedoAction::BLK_RESTORED {
+        let lsn = unsafe { xlog_rec_get_lsn(record) };
+        let page = unsafe { pg_sys::BufferGetPage(buf) };
+        unsafe {
+            pg_sys::PageSetLSN(page, lsn);
+            pg_sys::MarkBufferDirty(buf);
+        }
+    }
     if buf != 0 {
         unsafe { pg_sys::UnlockReleaseBuffer(buf) };
     }
@@ -586,12 +662,14 @@ unsafe extern "C-unwind" fn rmgr_desc(
     }
     let info = unsafe { xlog_rec_get_info(record) } & !(pg_sys::XLR_INFO_MASK as u8);
     let msg = match info {
-        XLOG_PG_EDDY_NODE_INSERT => c"node_insert",
-        XLOG_PG_EDDY_NODE_DELETE => c"node_delete",
-        XLOG_PG_EDDY_EDGE_INSERT => c"edge_insert",
-        XLOG_PG_EDDY_EDGE_DELETE => c"edge_delete",
-        XLOG_PG_EDDY_ADJ_UPDATE  => c"adj_update",
-        XLOG_PG_EDDY_VACUUM_PAGE => c"vacuum_page",
+        XLOG_PG_EDDY_NODE_INSERT    => c"node_insert",
+        XLOG_PG_EDDY_NODE_INSERT_OVF => c"node_insert_ovf",
+        XLOG_PG_EDDY_NODE_COMPACT   => c"node_compact",
+        XLOG_PG_EDDY_NODE_DELETE    => c"node_delete",
+        XLOG_PG_EDDY_EDGE_INSERT    => c"edge_insert",
+        XLOG_PG_EDDY_EDGE_DELETE    => c"edge_delete",
+        XLOG_PG_EDDY_ADJ_UPDATE     => c"adj_update",
+        XLOG_PG_EDDY_VACUUM_PAGE    => c"vacuum_page",
         _ => c"unknown",
     };
     unsafe { pg_sys::appendStringInfoString(buf, msg.as_ptr()) };
@@ -604,12 +682,14 @@ unsafe extern "C-unwind" fn rmgr_desc(
 unsafe extern "C-unwind" fn rmgr_identify(info: u8) -> *const std::ffi::c_char {
     let info = info & !(pg_sys::XLR_INFO_MASK as u8);
     match info {
-        XLOG_PG_EDDY_NODE_INSERT => c"NODE_INSERT".as_ptr(),
-        XLOG_PG_EDDY_NODE_DELETE => c"NODE_DELETE".as_ptr(),
-        XLOG_PG_EDDY_EDGE_INSERT => c"EDGE_INSERT".as_ptr(),
-        XLOG_PG_EDDY_EDGE_DELETE => c"EDGE_DELETE".as_ptr(),
-        XLOG_PG_EDDY_ADJ_UPDATE  => c"ADJ_UPDATE".as_ptr(),
-        XLOG_PG_EDDY_VACUUM_PAGE => c"VACUUM_PAGE".as_ptr(),
+        XLOG_PG_EDDY_NODE_INSERT    => c"NODE_INSERT".as_ptr(),
+        XLOG_PG_EDDY_NODE_INSERT_OVF => c"NODE_INSERT_OVF".as_ptr(),
+        XLOG_PG_EDDY_NODE_COMPACT   => c"NODE_COMPACT".as_ptr(),
+        XLOG_PG_EDDY_NODE_DELETE    => c"NODE_DELETE".as_ptr(),
+        XLOG_PG_EDDY_EDGE_INSERT    => c"EDGE_INSERT".as_ptr(),
+        XLOG_PG_EDDY_EDGE_DELETE    => c"EDGE_DELETE".as_ptr(),
+        XLOG_PG_EDDY_ADJ_UPDATE     => c"ADJ_UPDATE".as_ptr(),
+        XLOG_PG_EDDY_VACUUM_PAGE    => c"VACUUM_PAGE".as_ptr(),
         _ => c"UNKNOWN".as_ptr(),
     }
 }

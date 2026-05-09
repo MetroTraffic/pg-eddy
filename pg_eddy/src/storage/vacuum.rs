@@ -2,24 +2,20 @@
 // We allow the old implicit-unsafe behavior here to keep the code readable.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-/// VACUUM support for pg_eddy (Phase 3).
+/// VACUUM support for pg_eddy (Phase 3/4).
 ///
-/// Strategy
-/// --------
-/// Dead tuples are identified by a non-zero xmax that is visible to all
-/// current and future snapshots (i.e., xmax < OldestNonRemovableXid).
+/// Phase 3: mark dead slots LP_DEAD.
+/// Phase 4: physical compaction (PageRepairFragmentation) for node pages after
+/// LP_DEAD marking; adj headers cleared for dead nodes; WAL-logged as a full
+/// page image (XLOG_PG_EDDY_NODE_COMPACT).
 ///
-/// For each such dead item pointer we:
-///   1. Set the ItemId flags to LP_DEAD (preserves the data in-page so that
-///      the adjacency chain follower can still read the `next_*` pointers).
-///   2. WAL-log the batch of LP_DEAD changes via XLOG_PG_EDDY_VACUUM_PAGE.
-///
-/// Physical page compaction (PageRepairFragmentation) is deferred to Phase 4;
-/// VACUUM only marks slots LP_DEAD in this release.
+/// Edge pages are still only marked LP_DEAD (physical compaction requires
+/// adj-chain repair, deferred to a future release).
 use pgrx::pg_sys;
 use std::mem::size_of;
 
-use crate::storage::page::{OFF_EDGE_NEXT_IN_PAGE, OFF_EDGE_NEXT_IN_SLOT, OFF_EDGE_NEXT_OUT_PAGE, OFF_EDGE_NEXT_OUT_SLOT};
+use crate::storage::node_store::{compact_node_page, is_overflow_page};
+use crate::storage::page::NODE_FIXED_DATA_SIZE;
 use crate::storage::wal::log_vacuum_page;
 
 // ---------------------------------------------------------------------------
@@ -67,10 +63,28 @@ pub unsafe fn vacuum_relation(rel: pg_sys::Relation) -> VacuumStats {
         );
         pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
         let page = pg_sys::BufferGetPage(buf);
+
+        // Skip overflow blocks (plain pages with no special area).
+        if is_overflow_page(page) {
+            pg_sys::UnlockReleaseBuffer(buf);
+            continue;
+        }
+
+        // Detect node page vs edge page:
+        // Node pages: pd_special < BLCKSZ (they have a special area).
+        // Edge pages: pd_special == BLCKSZ (no special area, but they ARE data pages).
+        // We detect by checking the pd_special offset: node pages have
+        // pd_special = PD_NODE_SPECIAL_OFFSET (5792), edge pages have 8192.
+        // But `is_overflow_page` already returned false, so a page with
+        // pd_special == 8192 here is an EDGE page.
+        let phdr = page as *const pg_sys::PageHeaderData;
+        let is_node_page = (*phdr).pd_special as usize != pg_sys::BLCKSZ as usize;
+
         let max_off = pg_sys::PageGetMaxOffsetNumber(page as *const _);
 
         // Collect dead offsets under shared lock first (avoids long exclusive hold).
         let mut dead_offsets: Vec<u16> = Vec::new();
+        let mut dead_adj_slots: Vec<usize> = Vec::new(); // for node pages only
         let mut page_live: u64 = 0;
         let mut page_dead: u64 = 0;
 
@@ -104,6 +118,16 @@ pub unsafe fn vacuum_relation(rel: pg_sys::Relation) -> VacuumStats {
             {
                 dead_offsets.push(off as u16);
                 page_dead += 1;
+                // For node pages, collect the adj_slot_idx so we can clear the adj header.
+                if is_node_page && item_len >= hdr_size + NODE_FIXED_DATA_SIZE {
+                    let data = std::slice::from_raw_parts(item.add(hdr_size), item_len - hdr_size);
+                    let adj_slot_idx = u16::from_le_bytes(
+                        data[crate::storage::page::OFF_ADJ_SLOT..crate::storage::page::OFF_ADJ_SLOT + 2]
+                            .try_into()
+                            .unwrap_or([0, 0]),
+                    ) as usize;
+                    dead_adj_slots.push(adj_slot_idx);
+                }
             } else {
                 page_live += 1;
             }
@@ -111,19 +135,19 @@ pub unsafe fn vacuum_relation(rel: pg_sys::Relation) -> VacuumStats {
 
         pg_sys::UnlockReleaseBuffer(buf);
 
-        // Determine whether this is a node or edge page and update stats.
-        // We use NODE_FIXED_DATA_SIZE as a heuristic: node pages have
-        // pd_special > 0, edge pages have pd_special == sizeof(PageHeaderData).
-        // For now, accumulate totals without per-type split — callers in lib.rs
-        // will run vacuum on nodes and edges separately.
-        stats.live_nodes += page_live; // will be corrected by caller
-        stats.dead_nodes += page_dead;
+        if is_node_page {
+            stats.live_nodes += page_live;
+            stats.dead_nodes += page_dead;
+        } else {
+            stats.live_edges += page_live;
+            stats.dead_edges += page_dead;
+        }
 
         if dead_offsets.is_empty() {
             continue;
         }
 
-        // Re-acquire exclusive lock to mark LP_DEAD.
+        // Re-acquire exclusive lock to mark LP_DEAD and (for node pages) compact.
         let buf = pg_sys::ReadBufferExtended(
             rel,
             pg_sys::ForkNumber::MAIN_FORKNUM,
@@ -142,9 +166,23 @@ pub unsafe fn vacuum_relation(rel: pg_sys::Relation) -> VacuumStats {
             }
         }
 
-        let lsn = log_vacuum_page(buf, &dead_offsets);
-        pg_sys::PageSetLSN(page, lsn);
-        pg_sys::MarkBufferDirty(buf);
+        let lsn = if is_node_page {
+            // Node pages: physically compact (clears adj headers + PageRepairFragmentation)
+            // and WAL-log as a full-page image. The LP_DEAD marking above is a
+            // prerequisite so PageRepairFragmentation knows which slots to reclaim.
+            compact_node_page(buf, &dead_adj_slots)
+        } else {
+            // Edge pages: LP_DEAD only (chain repair deferred to future release).
+            let l = log_vacuum_page(buf, &dead_offsets);
+            pg_sys::PageSetLSN(page, l);
+            pg_sys::MarkBufferDirty(buf);
+            l
+        };
+
+        if is_node_page {
+            pg_sys::PageSetLSN(page, lsn);
+            pg_sys::MarkBufferDirty(buf);
+        }
         pg_sys::CritSectionCount -= 1;
 
         pg_sys::UnlockReleaseBuffer(buf);
@@ -153,22 +191,3 @@ pub unsafe fn vacuum_relation(rel: pg_sys::Relation) -> VacuumStats {
     stats
 }
 
-// ---------------------------------------------------------------------------
-// Accessor helpers for edge chain pointers (used by vacuum to verify chains)
-// ---------------------------------------------------------------------------
-
-/// Read the `next_out_page` and `next_out_slot` from an edge item data slice.
-#[inline]
-pub fn edge_next_out(data: &[u8]) -> (u32, u16) {
-    let pg = u32::from_le_bytes(data[OFF_EDGE_NEXT_OUT_PAGE..OFF_EDGE_NEXT_OUT_PAGE + 4].try_into().unwrap());
-    let sl = u16::from_le_bytes(data[OFF_EDGE_NEXT_OUT_SLOT..OFF_EDGE_NEXT_OUT_SLOT + 2].try_into().unwrap());
-    (pg, sl)
-}
-
-/// Read the `next_in_page` and `next_in_slot` from an edge item data slice.
-#[inline]
-pub fn edge_next_in(data: &[u8]) -> (u32, u16) {
-    let pg = u32::from_le_bytes(data[OFF_EDGE_NEXT_IN_PAGE..OFF_EDGE_NEXT_IN_PAGE + 4].try_into().unwrap());
-    let sl = u16::from_le_bytes(data[OFF_EDGE_NEXT_IN_SLOT..OFF_EDGE_NEXT_IN_SLOT + 2].try_into().unwrap());
-    (pg, sl)
-}

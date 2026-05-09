@@ -86,3 +86,48 @@ pub fn next_edge_id() -> i64 {
         .unwrap_or_else(|e| panic!("pg_eddy: next_edge_id SPI error: {e}"))
         .unwrap_or_else(|| panic!("pg_eddy: nextval returned NULL"))
 }
+
+/// Look up a label id by name; returns `None` if the label does not exist yet.
+pub fn label_id_by_name(name: &str) -> Option<i32> {
+    Spi::get_one_with_args::<i32>(
+        "SELECT label_id FROM _pg_eddy.label_registry WHERE name = $1",
+        &[DatumWithOid::from(name)],
+    )
+    .unwrap_or(None)
+}
+
+/// Return all label names in the registry.
+pub fn all_labels() -> Vec<String> {
+    Spi::connect(|client| {
+        let tup_table = client
+            .select("SELECT name FROM _pg_eddy.label_registry ORDER BY label_id", None, &[])
+            .unwrap_or_else(|e| panic!("pg_eddy: all_labels SPI error: {e}"));
+        tup_table
+            .filter_map(|row| row.get::<String>(1).ok().flatten())
+            .collect()
+    })
+}
+
+/// Return all relationship type names in the registry.
+pub fn all_rel_types() -> Vec<String> {
+    Spi::connect(|client| {
+        let tup_table = client
+            .select("SELECT name FROM _pg_eddy.rel_type_registry ORDER BY type_id", None, &[])
+            .unwrap_or_else(|e| panic!("pg_eddy: all_rel_types SPI error: {e}"));
+        tup_table
+            .filter_map(|row| row.get::<String>(1).ok().flatten())
+            .collect()
+    })
+}
+
+/// Return all property key names in the registry.
+pub fn all_prop_keys() -> Vec<String> {
+    Spi::connect(|client| {
+        let tup_table = client
+            .select("SELECT name FROM _pg_eddy.property_key_registry ORDER BY key_id", None, &[])
+            .unwrap_or_else(|e| panic!("pg_eddy: all_prop_keys SPI error: {e}"));
+        tup_table
+            .filter_map(|row| row.get::<String>(1).ok().flatten())
+            .collect()
+    })
+}

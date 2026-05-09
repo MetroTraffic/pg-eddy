@@ -19,9 +19,9 @@ use std::mem::size_of;
 use crate::storage::page::{
     MAX_LABELS_PER_NODE, NODE_FIXED_DATA_SIZE, OFF_ADJ_SLOT, OFF_LABEL_COUNT,
     OFF_LABEL_IDS, OFF_NODE_ID, OFF_PROP_INLINE_LEN, OFF_PROP_OVERFLOW_PAGE,
-    PD_NODE_SPECIAL_SIZE, PROP_INLINE_MAX,
+    PD_NODE_SPECIAL_OFFSET, PD_NODE_SPECIAL_SIZE, PROP_INLINE_MAX,
 };
-use crate::storage::wal::{log_node_delete, log_node_insert};
+use crate::storage::wal::{log_node_compact, log_node_delete, log_node_insert};
 
 // ---------------------------------------------------------------------------
 // Public node record
@@ -32,6 +32,10 @@ use crate::storage::wal::{log_node_delete, log_node_insert};
 pub struct NodeRecord {
     pub node_id: i64,
     pub adj_slot_idx: u16,
+    /// When non-zero, `prop_bytes` is empty and the actual properties are
+    /// stored in this block of the node relation. Callers must call
+    /// `read_overflow_block(rel, overflow_blkno)` to get the full data.
+    pub overflow_blkno: u32,
     pub label_ids: Vec<i32>,
     pub prop_bytes: Vec<u8>,
 }
@@ -61,26 +65,85 @@ pub unsafe fn insert_node(
     if label_ids.len() > MAX_LABELS_PER_NODE {
         pgrx::error!("pg_eddy PE101: node has {} labels, max is {}", label_ids.len(), MAX_LABELS_PER_NODE);
     }
-    // Guard: property size
-    if prop_bytes.len() > PROP_INLINE_MAX {
-        pgrx::error!(
-            "pg_eddy PE200: property data ({} B) exceeds inline limit ({} B); overflow pages not yet implemented",
-            prop_bytes.len(),
-            PROP_INLINE_MAX,
-        );
-    }
 
-    let item_bytes = build_node_item_bytes(node_id, 0 /*adj_slot_idx placeholder*/, label_ids, prop_bytes);
+    let needs_overflow = prop_bytes.len() > PROP_INLINE_MAX;
 
-    // Find a page with enough free space, or extend.
-    let buf = find_or_extend_page(rel, item_bytes.len());
+    // Compute item size (inline_props = empty when overflow; size is the same
+    // regardless of overflow_blkno value since it's a fixed-size u32 field).
+    let inline_props_for_size: &[u8] = if needs_overflow { &[] } else { prop_bytes };
+    let item_size_estimate = build_node_item_bytes_ovf(
+        node_id, 0, label_ids, inline_props_for_size, 0,
+    ).len();
+
+    // Step 1: Find/extend the NODE page FIRST (exclusive lock acquired here).
+    // We MUST do this before write_overflow_block to avoid a deadlock:
+    // write_overflow_block creates a new block (P_NEW) and holds it exclusively.
+    // If find_or_extend_page runs after, it tries the last block first, which
+    // would be the newly-created overflow block — causing a self-deadlock.
+    let buf = find_or_extend_page(rel, item_size_estimate);
+
+    // Step 2: Write overflow data if needed. The overflow block is always a
+    // NEW block (P_NEW = block after the node page we just found), so there
+    // is no lock conflict with the node page buffer we're already holding.
+    let ovf_result: Option<(pg_sys::Buffer, pg_sys::BlockNumber)> =
+        if needs_overflow {
+            Some(write_overflow_block(rel, prop_bytes))
+        } else {
+            None
+        };
+    let (inline_props, overflow_blkno) = match &ovf_result {
+        Some((_, blk)) => (&[][..], *blk),
+        None            => (prop_bytes, 0u32),
+    };
+
+    // Build final item bytes with correct overflow_blkno.
+    let item_bytes = build_node_item_bytes_ovf(
+        node_id, 0 /*adj placeholder*/, label_ids, inline_props, overflow_blkno,
+    );
 
     let page = pg_sys::BufferGetPage(buf);
     let blkno = pg_sys::BufferGetBlockNumber(buf);
 
     // ----- Critical section: must not error between START and END -----
+    // ALL page modifications (overflow page + node page) happen here, under a
+    // single CritSectionCount guard, so that:
+    //   1. PageAddItemExtended for overflow data runs inside the critical section.
+    //   2. XLogInsert registers and images both buffers atomically.
+    //   3. PageSetLSN + MarkBufferDirty for both pages happen before
+    //      CritSectionCount drops to zero.
+    // This is required by PostgreSQL's WAL protocol: between any page
+    // modification and the corresponding MarkBufferDirty + PageSetLSN, no
+    // error must be able to escape (otherwise the page is left in a modified
+    // but un-WAL-logged state).
     unsafe {
         pg_sys::CritSectionCount += 1;
+    }
+
+    // First, write the prop data into the overflow page (if used).
+    // This runs inside the critical section so the modification is covered.
+    let ovf_item_ok = if let Some((ovf_buf, _)) = ovf_result.as_ref() {
+        let ovf_page = unsafe { pg_sys::BufferGetPage(*ovf_buf) };
+        let ovf_off = unsafe {
+            pg_sys::PageAddItemExtended(
+                ovf_page,
+                prop_bytes.as_ptr() as pg_sys::Item,
+                prop_bytes.len() as pg_sys::Size,
+                pg_sys::InvalidOffsetNumber,
+                0,
+            )
+        };
+        ovf_off != pg_sys::InvalidOffsetNumber
+    } else {
+        true
+    };
+
+    if !ovf_item_ok {
+        unsafe { pg_sys::CritSectionCount -= 1; }
+        if let Some((ovf_buf, _)) = ovf_result {
+            unsafe { pg_sys::UnlockReleaseBuffer(ovf_buf) };
+        }
+        unsafe { pg_sys::UnlockReleaseBuffer(buf) };
+        pgrx::error!("pg_eddy: PageAddItemExtended failed for overflow block");
     }
 
     let off = unsafe {
@@ -95,6 +158,9 @@ pub unsafe fn insert_node(
     if off == pg_sys::InvalidOffsetNumber {
         // Roll back critical section before panic
         unsafe { pg_sys::CritSectionCount -= 1; }
+        if let Some((ovf_buf, _)) = ovf_result {
+            unsafe { pg_sys::UnlockReleaseBuffer(ovf_buf) };
+        }
         pgrx::error!("pg_eddy: PageAddItemExtended failed on block {blkno}");
     }
 
@@ -120,15 +186,31 @@ pub unsafe fn insert_node(
         pg_sys::ItemPointerSet(&mut (*item_in_page).t_ctid, blkno, off);
     }
 
-    // WAL-log the insert, get the LSN.
-    let lsn = unsafe { log_node_insert(buf, page, off, &item_bytes) };
+    // WAL-log the insert (with optional overflow block).
+    // log_node_insert registers both buffers and takes a full-page image of
+    // the overflow block (REGBUF_FORCE_IMAGE). Both pages are registered here,
+    // inside the critical section, so the WAL record covers all modifications.
+    let overflow_buf_opt: Option<pg_sys::Buffer> = ovf_result.as_ref().map(|(b, _)| *b);
+    let lsn = unsafe { log_node_insert(buf, page, off, &item_bytes, overflow_buf_opt) };
 
     unsafe {
         pg_sys::PageSetLSN(page, lsn);
         pg_sys::MarkBufferDirty(buf);
+        // Also set LSN and mark dirty for the overflow page (if any).
+        // Must be done inside the same critical section, after XLogInsert.
+        if let Some(ovf_buf) = overflow_buf_opt {
+            let ovf_page = pg_sys::BufferGetPage(ovf_buf);
+            pg_sys::PageSetLSN(ovf_page, lsn);
+            pg_sys::MarkBufferDirty(ovf_buf);
+        }
         pg_sys::CritSectionCount -= 1;
     }
     // ----- End critical section -----
+
+    // Release overflow buffer (after WAL critical section).
+    if let Some(ovf_buf) = overflow_buf_opt {
+        unsafe { pg_sys::UnlockReleaseBuffer(ovf_buf) };
+    }
 
     unsafe { pg_sys::UnlockReleaseBuffer(buf) };
     blkno
@@ -186,6 +268,15 @@ impl NodeScanState {
             };
             unsafe { pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32) };
             let page = unsafe { pg_sys::BufferGetPage(buf) };
+
+            // Skip overflow blocks (plain pages with no special area).
+            if unsafe { is_overflow_page(page) } {
+                unsafe { pg_sys::UnlockReleaseBuffer(buf) };
+                self.current_blk += 1;
+                self.current_off = pg_sys::FirstOffsetNumber;
+                continue;
+            }
+
             let max_off = unsafe { pg_sys::PageGetMaxOffsetNumber(page as *const _) };
 
             let mut found: Option<NodeRecord> = None;
@@ -203,8 +294,12 @@ impl NodeScanState {
 
             unsafe { pg_sys::UnlockReleaseBuffer(buf) };
 
-            if found.is_some() {
-                return found;
+            // Resolve overflow props outside the buffer lock.
+            if let Some(mut r) = found {
+                if r.overflow_blkno != 0 && r.prop_bytes.is_empty() {
+                    r.prop_bytes = unsafe { read_overflow_block(self.rel, r.overflow_blkno) };
+                }
+                return Some(r);
             }
             // Move to next block
             self.current_blk += 1;
@@ -245,17 +340,31 @@ pub unsafe fn find_node_by_id(
         };
         unsafe { pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32) };
         let page = unsafe { pg_sys::BufferGetPage(buf) };
+
+        // Skip overflow blocks.
+        if unsafe { is_overflow_page(page) } {
+            unsafe { pg_sys::UnlockReleaseBuffer(buf) };
+            continue;
+        }
+
         let max_off = unsafe { pg_sys::PageGetMaxOffsetNumber(page as *const _) };
 
+        let mut found: Option<NodeRecord> = None;
         for off in pg_sys::FirstOffsetNumber..=max_off {
             if let Some(rec) = unsafe { read_node_at_offset(page, buf, snapshot, off) } {
                 if rec.node_id == node_id {
-                    unsafe { pg_sys::UnlockReleaseBuffer(buf) };
-                    return Some(rec);
+                    found = Some(rec);
+                    break;
                 }
             }
         }
         unsafe { pg_sys::UnlockReleaseBuffer(buf) };
+        if let Some(mut r) = found {
+            if r.overflow_blkno != 0 && r.prop_bytes.is_empty() {
+                r.prop_bytes = unsafe { read_overflow_block(rel, r.overflow_blkno) };
+            }
+            return Some(r);
+        }
     }
     None
 }
@@ -278,6 +387,11 @@ pub unsafe fn count_nodes(rel: pg_sys::Relation, snapshot: pg_sys::Snapshot) -> 
         };
         unsafe { pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32) };
         let page = unsafe { pg_sys::BufferGetPage(buf) };
+        // Skip overflow pages.
+        if unsafe { is_overflow_page(page) } {
+            unsafe { pg_sys::UnlockReleaseBuffer(buf) };
+            continue;
+        }
         let max_off = unsafe { pg_sys::PageGetMaxOffsetNumber(page as *const _) };
         for off in pg_sys::FirstOffsetNumber..=max_off {
             if unsafe { read_node_at_offset(page, buf, snapshot, off) }.is_some() {
@@ -315,7 +429,8 @@ pub unsafe fn init_node_page(page: pg_sys::Page) {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Build the raw bytes for a node item.
+/// Build the raw bytes for a node item (without overflow support — kept for
+/// update_node which handles overflow separately).
 ///
 /// `adj_slot_idx` — the permanent adjacency-header slot index (0-based); pass
 /// 0 as a placeholder in `insert_node` and overwrite in the in-page copy
@@ -325,6 +440,21 @@ unsafe fn build_node_item_bytes(
     adj_slot_idx: u16,
     label_ids: &[i32],
     prop_bytes: &[u8],
+) -> Vec<u8> {
+    build_node_item_bytes_ovf(node_id, adj_slot_idx, label_ids, prop_bytes, 0)
+}
+
+/// Build the raw bytes for a node item with explicit overflow block control.
+///
+/// When `overflow_blkno != 0`, `prop_bytes` should be empty (the data is in
+/// the overflow block), and `prop_inline_len = 0` with
+/// `prop_overflow_page = overflow_blkno` will be stored.
+unsafe fn build_node_item_bytes_ovf(
+    node_id: i64,
+    adj_slot_idx: u16,
+    label_ids: &[i32],
+    prop_bytes: &[u8],
+    overflow_blkno: u32,
 ) -> Vec<u8> {
     let hdr_size = size_of::<pg_sys::HeapTupleHeaderData>();
     let total = hdr_size + NODE_FIXED_DATA_SIZE + label_ids.len() * 4 + prop_bytes.len();
@@ -357,51 +487,186 @@ unsafe fn build_node_item_bytes(
     data[OFF_ADJ_SLOT..OFF_ADJ_SLOT + 2].copy_from_slice(&adj_slot_idx.to_le_bytes());
     // label_count (1)
     data[OFF_LABEL_COUNT] = label_ids.len() as u8;
-    // prop_inline_len (2)
-    let nprop = prop_bytes.len() as u16;
+    // prop_inline_len (2) — 0 when overflow
+    let nprop = if overflow_blkno == 0 { prop_bytes.len() as u16 } else { 0u16 };
     data[OFF_PROP_INLINE_LEN..OFF_PROP_INLINE_LEN + 2].copy_from_slice(&nprop.to_le_bytes());
-    // prop_overflow_page (4) — 0 = none
-    data[OFF_PROP_OVERFLOW_PAGE..OFF_PROP_OVERFLOW_PAGE + 4].copy_from_slice(&0u32.to_le_bytes());
+    // prop_overflow_page (4)
+    data[OFF_PROP_OVERFLOW_PAGE..OFF_PROP_OVERFLOW_PAGE + 4].copy_from_slice(&overflow_blkno.to_le_bytes());
     // _pad (1) — already 0 from vec![]
     // label_ids (4 each)
     for (i, lid) in label_ids.iter().enumerate() {
         let off = OFF_LABEL_IDS + i * 4;
         data[off..off + 4].copy_from_slice(&lid.to_le_bytes());
     }
-    // prop_bytes
-    let prop_start = OFF_LABEL_IDS + label_ids.len() * 4;
-    data[prop_start..prop_start + prop_bytes.len()].copy_from_slice(prop_bytes);
+    // prop_bytes (only when inline)
+    if overflow_blkno == 0 {
+        let prop_start = OFF_LABEL_IDS + label_ids.len() * 4;
+        data[prop_start..prop_start + prop_bytes.len()].copy_from_slice(prop_bytes);
+    }
 
     buf
+}
+
+// ---------------------------------------------------------------------------
+// Overflow block helpers
+// ---------------------------------------------------------------------------
+
+/// Write a plain "overflow" block to the node relation containing `prop_bytes`.
+///
+/// Overflow blocks use PageInit(BLCKSZ, 0) — no pd_special area (pd_special
+/// offset = BLCKSZ = 8192).  A single item at offset 1 holds the raw bytes.
+/// Callers MUST release the returned buffer after WAL-logging.
+///
+/// # Safety
+/// `rel` must be a valid, open node relation with an exclusive lock held.
+pub unsafe fn write_overflow_block(
+    rel: pg_sys::Relation,
+    prop_bytes: &[u8],
+) -> (pg_sys::Buffer, pg_sys::BlockNumber) {
+    // Extend the relation with a new block.
+    // MUST be called OUTSIDE any critical section (ReadBufferExtended can error).
+    let buf = pg_sys::ReadBufferExtended(
+        rel,
+        pg_sys::ForkNumber::MAIN_FORKNUM,
+        pg_sys::InvalidBlockNumber,
+        pg_sys::ReadBufferMode::RBM_NORMAL,
+        std::ptr::null_mut(),
+    );
+    let blkno = pg_sys::BufferGetBlockNumber(buf);
+    pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
+    let page = pg_sys::BufferGetPage(buf);
+    // Initialise as a plain page (no special area).
+    // pd_special = BLCKSZ after PageInit(page, BLCKSZ, 0), which is how we
+    // identify overflow pages in is_overflow_page().
+    // PageInit is safe here (outside critical section) because we hold the
+    // exclusive buffer lock and haven't registered this buffer for WAL yet.
+    pg_sys::PageInit(page, pg_sys::BLCKSZ as pg_sys::Size, 0);
+
+    // DO NOT call PageAddItemExtended, PageSetLSN, or MarkBufferDirty here.
+    // The caller (insert_node) MUST do all page modifications for this buffer
+    // inside its own critical section, so that all page changes (node page +
+    // overflow page) and WAL registration happen atomically under a single
+    // CritSectionCount guard.
+
+    (buf, blkno)
+}
+
+/// Read raw property bytes from an overflow block.
+///
+/// Returns an empty `Vec` if the block is absent, uninitialised, or has no
+/// items (should not happen in normal operation).
+///
+/// # Safety
+/// `rel` must be a valid, open node relation.
+pub unsafe fn read_overflow_block(
+    rel: pg_sys::Relation,
+    blkno: pg_sys::BlockNumber,
+) -> Vec<u8> {
+    let buf = pg_sys::ReadBufferExtended(
+        rel,
+        pg_sys::ForkNumber::MAIN_FORKNUM,
+        blkno,
+        pg_sys::ReadBufferMode::RBM_NORMAL,
+        std::ptr::null_mut(),
+    );
+    pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
+    let page = pg_sys::BufferGetPage(buf);
+    let max_off = pg_sys::PageGetMaxOffsetNumber(page as *const _);
+    let result = if max_off >= pg_sys::FirstOffsetNumber {
+        let iid = pg_sys::PageGetItemId(page, pg_sys::FirstOffsetNumber);
+        let len = (*iid).lp_len() as usize;
+        let data = pg_sys::PageGetItem(page as *const _, iid) as *const u8;
+        std::slice::from_raw_parts(data, len).to_vec()
+    } else {
+        Vec::new()
+    };
+    pg_sys::UnlockReleaseBuffer(buf);
+    result
+}
+
+/// Returns `true` if `page` is an overflow block (pd_special == BLCKSZ).
+///
+/// Node pages have `pd_special == PD_NODE_SPECIAL_OFFSET (5792)`.
+/// Overflow pages are initialised with `PageInit(BLCKSZ, 0)` so
+/// `pd_special == BLCKSZ (8192)`.
+#[inline]
+pub unsafe fn is_overflow_page(page: pg_sys::Page) -> bool {
+    let phdr = page as *const pg_sys::PageHeaderData;
+    (*phdr).pd_special as usize == pg_sys::BLCKSZ as usize
+        && (*phdr).pd_special as usize != PD_NODE_SPECIAL_OFFSET
+}
+
+/// Compact a node page: clear adj headers for dead items, call
+/// PageRepairFragmentation, and WAL-log the result as a full-page image.
+///
+/// `dead_adj_slots` — adj_slot_idx values of the LP_DEAD items being reclaimed.
+///
+/// # Safety
+/// Called inside vacuum_relation with the buffer held exclusively and inside a
+/// critical section.
+pub unsafe fn compact_node_page(
+    buf: pg_sys::Buffer,
+    dead_adj_slots: &[usize],
+) -> pg_sys::XLogRecPtr {
+    let page = pg_sys::BufferGetPage(buf);
+
+    // Clear adj headers for each dead item (zero the pd_special entry).
+    if !dead_adj_slots.is_empty() {
+        let special = pg_sys::PageGetSpecialPointer(page) as *mut u8;
+        for &slot in dead_adj_slots {
+            let offset = slot * crate::storage::page::ADJ_HEADER_BYTES;
+            std::ptr::write_bytes(special.add(offset), 0, crate::storage::page::ADJ_HEADER_BYTES);
+        }
+    }
+
+    // Physically compact the page (reclaim LP_DEAD slot space).
+    pg_sys::PageRepairFragmentation(page);
+
+    // WAL-log the full compacted page image.
+    log_node_compact(buf)
 }
 
 /// Find a buffer with enough free space, or extend the relation.
 ///
 /// Returns an exclusively-locked buffer ready for writing.
+/// Skips overflow blocks (which have pd_special == BLCKSZ).
 unsafe fn find_or_extend_page(rel: pg_sys::Relation, item_size: usize) -> pg_sys::Buffer {
     let nblocks = unsafe {
         pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM)
     };
 
-    // Try the last block first (or block 0 if only one block).
+    // Scan backwards from the last block looking for a node page with space.
+    // Skip overflow blocks (pd_special == BLCKSZ, created by write_overflow_block).
     if nblocks > 0 {
-        let last = nblocks - 1;
-        let buf = unsafe {
-            pg_sys::ReadBufferExtended(
-                rel,
-                pg_sys::ForkNumber::MAIN_FORKNUM,
-                last,
-                pg_sys::ReadBufferMode::RBM_NORMAL,
-                std::ptr::null_mut(),
-            )
-        };
-        unsafe { pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32) };
-        let page = unsafe { pg_sys::BufferGetPage(buf) };
-        let free = unsafe { page_free_space(page) };
-        if free >= item_size + size_of::<pg_sys::ItemIdData>() {
-            return buf;
+        let mut blk = nblocks - 1;
+        loop {
+            let buf = unsafe {
+                pg_sys::ReadBufferExtended(
+                    rel,
+                    pg_sys::ForkNumber::MAIN_FORKNUM,
+                    blk,
+                    pg_sys::ReadBufferMode::RBM_NORMAL,
+                    std::ptr::null_mut(),
+                )
+            };
+            unsafe { pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32) };
+            let page = unsafe { pg_sys::BufferGetPage(buf) };
+            // Skip overflow blocks.
+            if unsafe { is_overflow_page(page) } {
+                unsafe { pg_sys::UnlockReleaseBuffer(buf) };
+                if blk == 0 {
+                    break;
+                }
+                blk -= 1;
+                continue;
+            }
+            let free = unsafe { page_free_space(page) };
+            if free >= item_size + size_of::<pg_sys::ItemIdData>() {
+                return buf;
+            }
+            unsafe { pg_sys::UnlockReleaseBuffer(buf) };
+            break;
         }
-        unsafe { pg_sys::UnlockReleaseBuffer(buf) };
     }
 
     // Extend the relation with a new page.
@@ -480,6 +745,9 @@ unsafe fn read_node_at_offset(
     let prop_len = u16::from_le_bytes(
         data[OFF_PROP_INLINE_LEN..OFF_PROP_INLINE_LEN + 2].try_into().ok()?,
     ) as usize;
+    let overflow_blkno = u32::from_le_bytes(
+        data[OFF_PROP_OVERFLOW_PAGE..OFF_PROP_OVERFLOW_PAGE + 4].try_into().ok()?,
+    );
 
     let labels_end = OFF_LABEL_IDS + label_count * 4;
     if data.len() < labels_end + prop_len {
@@ -490,9 +758,25 @@ unsafe fn read_node_at_offset(
         let lo = OFF_LABEL_IDS + i * 4;
         label_ids.push(i32::from_le_bytes(data[lo..lo + 4].try_into().ok()?));
     }
-    let prop_bytes = data[labels_end..labels_end + prop_len].to_vec();
 
-    Some(NodeRecord { node_id, adj_slot_idx, label_ids, prop_bytes })
+    // Resolve properties: inline or from overflow block.
+    let prop_bytes = if prop_len > 0 {
+        data[labels_end..labels_end + prop_len].to_vec()
+    } else if overflow_blkno != 0 {
+        // We need to open the relation again for the overflow read. Since we
+        // already hold a shared lock on the NODE page's buffer, and the
+        // overflow block is a different block, this is safe.
+        // SAFETY: `_buf` parameter gives us access to the relation via rel_lookup;
+        // but we don't have rel here. For now, re-derive from the buffer.
+        // Actually: read_node_at_offset doesn't have access to `rel`.
+        // Store overflow_blkno in the returned record and let callers resolve it.
+        // See NodeRecord.overflow_blkno — callers call read_overflow_block if non-zero.
+        Vec::new() // placeholder; caller checks overflow_blkno
+    } else {
+        Vec::new()
+    };
+
+    Some(NodeRecord { node_id, adj_slot_idx, overflow_blkno, label_ids, prop_bytes })
 }
 
 /// Return the number of free bytes available for new items on `page`.
@@ -536,6 +820,13 @@ pub unsafe fn find_node_location(
         );
         pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
         let page = pg_sys::BufferGetPage(buf);
+
+        // Skip overflow blocks.
+        if is_overflow_page(page) {
+            pg_sys::UnlockReleaseBuffer(buf);
+            continue;
+        }
+
         let max_off = pg_sys::PageGetMaxOffsetNumber(page as *const _);
 
         let mut found: Option<(pg_sys::BlockNumber, pg_sys::OffsetNumber, usize)> = None;
@@ -715,7 +1006,7 @@ pub unsafe fn update_node(
 
     // WAL-log: delete old, insert new.
     let lsn_del = log_node_delete(buf, page, old_off, xmax);
-    let lsn_ins = log_node_insert(buf, page, new_off, &new_item);
+    let lsn_ins = log_node_insert(buf, page, new_off, &new_item, None);
     let lsn = if lsn_ins > lsn_del { lsn_ins } else { lsn_del };
     pg_sys::PageSetLSN(page, lsn);
     pg_sys::MarkBufferDirty(buf);
