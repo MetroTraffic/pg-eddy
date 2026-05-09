@@ -1,7 +1,6 @@
 /// Label and property-key registry SPI helpers.
 ///
 /// All functions require an active transaction with SPI available.
-
 use pgrx::prelude::*;
 use pgrx::datum::DatumWithOid;
 

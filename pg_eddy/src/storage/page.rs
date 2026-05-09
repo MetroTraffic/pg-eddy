@@ -10,7 +10,6 @@
 ///
 /// The `pd_special` area is sized for `MAX_NODE_SLOTS_PER_PAGE` adjacency headers.
 /// Each header maps 1:1 to an item slot (adj_slot_idx in the node record).
-
 // ---------------------------------------------------------------------------
 // WAL record info bytes.
 //

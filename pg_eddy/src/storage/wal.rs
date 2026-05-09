@@ -204,7 +204,7 @@ pub unsafe fn log_vacuum_page(
     );
     pg_sys::XLogRegisterData(
         dead_offsets.as_ptr() as *const _,
-        (dead_offsets.len() * size_of::<u16>()) as u32,
+        std::mem::size_of_val(dead_offsets) as u32,
     );
     pg_sys::XLogInsert(RMGR_ID, XLOG_PG_EDDY_VACUUM_PAGE)
 }

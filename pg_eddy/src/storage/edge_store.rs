@@ -35,6 +35,7 @@ use crate::storage::wal::{log_adj_update, log_edge_delete, log_edge_insert};
 
 /// A decoded edge record, ready for Rust/SQL consumption.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct EdgeRecord {
     pub edge_id: i64,
     pub rel_type_id: i32,
@@ -176,7 +177,7 @@ pub unsafe fn insert_edge(
 
     let src_adj = read_adj_header(src_node_page, src_adj_idx);
     let tgt_adj = if same_node_page && src_adj_idx == tgt_adj_idx {
-        src_adj.clone() // self-loop
+        src_adj // self-loop
     } else {
         read_adj_header(tgt_node_page, tgt_adj_idx)
     };
@@ -224,16 +225,16 @@ pub unsafe fn insert_edge(
     }
 
     // Compute new adjacency headers with updated head pointers and degrees.
-    let mut new_src_adj = src_adj.clone();
+    let mut new_src_adj = src_adj;
     new_src_adj.set_out_head_pg(edge_blk);
     new_src_adj.set_out_head_sl(edge_off);
     new_src_adj.set_out_degree(src_adj.out_degree() + 1);
 
     // For self-loops, start from new_src_adj (which already has out updated).
     let mut new_tgt_adj = if same_node_page && src_adj_idx == tgt_adj_idx {
-        new_src_adj.clone()
+        new_src_adj
     } else {
-        tgt_adj.clone()
+        tgt_adj
     };
     new_tgt_adj.set_in_head_pg(edge_blk);
     new_tgt_adj.set_in_head_sl(edge_off);
@@ -400,12 +401,11 @@ pub unsafe fn find_edge_by_id(
         let max_off = pg_sys::PageGetMaxOffsetNumber(page as *const _);
 
         for off in pg_sys::FirstOffsetNumber..=max_off {
-            if let Some(rec) = read_edge_at_offset(page, blkno, off) {
-                if rec.edge_id == edge_id {
+            if let Some(rec) = read_edge_at_offset(page, blkno, off)
+                && rec.edge_id == edge_id {
                     pg_sys::UnlockReleaseBuffer(buf);
                     return Some(rec);
                 }
-            }
         }
         pg_sys::UnlockReleaseBuffer(buf);
     }
@@ -580,7 +580,7 @@ unsafe fn follow_chain(
         if xmax_invalid && is_lp_normal {
             // Edge is alive — decode and maybe yield it.
             if let Some(rec) = decode_edge_record(data, item_len - hdr_size, head_pg, off) {
-                let passes_filter = rel_type_filter.map_or(true, |t| t == rec.rel_type_id);
+                let passes_filter = rel_type_filter.is_none_or(|t| t == rec.rel_type_id);
                 if passes_filter {
                     out.push(rec);
                 }
@@ -633,6 +633,7 @@ unsafe fn write_adj_header(page: pg_sys::Page, idx: usize, hdr: &NodeAdjHeader) 
 }
 
 /// Build the raw bytes for an edge item (including HeapTupleHeaderData).
+#[allow(clippy::too_many_arguments)]
 unsafe fn build_edge_item_bytes(
     edge_id: i64,
     rel_type_id: i32,
@@ -848,5 +849,5 @@ unsafe fn page_free_space(page: pg_sys::Page) -> usize {
     let phdr = page as *mut pg_sys::PageHeaderData;
     let upper = (*phdr).pd_upper as usize;
     let lower = (*phdr).pd_lower as usize;
-    if upper >= lower { upper - lower } else { 0 }
+    upper.saturating_sub(lower)
 }

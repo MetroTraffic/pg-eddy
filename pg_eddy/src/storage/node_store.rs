@@ -29,6 +29,7 @@ use crate::storage::wal::{log_node_compact, log_node_delete, log_node_insert};
 
 /// A decoded node record, ready for Rust/SQL consumption.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct NodeRecord {
     pub node_id: i64,
     pub adj_slot_idx: u16,
@@ -351,12 +352,11 @@ pub unsafe fn find_node_by_id(
 
         let mut found: Option<NodeRecord> = None;
         for off in pg_sys::FirstOffsetNumber..=max_off {
-            if let Some(rec) = unsafe { read_node_at_offset(page, buf, snapshot, off) } {
-                if rec.node_id == node_id {
+            if let Some(rec) = unsafe { read_node_at_offset(page, buf, snapshot, off) }
+                && rec.node_id == node_id {
                     found = Some(rec);
                     break;
                 }
-            }
         }
         unsafe { pg_sys::UnlockReleaseBuffer(buf) };
         if let Some(mut r) = found {
@@ -521,7 +521,7 @@ unsafe fn build_node_item_bytes_ovf(
 /// `rel` must be a valid, open node relation with an exclusive lock held.
 pub unsafe fn write_overflow_block(
     rel: pg_sys::Relation,
-    prop_bytes: &[u8],
+    _prop_bytes: &[u8],
 ) -> (pg_sys::Buffer, pg_sys::BlockNumber) {
     // Extend the relation with a new block.
     // MUST be called OUTSIDE any critical section (ReadBufferExtended can error).
@@ -806,7 +806,7 @@ unsafe fn page_free_space(page: pg_sys::Page) -> usize {
     let phdr = page as *mut pg_sys::PageHeaderData;
     let upper = unsafe { (*phdr).pd_upper as usize };
     let lower = unsafe { (*phdr).pd_lower as usize };
-    if upper >= lower { upper - lower } else { 0 }
+    upper.saturating_sub(lower)
 }
 
 // ---------------------------------------------------------------------------

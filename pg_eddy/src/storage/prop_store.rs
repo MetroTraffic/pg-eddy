@@ -12,7 +12,6 @@
 ///
 /// Overflow pages are NOT yet implemented; properties exceeding `PROP_INLINE_MAX`
 /// bytes per entity raise a PE200 error.
-
 use serde_json::Value as Json;
 
 // ---------------------------------------------------------------------------
@@ -239,7 +238,7 @@ pub fn decode_value(data: &[u8], pos: usize) -> (Json, usize) {
                     inner_pos += kc;
                     let key_str = match key_val {
                         Json::String(s) => s,
-                        _ => format!("?"),
+                        _ => "?".to_string(),
                     };
                     // value
                     let (v, vc) = decode_value(data, inner_pos);

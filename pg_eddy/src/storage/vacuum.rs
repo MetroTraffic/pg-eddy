@@ -116,7 +116,7 @@ pub unsafe fn vacuum_relation(rel: pg_sys::Relation) -> VacuumStats {
                 && pg_sys::TransactionIdPrecedes(xmax, oldest_xmin)
                 && pg_sys::TransactionIdDidCommit(xmax)
             {
-                dead_offsets.push(off as u16);
+                dead_offsets.push(off);
                 page_dead += 1;
                 // For node pages, collect the adj_slot_idx so we can clear the adj header.
                 if is_node_page && item_len >= hdr_size + NODE_FIXED_DATA_SIZE {

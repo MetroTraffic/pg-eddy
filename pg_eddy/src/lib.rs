@@ -125,7 +125,7 @@ fn get_node(node_id: i64) -> Option<pgrx::JsonB> {
         out.insert("labels".into(), serde_json::Value::Array(
             label_names.into_iter().map(serde_json::Value::String).collect(),
         ));
-        let props = prop_store::decode(&r.prop_bytes, |kid| prop_key_name(kid));
+        let props = prop_store::decode(&r.prop_bytes, prop_key_name);
         out.insert("properties".into(), serde_json::Value::Object(props));
         pgrx::JsonB(serde_json::Value::Object(out))
     })
@@ -278,7 +278,7 @@ fn get_edge(rel_id: i64) -> Option<pgrx::JsonB> {
         out.insert("rel_type".into(), serde_json::Value::String(rel_type_name(r.rel_type_id)));
         out.insert("source_node_id".into(), serde_json::Value::Number(r.source_node_id.into()));
         out.insert("target_node_id".into(), serde_json::Value::Number(r.target_node_id.into()));
-        let props = prop_store::decode(&r.prop_bytes, |kid| prop_key_name(kid));
+        let props = prop_store::decode(&r.prop_bytes, prop_key_name);
         out.insert("properties".into(), serde_json::Value::Object(props));
         pgrx::JsonB(serde_json::Value::Object(out))
     })
@@ -369,7 +369,7 @@ fn neighbours(
         }
     }).collect();
 
-    SetOfIterator::new(ids.into_iter())
+    SetOfIterator::new(ids)
 }
 
 /// Find edge IDs connecting specific endpoints and/or of a specific type.
@@ -432,7 +432,7 @@ fn find_edges(
         } else {
             rows
         };
-        return SetOfIterator::new(filtered.into_iter());
+        return SetOfIterator::new(filtered);
     }
 
     // Fast path: type + dst → use edge_type_dst index.
@@ -449,7 +449,7 @@ fn find_edges(
                 .map(|row| row["edge_id"].value::<i64>().unwrap_or(None).unwrap_or(0))
                 .collect::<Vec<i64>>()
         });
-        return SetOfIterator::new(rows.into_iter());
+        return SetOfIterator::new(rows);
     }
 
     // Fallback: use adjacency chain for endpoint-only filters.
@@ -480,7 +480,7 @@ fn find_edges(
                 .map(|row| row["edge_id"].value::<i64>().unwrap_or(None).unwrap_or(0))
                 .collect::<Vec<i64>>()
         });
-        return SetOfIterator::new(rows.into_iter());
+        return SetOfIterator::new(rows);
     } else {
         // No filters at all: full edge scan via adjacency chains from every node.
         // This is O(N+E) — use only for small graphs or tooling purposes.
@@ -498,12 +498,12 @@ fn find_edges(
     // Apply remaining dst filter if we traversed from src.
     let ids: Vec<i64> = edges
         .into_iter()
-        .filter(|e| dst_node_id.map_or(true, |d| e.target_node_id == d))
-        .filter(|e| src_node_id.map_or(true, |s| e.source_node_id == s))
+        .filter(|e| dst_node_id.is_none_or(|d| e.target_node_id == d))
+        .filter(|e| src_node_id.is_none_or(|s| e.source_node_id == s))
         .map(|e| e.edge_id)
         .collect();
 
-    SetOfIterator::new(ids.into_iter())
+    SetOfIterator::new(ids)
 }
 
 /// Adjacency-follow SRF: follows the adjacency chain from `node_id` in
@@ -553,14 +553,14 @@ fn expand(
             } else {
                 e.source_node_id
             };
-            let props = prop_store::decode(&e.prop_bytes, |kid| prop_key_name(kid));
+            let props = prop_store::decode(&e.prop_bytes, prop_key_name);
             let _ = rel_type_name; // suppress unused warning — available if needed
             let props_json = pgrx::JsonB(serde_json::Value::Object(props));
             (e.edge_id, other, e.rel_type_id, props_json)
         })
         .collect();
 
-    TableIterator::new(rows.into_iter())
+    TableIterator::new(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -928,8 +928,8 @@ fn find_nodes(
                             };
                         }
                         let props =
-                            prop_store::decode(&r.prop_bytes, |kid| prop_key_name(kid));
-                        filter.iter().all(|(k, v)| props.get(k).map_or(false, |pv| pv == v))
+                            prop_store::decode(&r.prop_bytes, prop_key_name);
+                        filter.iter().all(|(k, v)| props.get(k) == Some(v))
                     }
                 }
             })
@@ -938,7 +938,7 @@ fn find_nodes(
         candidates
     };
 
-    SetOfIterator::new(result.into_iter())
+    SetOfIterator::new(result)
 }
 
 /// Return schema information (label, rel-type, and property-key registries) as JSONB.
@@ -977,7 +977,7 @@ fn am_stats() -> pgrx::JsonB {
 
     let (live_nodes, dead_nodes, node_pages) = unsafe {
         let rel = open_nodes_relation();
-        let snapshot = pg_sys::GetActiveSnapshot();
+        let _snapshot = pg_sys::GetActiveSnapshot();
         let hdr_size = size_of::<pg_sys::HeapTupleHeaderData>();
         let nblocks = pg_sys::RelationGetNumberOfBlocksInFork(
             rel,
