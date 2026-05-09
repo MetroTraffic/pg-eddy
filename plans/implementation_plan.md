@@ -1402,16 +1402,16 @@ correct live/dead counts ✅; 17/17 tests pass ✅.
 
 ---
 
-### Phase 4 — Indexes, Constraints, and Full CRUD API (v0.5.0)
+### Phase 4 — Indexes, Constraints, and Full CRUD API (v0.5.0) ✅ COMPLETE (ccc7691, tagged v0.5.0)
 
 **Goal**: Complete the storage layer. Everything needed to build the query
 engine on top. Also delivers deferred items from Phases 1–3.
 
 **Deferred items completed in v0.5.0**:
-- [ ] Property overflow pages (deferred Phase 1) — overflow blocks in the
+- [x] Property overflow pages (deferred Phase 1) — overflow blocks in the
       same node relation; `prop_overflow_page` field stores block number;
       REGBUF_FORCE_IMAGE WAL; vacuum skips overflow blocks
-- [ ] Physical VACUUM compaction (deferred Phase 3) — `PageRepairFragmentation`
+- [x] Physical VACUUM compaction (deferred Phase 3) — `PageRepairFragmentation`
       on node pages after LP_DEAD marking; zero out dead adj headers;
       WAL-logged as XLOG_PG_EDDY_NODE_COMPACT (full page image)
 - [ ] REPLICA IDENTITY — still deferred; tables have no SQL columns so
@@ -1440,20 +1440,26 @@ engine on top. Also delivers deferred items from Phases 1–3.
         temporary PostgreSQL 18 cluster; fails on any TAP `not ok`
 
 **v0.5.0 new deliverables**:
-- [ ] Internal label B-tree index: `_pg_eddy.label_index(label_id, node_id)`
+- [x] Internal label B-tree index: `_pg_eddy.label_index(label_id, node_id)`
       maintained by Rust/SPI in create_node, update_node, delete_node;
       enables O(|matching nodes|) label scans without a full page sweep
-- [ ] `pg_eddy.add_label(node_id BIGINT, label TEXT) RETURNS BOOLEAN`
-- [ ] `pg_eddy.remove_label(node_id BIGINT, label TEXT) RETURNS BOOLEAN`
-- [ ] `pg_eddy.detach_delete_node(node_id BIGINT) RETURNS BOOLEAN` —
+- [x] `pg_eddy.add_label(node_id BIGINT, label TEXT) RETURNS BOOLEAN`
+- [x] `pg_eddy.remove_label(node_id BIGINT, label TEXT) RETURNS BOOLEAN`
+- [x] `pg_eddy.detach_delete_node(node_id BIGINT) RETURNS BOOLEAN` —
       removes all incident edges then deletes the node
-- [ ] `pg_eddy.find_nodes(label TEXT, property_filter JSONB) RETURNS SETOF BIGINT`
+- [x] `pg_eddy.find_nodes(label TEXT, property_filter JSONB) RETURNS SETOF BIGINT`
       — uses label_index for fast label lookup; optionally filters by props
-- [ ] `pg_eddy.schema_info() RETURNS JSONB` — label, rel-type, property-key
+- [x] `pg_eddy.schema_info() RETURNS JSONB` — label, rel-type, property-key
       counts and names from the registry tables
-- [ ] Tests for all v0.5.0 deliverables
+- [x] Tests for all v0.5.0 deliverables (24/24 pgrx tests pass)
 
-**v0.5.1 deliverables** (deferred to next release):
+**Key fixes in v0.5.0**:
+- WAL opcode values: all info bytes now use only the high nibble (bits 4-7);
+  PostgreSQL reserves bits 2-3 of the low nibble (causes PANIC if set).
+  Old broken values: NODE_DELETE=0x02, EDGE_DELETE=0x11, NODE_COMPACT=0x04,
+  NODE_INSERT_OVF=0x05. New correct values: each op has unique high nibble.
+- WAL protocol: all page modifications (overflow + node) in one critical section.
+- Buffer ordering: find_or_extend_page before write_overflow_block.
 - [ ] Rel-type B-tree indexes: `(type_id, source_node_id)` and
       `(type_id, target_node_id)` (requires AM index callback work or
       internal catalog table approach)
