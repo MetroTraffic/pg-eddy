@@ -10,21 +10,43 @@ pub struct OrderItem {
     pub ascending: bool,
 }
 
-/// A complete Cypher query (single MATCH … RETURN with optional ORDER BY / SKIP / LIMIT).
+/// A complete Cypher query as an ordered pipeline of clauses.
 #[derive(Debug, Clone)]
 pub struct Query {
-    pub match_clause: MatchClause,
-    pub where_clause: Option<Expr>,
-    pub return_clause: ReturnClause,
-    pub order_by: Vec<OrderItem>,
-    pub skip: Option<Expr>,
-    pub limit: Option<Expr>,
+    pub clauses: Vec<QueryClause>,
 }
 
-/// MATCH clause: one or more comma-separated patterns.
+/// A single clause in the query pipeline.
 #[derive(Debug, Clone)]
-pub struct MatchClause {
-    pub patterns: Vec<Pattern>,
+pub enum QueryClause {
+    /// MATCH or OPTIONAL MATCH clause.
+    Match {
+        optional: bool,
+        patterns: Vec<Pattern>,
+        where_clause: Option<Expr>,
+    },
+    /// UNWIND expr AS alias.
+    Unwind {
+        expr: Expr,
+        alias: String,
+    },
+    /// WITH clause: intermediate projection (may include WHERE after it).
+    With {
+        distinct: bool,
+        items: Vec<ReturnItem>,
+        order_by: Vec<OrderItem>,
+        skip: Option<Expr>,
+        limit: Option<Expr>,
+        where_clause: Option<Expr>,
+    },
+    /// RETURN clause: terminal projection.
+    Return {
+        distinct: bool,
+        items: Vec<ReturnItem>,
+        order_by: Vec<OrderItem>,
+        skip: Option<Expr>,
+        limit: Option<Expr>,
+    },
 }
 
 /// A single pattern: a chain of nodes connected by relationships.
@@ -132,6 +154,17 @@ pub enum Expr {
     Contains(Box<Expr>, Box<Expr>),
     /// Regular expression match: str =~ pattern
     Regex(Box<Expr>, Box<Expr>),
+    /// Searched CASE: CASE WHEN cond THEN val ... [ELSE val] END
+    CaseSearched {
+        branches: Vec<(Expr, Expr)>,
+        else_: Option<Box<Expr>>,
+    },
+    /// Simple CASE: CASE test WHEN val THEN val ... [ELSE val] END
+    CaseSimple {
+        test: Box<Expr>,
+        branches: Vec<(Expr, Expr)>,
+        else_: Option<Box<Expr>>,
+    },
 }
 
 /// Comparison operators.

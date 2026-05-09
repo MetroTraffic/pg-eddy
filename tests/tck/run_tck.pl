@@ -43,8 +43,6 @@ my $SKIP_GROUPS = do {
 # Cypher features not yet implemented in pg_eddy v0.6.0.
 # A scenario whose query contains any of these patterns is skipped.
 my @UNSUPPORTED_QUERY_PATTERNS = (
-    [ qr/\bOPTIONAL\s+MATCH\b/i,   'OPTIONAL MATCH'    ],
-    [ qr/\bWITH\b/i,               'WITH'              ],
     [ qr/\bCALL\b/i,               'CALL'              ],
     [ qr/\bCREATE\b/i,             'CREATE'            ],
     [ qr/\bMERGE\b/i,              'MERGE'             ],
@@ -53,7 +51,6 @@ my @UNSUPPORTED_QUERY_PATTERNS = (
     [ qr/\bREMOVE\b/i,             'REMOVE'            ],
     [ qr/\bUNION\b/i,              'UNION'             ],
     [ qr/\bFOREACH\b/i,            'FOREACH'           ],
-    [ qr/\bUNWIND\b/i,             'UNWIND'            ],
     [ qr/-\[.*\*.*\]-/,            'variable-length path' ],
     [ qr/\bshortestPath\b/i,       'shortestPath'      ],
     [ qr/\ballShortestPaths\b/i,   'allShortestPaths'  ],

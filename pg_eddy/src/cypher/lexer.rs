@@ -29,7 +29,13 @@ pub enum Token {
     Delete,   // reserved for v0.11.0
     Detach,   // reserved for v0.11.0
     Set,      // reserved for v0.11.0
-    With,     // reserved for v0.7.0
+    With,     // WITH clause (also used in STARTS WITH / ENDS WITH)
+    Unwind,   // UNWIND clause
+    Case,     // CASE expression
+    When,     // WHEN branch
+    Then,     // THEN result
+    Else,     // ELSE default
+    End,      // END of CASE
 
     // Identifiers and literals
     Ident(String),
@@ -339,6 +345,12 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
                 "DETACH" => Token::Detach,
                 "SET" => Token::Set,
                 "WITH" => Token::With,
+                "UNWIND" => Token::Unwind,
+                "CASE" => Token::Case,
+                "WHEN" => Token::When,
+                "THEN" => Token::Then,
+                "ELSE" => Token::Else,
+                "END" => Token::End,
                 _ => Token::Ident(word.to_string()),
             };
             tokens.push(SpannedToken { token, offset: start });

@@ -9,6 +9,8 @@ use std::collections::HashSet;
 /// A logical plan node.
 #[derive(Debug, Clone)]
 pub enum LogicalPlan {
+    /// Produces a single empty row (seed for queries with no initial MATCH).
+    SingleRow,
     /// Scan all nodes, optionally filtered by a single label.
     LabelScan {
         variable: String,
@@ -26,6 +28,7 @@ pub enum LogicalPlan {
         rel_props: Vec<(String, Expr)>,
         dst_labels: Vec<String>,
         dst_props: Vec<(String, Expr)>,
+        optional: bool,
     },
     /// Cross-product of two independent plan branches.
     CrossProduct {
@@ -46,6 +49,12 @@ pub enum LogicalPlan {
         skip: Option<Expr>,
         limit: Option<Expr>,
     },
+    /// Unwind: expand a list expression into one row per element.
+    Unwind {
+        input: Box<LogicalPlan>,
+        expr: Expr,
+        alias: String,
+    },
 }
 
 /// A plan error.
@@ -60,151 +69,191 @@ impl std::fmt::Display for PlanError {
     }
 }
 
-/// Build a logical plan from a parsed Query.
+/// Build a logical plan from a parsed Query pipeline.
 pub fn plan(query: &Query) -> Result<LogicalPlan, PlanError> {
-    // Step 1: build one plan branch per MATCH pattern.
-    let mut branches: Vec<LogicalPlan> = Vec::new();
+    let mut current: LogicalPlan = LogicalPlan::SingleRow;
     let mut bound_vars: HashSet<String> = HashSet::new();
 
-    for pattern in &query.match_clause.patterns {
-        let branch = plan_pattern(pattern, &mut bound_vars)?;
-        branches.push(branch);
-    }
-
-    // Step 2: combine branches with CrossProduct.
-    let mut plan = branches.remove(0);
-    for branch in branches {
-        plan = LogicalPlan::CrossProduct {
-            left: Box::new(plan),
-            right: Box::new(branch),
-        };
-    }
-
-    // Step 3: node isomorphism — every distinct node variable pair gets <>.
-    let node_vars = collect_node_variables(&query.match_clause);
-    let iso_filter = build_isomorphism_filter(&node_vars);
-
-    // Step 4: WHERE clause filter.
-    let combined_filter = match (&iso_filter, &query.where_clause) {
-        (Some(iso), Some(wh)) => Some(Expr::And(Box::new(iso.clone()), Box::new(wh.clone()))),
-        (Some(iso), None) => Some(iso.clone()),
-        (None, Some(wh)) => Some(wh.clone()),
-        (None, None) => None,
-    };
-
-    if let Some(predicate) = combined_filter {
-        plan = LogicalPlan::Filter {
-            input: Box::new(plan),
-            predicate,
-        };
-    }
-
-    // Step 5: Project (RETURN clause + ORDER BY / SKIP / LIMIT).
-    plan = LogicalPlan::Project {
-        input: Box::new(plan),
-        items: query.return_clause.items.clone(),
-        distinct: query.return_clause.distinct,
-        order_by: query.order_by.clone(),
-        skip: query.skip.clone(),
-        limit: query.limit.clone(),
-    };
-
-    Ok(plan)
-}
-
-/// Build a plan for a single pattern chain.
-fn plan_pattern(
-    pattern: &Pattern,
-    bound_vars: &mut HashSet<String>,
-) -> Result<LogicalPlan, PlanError> {
-    let mut plan: Option<LogicalPlan> = None;
-
-    let mut i = 0;
-    while i < pattern.elements.len() {
-        match &pattern.elements[i] {
-            PatternElement::Node(node) => {
-                if plan.is_none() {
-                    // First node in the pattern — start with LabelScan.
-                    let var = node.variable.clone().unwrap_or_else(|| {
-                        format!("_anon_n{}", i)
-                    });
-                    let label = node.labels.first().cloned();
-                    plan = Some(LogicalPlan::LabelScan {
-                        variable: var.clone(),
-                        label,
-                        inline_props: node.properties.clone(),
-                    });
-                    bound_vars.insert(var);
-                }
-                i += 1;
+    for clause in &query.clauses {
+        match clause {
+            QueryClause::Match { optional, patterns, where_clause } => {
+                current = plan_match_clause(current, patterns, where_clause, *optional, &mut bound_vars)?;
             }
-            PatternElement::Relationship(rel) => {
-                // Must be preceded by a node (plan is Some) and followed by a node.
-                let src_plan = plan.take().ok_or_else(|| PlanError {
-                    message: "relationship without preceding node".into(),
-                })?;
-
-                let next_node = match pattern.elements.get(i + 1) {
-                    Some(PatternElement::Node(n)) => n,
-                    _ => {
-                        return Err(PlanError {
-                            message: "relationship must be followed by a node".into(),
-                        })
-                    }
+            QueryClause::Unwind { expr, alias } => {
+                bound_vars.insert(alias.clone());
+                current = LogicalPlan::Unwind {
+                    input: Box::new(current),
+                    expr: expr.clone(),
+                    alias: alias.clone(),
                 };
-
-                // Determine src/dst variable names.
-                let src_var = find_last_node_var(&src_plan);
-                let dst_var = next_node
-                    .variable
-                    .clone()
-                    .unwrap_or_else(|| format!("_anon_n{}", i + 1));
-
-                let rel_var = rel.variable.clone();
-
-                plan = Some(LogicalPlan::Expand {
-                    input: Box::new(src_plan),
-                    src_var,
-                    rel_var: rel_var.clone(),
-                    dst_var: dst_var.clone(),
-                    rel_types: rel.rel_types.clone(),
-                    direction: rel.direction,
-                    rel_props: rel.properties.clone(),
-                    dst_labels: next_node.labels.clone(),
-                    dst_props: next_node.properties.clone(),
-                });
-
-                bound_vars.insert(dst_var);
-                if let Some(rv) = &rel_var {
-                    bound_vars.insert(rv.clone());
+            }
+            QueryClause::With { distinct, items, order_by, skip, limit, where_clause } => {
+                current = LogicalPlan::Project {
+                    input: Box::new(current),
+                    items: items.clone(),
+                    distinct: *distinct,
+                    order_by: order_by.clone(),
+                    skip: skip.clone(),
+                    limit: limit.clone(),
+                };
+                // After WITH, only the projected variables are in scope.
+                bound_vars.clear();
+                for item in items {
+                    let exposed = item.alias.clone().or_else(|| {
+                        if let Expr::Variable(v) = &item.expr { Some(v.clone()) } else { None }
+                    });
+                    if let Some(v) = exposed { bound_vars.insert(v); }
                 }
-
-                i += 2; // skip relationship + next node
+                if let Some(wh) = where_clause {
+                    current = LogicalPlan::Filter { input: Box::new(current), predicate: wh.clone() };
+                }
+            }
+            QueryClause::Return { distinct, items, order_by, skip, limit } => {
+                current = LogicalPlan::Project {
+                    input: Box::new(current),
+                    items: items.clone(),
+                    distinct: *distinct,
+                    order_by: order_by.clone(),
+                    skip: skip.clone(),
+                    limit: limit.clone(),
+                };
             }
         }
     }
 
-    plan.ok_or_else(|| PlanError {
-        message: "empty pattern".into(),
-    })
+    Ok(current)
+}
+
+/// Plan all patterns in one MATCH (or OPTIONAL MATCH) clause.
+fn plan_match_clause(
+    current: LogicalPlan,
+    patterns: &[Pattern],
+    where_clause: &Option<Expr>,
+    optional: bool,
+    bound_vars: &mut HashSet<String>,
+) -> Result<LogicalPlan, PlanError> {
+    let mut plan = current;
+    let mut new_node_vars: Vec<String> = Vec::new();
+
+    for pattern in patterns {
+        let (new_plan, new_vars) = plan_pattern_onto(pattern, plan, bound_vars, optional)?;
+        for v in &new_vars {
+            if !new_node_vars.contains(v) { new_node_vars.push(v.clone()); }
+            bound_vars.insert(v.clone());
+        }
+        plan = new_plan;
+    }
+
+    // Node isomorphism: add a <> filter for every new pair of node variables.
+    let iso_filter = build_isomorphism_filter(&new_node_vars);
+
+    let combined = match (iso_filter, where_clause.clone()) {
+        (Some(iso), Some(wh)) => Some(Expr::And(Box::new(iso), Box::new(wh))),
+        (Some(iso), None) => Some(iso),
+        (None, Some(wh)) => Some(wh),
+        (None, None) => None,
+    };
+
+    if let Some(predicate) = combined {
+        plan = LogicalPlan::Filter { input: Box::new(plan), predicate };
+    }
+
+    Ok(plan)
+}
+
+/// Plan a single pattern onto the current pipeline.
+/// Returns (new_plan, new_node_vars_introduced).
+fn plan_pattern_onto(
+    pattern: &Pattern,
+    current: LogicalPlan,
+    bound_vars: &HashSet<String>,
+    optional: bool,
+) -> Result<(LogicalPlan, Vec<String>), PlanError> {
+    let mut new_node_vars: Vec<String> = Vec::new();
+
+    // First element must be a node.
+    let first_node = match pattern.elements.first() {
+        Some(PatternElement::Node(n)) => n,
+        _ => return Err(PlanError { message: "pattern must start with a node".into() }),
+    };
+
+    let first_var = first_node.variable.clone().unwrap_or_else(|| "_anon_n0".to_string());
+    let first_is_bound = first_node.variable.is_some() && bound_vars.contains(&first_var);
+
+    let mut plan = if first_is_bound {
+        // Start with current pipeline — first node is already in scope.
+        current
+    } else {
+        // New node: LabelScan, cross-product with current.
+        let label = first_node.labels.first().cloned();
+        let scan = LogicalPlan::LabelScan {
+            variable: first_var.clone(),
+            label,
+            inline_props: first_node.properties.clone(),
+        };
+        new_node_vars.push(first_var.clone());
+        match current {
+            LogicalPlan::SingleRow => scan,
+            other => LogicalPlan::CrossProduct { left: Box::new(other), right: Box::new(scan) },
+        }
+    };
+
+    // Process relationship+node pairs.
+    let mut i = 1;
+    while i < pattern.elements.len() {
+        if let PatternElement::Relationship(rel) = &pattern.elements[i] {
+            let next_node = match pattern.elements.get(i + 1) {
+                Some(PatternElement::Node(n)) => n,
+                _ => return Err(PlanError { message: "relationship must be followed by a node".into() }),
+            };
+
+            let src_var = find_last_node_var(&plan);
+            let dst_var = next_node.variable.clone()
+                .unwrap_or_else(|| format!("_anon_n{}", i + 1));
+
+            if !bound_vars.contains(&dst_var) && !new_node_vars.contains(&dst_var) {
+                new_node_vars.push(dst_var.clone());
+            }
+
+            plan = LogicalPlan::Expand {
+                input: Box::new(plan),
+                src_var,
+                rel_var: rel.variable.clone(),
+                dst_var,
+                rel_types: rel.rel_types.clone(),
+                direction: rel.direction,
+                rel_props: rel.properties.clone(),
+                dst_labels: next_node.labels.clone(),
+                dst_props: next_node.properties.clone(),
+                optional,
+            };
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    Ok((plan, new_node_vars))
 }
 
 /// Find the last node variable name from a plan branch.
 fn find_last_node_var(plan: &LogicalPlan) -> String {
     match plan {
+        LogicalPlan::SingleRow => "_none".to_string(),
         LogicalPlan::LabelScan { variable, .. } => variable.clone(),
         LogicalPlan::Expand { dst_var, .. } => dst_var.clone(),
         LogicalPlan::CrossProduct { right, .. } => find_last_node_var(right),
         LogicalPlan::Filter { input, .. } => find_last_node_var(input),
         LogicalPlan::Project { input, .. } => find_last_node_var(input),
+        LogicalPlan::Unwind { alias, .. } => alias.clone(),
     }
 }
 
-/// Collect all named node variables from a MATCH clause.
-fn collect_node_variables(match_clause: &MatchClause) -> Vec<String> {
+/// Collect all named node variables from a slice of patterns.
+fn collect_node_variables(patterns: &[Pattern]) -> Vec<String> {
     let mut vars = Vec::new();
     let mut seen = HashSet::new();
-    for pattern in &match_clause.patterns {
+    for pattern in patterns {
         for elem in &pattern.elements {
             if let PatternElement::Node(n) = elem
                 && let Some(ref v) = n.variable
@@ -298,6 +347,11 @@ pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
             let dist = if *distinct { " DISTINCT" } else { "" };
             let child = explain(input, indent + 1);
             format!("{prefix}Project{dist}({})\n{child}", cols.join(", "))
+        }
+        LogicalPlan::SingleRow => format!("{prefix}SingleRow"),
+        LogicalPlan::Unwind { input, expr, alias } => {
+            let child = explain(input, indent + 1);
+            format!("{prefix}Unwind({expr:?} AS {alias})\n{child}")
         }
     }
 }

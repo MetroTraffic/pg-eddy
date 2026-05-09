@@ -1341,7 +1341,7 @@ AM. Node isomorphism and null semantics are correct from the first release.
 - [x] `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `=~` (regex) string predicates
 - [x] `ORDER BY`, `SKIP`, `LIMIT` (applied in executor after projection)
 - [x] `RETURN DISTINCT` already partially wired; complete with window dedup
-- [ ] Relationship variable access in RETURN (`RETURN type(r)`, `r.prop`)
+- [x] Relationship variable access in RETURN (`RETURN type(r)`, `r.prop`)
 - [x] Null semantics evaluator: openCypher null propagation through
       arithmetic, comparisons, and list indexing
 - [x] Built-in functions: `size()`, `length()`, `head()`, `tail()`, `last()`,
@@ -1371,12 +1371,11 @@ microbenchmark (the v0.5.1 benchmark already proved raw traversal speed at
 the storage layer).
 
 **v0.8.0 — Composition clauses**:
-- [ ] `WITH` clause: mid-query projection and filtering between MATCH chains
-- [ ] `OPTIONAL MATCH` (rows with no match produce NULL bindings)
-- [ ] `UNWIND expr AS var`
-- [ ] `CASE` expressions (simple and searched)
-- [ ] Target: pass `WithAcceptance`, `OptionalMatchAcceptance`,
-      `UnwindAcceptance`; TCK ~25%
+- [x] `WITH` clause: mid-query projection and filtering between MATCH chains
+- [x] `OPTIONAL MATCH` (rows with no match produce NULL bindings)
+- [x] `UNWIND expr AS var`
+- [x] `CASE` expressions (simple and searched)
+- [x] TCK: 172/3881 overall (4.4%); 172/172 in-scope (100%)
 
 **v0.9.0 — Aggregation and functions**:
 - [ ] Aggregation: `COUNT(*)`, `COUNT(DISTINCT)`, `SUM`, `AVG`, `MIN`, `MAX`,

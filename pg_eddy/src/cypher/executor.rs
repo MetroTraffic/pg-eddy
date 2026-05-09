@@ -138,18 +138,21 @@ pub fn execute(
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<Vec<Row>, ExecError> {
     match plan {
+        LogicalPlan::SingleRow => {
+            Ok(vec![HashMap::new()])
+        }
         LogicalPlan::LabelScan { variable, label, inline_props } => {
             exec_label_scan(variable, label.as_deref(), inline_props, params)
         }
         LogicalPlan::Expand {
             input, src_var, rel_var, dst_var,
             rel_types, direction, rel_props,
-            dst_labels, dst_props,
+            dst_labels, dst_props, optional,
         } => {
             exec_expand(
                 input, src_var, rel_var.as_deref(), dst_var,
                 rel_types, *direction, rel_props, dst_labels, dst_props,
-                params,
+                *optional, params,
             )
         }
         LogicalPlan::CrossProduct { left, right } => {
@@ -160,6 +163,9 @@ pub fn execute(
         }
         LogicalPlan::Project { input, items, distinct, order_by, skip, limit } => {
             exec_project(input, items, *distinct, order_by, skip, limit, params)
+        }
+        LogicalPlan::Unwind { input, expr, alias } => {
+            exec_unwind(input, expr, alias, params)
         }
     }
 }
@@ -276,6 +282,7 @@ fn exec_expand(
     rel_props: &[(String, Expr)],
     dst_labels: &[String],
     dst_props: &[(String, Expr)],
+    optional: bool,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<Vec<Row>, ExecError> {
     use crate::catalog::labels::{ensure_rel_type, label_name, prop_key_name, rel_type_name, label_id_by_name};
@@ -305,6 +312,17 @@ fn exec_expand(
             message: format!("unbound variable: {src_var}"),
         })?;
 
+        // If src is NULL (propagated from upstream optional expand), emit a null row.
+        if matches!(src_val, Value::Null) {
+            if optional {
+                let mut row = input_row.clone();
+                row.insert(dst_var.to_string(), Value::Null);
+                if let Some(rv) = rel_var { row.insert(rv.to_string(), Value::Null); }
+                result.push(row);
+            }
+            continue;
+        }
+
         let src_node_id = src_val.node_id().ok_or_else(|| ExecError {
             message: format!("{src_var} is not a node"),
         })?;
@@ -328,6 +346,8 @@ fn exec_expand(
         } else {
             Vec::new()
         };
+
+        let mut matched_any = false;
 
         for edge in &edges {
             // Type filter for multi-type patterns.
@@ -438,6 +458,44 @@ fn exec_expand(
             if let Some(rv) = rel_var {
                 row.insert(rv.to_string(), edge_val);
             }
+            result.push(row);
+            matched_any = true;
+        }
+
+        // OPTIONAL: if no edges matched, emit a null row.
+        if optional && !matched_any {
+            let mut row = input_row.clone();
+            row.insert(dst_var.to_string(), Value::Null);
+            if let Some(rv) = rel_var { row.insert(rv.to_string(), Value::Null); }
+            result.push(row);
+        }
+    }
+
+    Ok(result)
+}
+
+fn exec_unwind(
+    input: &LogicalPlan,
+    expr: &Expr,
+    alias: &str,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<Row>, ExecError> {
+    let input_rows = execute(input, params)?;
+    let mut result = Vec::new();
+
+    for input_row in &input_rows {
+        let val = eval_expr(expr, input_row, params)?;
+        let items = match val {
+            Value::Json(serde_json::Value::Array(arr)) => arr,
+            Value::Null => continue, // UNWIND null → no rows
+            other => {
+                // Single scalar: wrap in a one-element array.
+                vec![other.to_json()]
+            }
+        };
+        for item in items {
+            let mut row = input_row.clone();
+            row.insert(alias.to_string(), json_to_value(&item));
             result.push(row);
         }
     }
@@ -745,6 +803,31 @@ pub fn eval_expr(
                     Ok(Value::Bool(result))
                 }
                 _ => Ok(Value::Null),
+            }
+        }
+        Expr::CaseSearched { branches, else_ } => {
+            for (cond, then) in branches {
+                let cv = eval_expr(cond, row, params)?;
+                if matches!(truthy3(&cv), Some(true)) {
+                    return eval_expr(then, row, params);
+                }
+            }
+            match else_ {
+                Some(e) => eval_expr(e, row, params),
+                None => Ok(Value::Null),
+            }
+        }
+        Expr::CaseSimple { test, branches, else_ } => {
+            let test_val = eval_expr(test, row, params)?;
+            for (when, then) in branches {
+                let wv = eval_expr(when, row, params)?;
+                if values_equal(&test_val, &wv) {
+                    return eval_expr(then, row, params);
+                }
+            }
+            match else_ {
+                Some(e) => eval_expr(e, row, params),
+                None => Ok(Value::Null),
             }
         }
     }

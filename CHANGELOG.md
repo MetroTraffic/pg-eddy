@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.8.0](#080--2026-05-09--with-optional-match-unwind-and-case-expressions) — WITH, OPTIONAL MATCH, UNWIND, and CASE Expressions
 - [0.7.0](#070--2026-05-09--cypher-predicates-ordering-and-built-in-functions) — Cypher Predicates, Ordering, and Built-in Functions
 - [0.6.0](#060--2026-05-09--cypher-query-engine) — Cypher Query Engine
 - [0.5.1](#051--2026-05-09--tap-infrastructure-wal-hardening-and-age-benchmark) — TAP Infrastructure, WAL Hardening, and AGE Benchmark
@@ -14,6 +15,53 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 - [0.3.0](#030--2026-05-09--edge-storage--adjacency-lists) — Edge Storage + Adjacency Lists
 - [0.2.0](#020--2026-05-09--node-storage) — Node Storage
 - [0.1.0](#010--2026-05-09--am-skeleton) — AM Skeleton
+
+---
+
+## [0.8.0] — 2026-05-09 — WITH, OPTIONAL MATCH, UNWIND, and CASE Expressions
+
+v0.8.0 is a major architectural expansion of the Cypher query engine. The AST,
+planner, and executor have been refactored from a single-clause model to a
+full **multi-clause pipeline**, enabling composition across MATCH chains with
+WITH, outer-join semantics via OPTIONAL MATCH, list expansion via UNWIND, and
+conditional logic via CASE. 172/172 in-scope TCK scenarios pass (100%).
+
+### New Cypher Features
+
+**WITH clause**: Projects and renames bindings between query stages, optionally
+filtering with `WHERE`. Supports `DISTINCT`, `ORDER BY`, `SKIP`, and `LIMIT`.
+Variables not projected by WITH are no longer in scope for subsequent clauses,
+exactly matching the openCypher spec.
+
+**OPTIONAL MATCH**: Returns all rows from the left side even when the pattern
+finds no matches. Unbound variables from an OPTIONAL MATCH produce `null`
+bindings that propagate correctly through subsequent WHERE and RETURN clauses
+with openCypher 3-valued logic.
+
+**UNWIND**: Expands a list expression into one row per element, binding each
+element to the given variable. Works with literal lists, property accesses, and
+expressions. `UNWIND [] AS x` produces zero rows.
+
+**CASE expressions** — both forms:
+- *Searched*: `CASE WHEN cond THEN val … [ELSE val] END` — evaluates conditions
+  in order and returns the first matching branch.
+- *Simple*: `CASE expr WHEN val THEN result … [ELSE val] END` — compares the
+  subject expression against each WHEN value.
+Both forms return `null` when no branch matches and no ELSE is present.
+
+### Architecture
+
+The internal `Query` type now holds a `Vec<QueryClause>` pipeline instead of a
+single match + return pair. The planner folds over clauses left-to-right,
+building up a `LogicalPlan` tree. New plan nodes: `SingleRow` (seed for queries
+starting with UNWIND or a second MATCH) and `Unwind { input, expr, alias }`.
+`Expand` gains an `optional: bool` flag for OPTIONAL MATCH semantics.
+
+### TCK
+
+- 172/3881 overall (4.4%); 172/172 in-scope (100%)
+- Newly unlocked acceptance tests: `WithAcceptance`, `OptionalMatchAcceptance`,
+  `UnwindAcceptance`, `CaseExpressionAcceptance`, `TriadicSelection`
 
 ---
 

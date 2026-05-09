@@ -78,64 +78,68 @@ impl Parser {
         }
     }
 
-    /// Parse: MATCH pattern [WHERE expr] RETURN items [ORDER BY ...] [SKIP n] [LIMIT n]
+    /// Parse a full query pipeline: (MATCH | OPTIONAL MATCH | UNWIND | WITH)* RETURN ...
     fn parse_query(&mut self) -> Result<Query, ParseError> {
-        self.expect(&Token::Match)?;
-        let match_clause = self.parse_match_clause()?;
+        let mut clauses: Vec<QueryClause> = Vec::new();
 
-        let where_clause = if *self.peek() == Token::Where {
-            self.advance();
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
-
-        self.expect(&Token::Return)?;
-        let return_clause = self.parse_return_clause()?;
-
-        // ORDER BY
-        let order_by = if *self.peek() == Token::OrderBy {
-            self.advance();
-            let mut items = Vec::new();
-            loop {
-                let expr = self.parse_expr()?;
-                let ascending = match self.peek().clone() {
-                    Token::Ident(ref s) if s.eq_ignore_ascii_case("DESC")
-                                       || s.eq_ignore_ascii_case("DESCENDING") => {
+        loop {
+            match self.peek().clone() {
+                Token::Match => {
+                    self.advance();
+                    let patterns = self.parse_patterns()?;
+                    let where_clause = self.try_parse_where()?;
+                    clauses.push(QueryClause::Match { optional: false, patterns, where_clause });
+                }
+                Token::OptionalMatch => {
+                    self.advance();
+                    let patterns = self.parse_patterns()?;
+                    let where_clause = self.try_parse_where()?;
+                    clauses.push(QueryClause::Match { optional: true, patterns, where_clause });
+                }
+                Token::Unwind => {
+                    self.advance();
+                    let expr = self.parse_expr()?;
+                    if let Token::Ident(ref s) = self.peek().clone() {
+                        if !s.eq_ignore_ascii_case("AS") {
+                            return Err(ParseError {
+                                message: format!("expected AS after UNWIND expression, got {:?}", self.peek()),
+                                offset: self.offset(),
+                            });
+                        }
                         self.advance();
-                        false
+                    } else {
+                        self.expect(&Token::As)?;
                     }
-                    Token::Ident(ref s) if s.eq_ignore_ascii_case("ASC")
-                                       || s.eq_ignore_ascii_case("ASCENDING") => {
-                        self.advance();
-                        true
-                    }
-                    _ => true,
-                };
-                items.push(crate::cypher::ast::OrderItem { expr, ascending });
-                if *self.peek() != Token::Comma { break; }
-                self.advance();
+                    let alias = self.eat_ident_flexible()?;
+                    clauses.push(QueryClause::Unwind { expr, alias });
+                }
+                Token::With => {
+                    self.advance();
+                    let (distinct, items) = self.parse_return_items()?;
+                    let order_by = self.try_parse_order_by()?;
+                    let skip = self.try_parse_skip()?;
+                    let limit = self.try_parse_limit()?;
+                    let where_clause = self.try_parse_where()?;
+                    clauses.push(QueryClause::With { distinct, items, order_by, skip, limit, where_clause });
+                }
+                Token::Return => {
+                    self.advance();
+                    let (distinct, items) = self.parse_return_items()?;
+                    let order_by = self.try_parse_order_by()?;
+                    let skip = self.try_parse_skip()?;
+                    let limit = self.try_parse_limit()?;
+                    clauses.push(QueryClause::Return { distinct, items, order_by, skip, limit });
+                    break;
+                }
+                Token::Eof => break,
+                other => {
+                    return Err(ParseError {
+                        message: format!("unexpected token in query: {:?}", other),
+                        offset: self.offset(),
+                    });
+                }
             }
-            items
-        } else {
-            Vec::new()
-        };
-
-        // SKIP
-        let skip = if *self.peek() == Token::Skip {
-            self.advance();
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
-
-        // LIMIT
-        let limit = if *self.peek() == Token::Limit {
-            self.advance();
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
+        }
 
         if *self.peek() != Token::Eof {
             return Err(ParseError {
@@ -144,24 +148,86 @@ impl Parser {
             });
         }
 
-        Ok(Query {
-            match_clause,
-            where_clause,
-            return_clause,
-            order_by,
-            skip,
-            limit,
-        })
+        Ok(Query { clauses })
+    }
+
+    /// Parse a WHERE clause if present.
+    fn try_parse_where(&mut self) -> Result<Option<Expr>, ParseError> {
+        if *self.peek() == Token::Where {
+            self.advance();
+            Ok(Some(self.parse_expr()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Parse ORDER BY if present.
+    fn try_parse_order_by(&mut self) -> Result<Vec<OrderItem>, ParseError> {
+        if *self.peek() != Token::OrderBy {
+            return Ok(Vec::new());
+        }
+        self.advance();
+        let mut items = Vec::new();
+        loop {
+            let expr = self.parse_expr()?;
+            let ascending = match self.peek().clone() {
+                Token::Ident(ref s) if s.eq_ignore_ascii_case("DESC")
+                                   || s.eq_ignore_ascii_case("DESCENDING") => {
+                    self.advance();
+                    false
+                }
+                Token::Ident(ref s) if s.eq_ignore_ascii_case("ASC")
+                                   || s.eq_ignore_ascii_case("ASCENDING") => {
+                    self.advance();
+                    true
+                }
+                _ => true,
+            };
+            items.push(OrderItem { expr, ascending });
+            if *self.peek() != Token::Comma { break; }
+            self.advance();
+        }
+        Ok(items)
+    }
+
+    fn try_parse_skip(&mut self) -> Result<Option<Expr>, ParseError> {
+        if *self.peek() == Token::Skip {
+            self.advance();
+            Ok(Some(self.parse_expr()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn try_parse_limit(&mut self) -> Result<Option<Expr>, ParseError> {
+        if *self.peek() == Token::Limit {
+            self.advance();
+            Ok(Some(self.parse_expr()?))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Parse comma-separated patterns.
-    fn parse_match_clause(&mut self) -> Result<MatchClause, ParseError> {
+    fn parse_patterns(&mut self) -> Result<Vec<Pattern>, ParseError> {
         let mut patterns = vec![self.parse_pattern()?];
         while *self.peek() == Token::Comma {
             self.advance();
             patterns.push(self.parse_pattern()?);
         }
-        Ok(MatchClause { patterns })
+        Ok(patterns)
+    }
+
+    /// Parse RETURN items: [DISTINCT] expr [AS alias], ...
+    fn parse_return_items(&mut self) -> Result<(bool, Vec<ReturnItem>), ParseError> {
+        let distinct = if *self.peek() == Token::Distinct {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let items = self.parse_return_clause_items()?;
+        Ok((distinct, items))
     }
 
     /// Parse a single pattern chain: (n)-[r:T]->(m)
@@ -323,7 +389,7 @@ impl Parser {
         Ok(props)
     }
 
-    /// Parse RETURN items: expr [AS alias], ...
+    /// Parse RETURN items: expr [AS alias], ... (old API, kept for compatibility)
     fn parse_return_clause(&mut self) -> Result<ReturnClause, ParseError> {
         let distinct = if *self.peek() == Token::Distinct {
             self.advance();
@@ -332,13 +398,31 @@ impl Parser {
             false
         };
 
+        let items = self.parse_return_clause_items()?;
+        Ok(ReturnClause { distinct, items })
+    }
+
+    /// Parse a comma-separated list of return items (without the DISTINCT prefix).
+    fn parse_return_clause_items(&mut self) -> Result<Vec<ReturnItem>, ParseError> {
         let mut items = vec![self.parse_return_item()?];
         while *self.peek() == Token::Comma {
             self.advance();
             items.push(self.parse_return_item()?);
         }
+        Ok(items)
+    }
 
-        Ok(ReturnClause { distinct, items })
+    /// Like eat_ident but also accepts keyword tokens that are valid as identifiers
+    /// in certain positions (e.g. variable names after UNWIND ... AS).
+    fn eat_ident_flexible(&mut self) -> Result<String, ParseError> {
+        match self.peek().clone() {
+            Token::Ident(name) => { self.advance(); Ok(name) }
+            Token::End => { self.advance(); Ok("end".to_string()) }
+            other => Err(ParseError {
+                message: format!("expected identifier, got {:?}", other),
+                offset: self.offset(),
+            }),
+        }
     }
 
     fn parse_return_item(&mut self) -> Result<ReturnItem, ParseError> {
@@ -581,6 +665,10 @@ impl Parser {
                 self.expect(&Token::RBracket)?;
                 Expr::List(elems)
             }
+            Token::Case => {
+                self.advance();
+                self.parse_case_expr()?
+            }
             Token::Ident(name) => {
                 self.advance();
                 // Check for function call: name(...)
@@ -616,6 +704,44 @@ impl Parser {
 
         // Handle property access chains: expr.prop.prop
         self.parse_property_chain(expr)
+    }
+
+    /// Parse a CASE expression (after consuming CASE token).
+    /// CASE [test] WHEN val THEN val ... [ELSE val] END
+    fn parse_case_expr(&mut self) -> Result<Expr, ParseError> {
+        // Simple CASE: CASE test WHEN ...
+        // Searched CASE: CASE WHEN cond THEN ...
+        let is_searched = *self.peek() == Token::When;
+
+        let test = if is_searched {
+            None
+        } else {
+            Some(Box::new(self.parse_expr()?))
+        };
+
+        let mut branches: Vec<(Expr, Expr)> = Vec::new();
+        while *self.peek() == Token::When {
+            self.advance();
+            let when_expr = self.parse_expr()?;
+            self.expect(&Token::Then)?;
+            let then_expr = self.parse_expr()?;
+            branches.push((when_expr, then_expr));
+        }
+
+        let else_ = if *self.peek() == Token::Else {
+            self.advance();
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+
+        self.expect(&Token::End)?;
+
+        if let Some(test) = test {
+            Ok(Expr::CaseSimple { test, branches, else_ })
+        } else {
+            Ok(Expr::CaseSearched { branches, else_ })
+        }
     }
 
     fn parse_property_chain(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
@@ -657,11 +783,44 @@ pub fn parse(input: &str) -> Result<Query, ParseError> {
 mod tests {
     use super::*;
 
+    /// Helper: get the first Match clause's patterns.
+    fn first_match_patterns(q: &Query) -> &Vec<Pattern> {
+        match &q.clauses[0] {
+            QueryClause::Match { patterns, .. } => patterns,
+            other => panic!("expected Match clause, got {other:?}"),
+        }
+    }
+
+    /// Helper: get the first Match clause's where_clause.
+    fn first_where(q: &Query) -> Option<&Expr> {
+        match &q.clauses[0] {
+            QueryClause::Match { where_clause, .. } => where_clause.as_ref(),
+            other => panic!("expected Match clause, got {other:?}"),
+        }
+    }
+
+    /// Helper: get the Return clause items.
+    fn return_items(q: &Query) -> &Vec<ReturnItem> {
+        for c in &q.clauses {
+            if let QueryClause::Return { items, .. } = c { return items; }
+        }
+        panic!("no Return clause found");
+    }
+
+    /// Helper: get the Return clause's distinct flag.
+    fn return_distinct(q: &Query) -> bool {
+        for c in &q.clauses {
+            if let QueryClause::Return { distinct, .. } = c { return *distinct; }
+        }
+        false
+    }
+
     #[test]
     fn test_simple_match_return() {
         let q = parse("MATCH (n:Person) RETURN n").unwrap();
-        assert_eq!(q.match_clause.patterns.len(), 1);
-        let p = &q.match_clause.patterns[0];
+        let patterns = first_match_patterns(&q);
+        assert_eq!(patterns.len(), 1);
+        let p = &patterns[0];
         assert_eq!(p.elements.len(), 1);
         match &p.elements[0] {
             PatternElement::Node(n) => {
@@ -670,14 +829,14 @@ mod tests {
             }
             _ => panic!("expected node"),
         }
-        assert!(q.where_clause.is_none());
-        assert_eq!(q.return_clause.items.len(), 1);
+        assert!(first_where(&q).is_none());
+        assert_eq!(return_items(&q).len(), 1);
     }
 
     #[test]
     fn test_match_with_relationship() {
         let q = parse("MATCH (a)-[r:KNOWS]->(b) RETURN a, b").unwrap();
-        let p = &q.match_clause.patterns[0];
+        let p = &first_match_patterns(&q)[0];
         assert_eq!(p.elements.len(), 3); // node, rel, node
         match &p.elements[1] {
             PatternElement::Relationship(r) => {
@@ -692,7 +851,7 @@ mod tests {
     #[test]
     fn test_left_arrow() {
         let q = parse("MATCH (a)<-[r:KNOWS]-(b) RETURN a").unwrap();
-        match &q.match_clause.patterns[0].elements[1] {
+        match &first_match_patterns(&q)[0].elements[1] {
             PatternElement::Relationship(r) => {
                 assert_eq!(r.direction, RelDirection::In);
             }
@@ -703,7 +862,7 @@ mod tests {
     #[test]
     fn test_undirected() {
         let q = parse("MATCH (a)-[r:KNOWS]-(b) RETURN a").unwrap();
-        match &q.match_clause.patterns[0].elements[1] {
+        match &first_match_patterns(&q)[0].elements[1] {
             PatternElement::Relationship(r) => {
                 assert_eq!(r.direction, RelDirection::Both);
             }
@@ -714,8 +873,8 @@ mod tests {
     #[test]
     fn test_where_clause() {
         let q = parse("MATCH (n:Person) WHERE n.age > 30 RETURN n").unwrap();
-        assert!(q.where_clause.is_some());
-        match &q.where_clause.unwrap() {
+        assert!(first_where(&q).is_some());
+        match first_where(&q).unwrap() {
             Expr::Compare(_, CmpOp::Gt, _) => {}
             other => panic!("expected Compare(Gt), got {other:?}"),
         }
@@ -724,8 +883,7 @@ mod tests {
     #[test]
     fn test_where_and_or() {
         let q = parse("MATCH (n) WHERE n.x = 1 AND n.y = 2 OR n.z = 3 RETURN n").unwrap();
-        // OR has lower precedence than AND: (x=1 AND y=2) OR z=3
-        match &q.where_clause.unwrap() {
+        match first_where(&q).unwrap() {
             Expr::Or(_, _) => {}
             other => panic!("expected Or at top, got {other:?}"),
         }
@@ -734,7 +892,7 @@ mod tests {
     #[test]
     fn test_is_null() {
         let q = parse("MATCH (n) WHERE n.x IS NULL RETURN n").unwrap();
-        match &q.where_clause.unwrap() {
+        match first_where(&q).unwrap() {
             Expr::IsNull(_) => {}
             other => panic!("expected IsNull, got {other:?}"),
         }
@@ -743,7 +901,7 @@ mod tests {
     #[test]
     fn test_is_not_null() {
         let q = parse("MATCH (n) WHERE n.x IS NOT NULL RETURN n").unwrap();
-        match &q.where_clause.unwrap() {
+        match first_where(&q).unwrap() {
             Expr::IsNotNull(_) => {}
             other => panic!("expected IsNotNull, got {other:?}"),
         }
@@ -752,19 +910,19 @@ mod tests {
     #[test]
     fn test_return_alias() {
         let q = parse("MATCH (n) RETURN n.name AS name").unwrap();
-        assert_eq!(q.return_clause.items[0].alias.as_deref(), Some("name"));
+        assert_eq!(return_items(&q)[0].alias.as_deref(), Some("name"));
     }
 
     #[test]
     fn test_return_distinct() {
         let q = parse("MATCH (n) RETURN DISTINCT n").unwrap();
-        assert!(q.return_clause.distinct);
+        assert!(return_distinct(&q));
     }
 
     #[test]
     fn test_function_call() {
         let q = parse("MATCH (n) RETURN id(n)").unwrap();
-        match &q.return_clause.items[0].expr {
+        match &return_items(&q)[0].expr {
             Expr::FunctionCall(name, args) => {
                 assert_eq!(name, "id");
                 assert_eq!(args.len(), 1);
@@ -776,13 +934,13 @@ mod tests {
     #[test]
     fn test_multi_pattern() {
         let q = parse("MATCH (a:Person), (b:Company) RETURN a, b").unwrap();
-        assert_eq!(q.match_clause.patterns.len(), 2);
+        assert_eq!(first_match_patterns(&q).len(), 2);
     }
 
     #[test]
     fn test_inline_properties() {
         let q = parse("MATCH (n:Person {name: 'Alice', age: 30}) RETURN n").unwrap();
-        match &q.match_clause.patterns[0].elements[0] {
+        match &first_match_patterns(&q)[0].elements[0] {
             PatternElement::Node(n) => {
                 assert_eq!(n.properties.len(), 2);
                 assert_eq!(n.properties[0].0, "name");
@@ -795,7 +953,7 @@ mod tests {
     #[test]
     fn test_chain_pattern() {
         let q = parse("MATCH (a)-[:KNOWS]->(b)-[:LIKES]->(c) RETURN a, c").unwrap();
-        let p = &q.match_clause.patterns[0];
+        let p = &first_match_patterns(&q)[0];
         // a, KNOWS, b, LIKES, c = 5 elements
         assert_eq!(p.elements.len(), 5);
     }
@@ -804,4 +962,54 @@ mod tests {
     fn test_error_on_junk() {
         assert!(parse("MATCH (n) RETURN n GARBAGE").is_err());
     }
+
+    #[test]
+    fn test_optional_match() {
+        let q = parse("MATCH (a) OPTIONAL MATCH (a)-[:KNOWS]->(b) RETURN a, b").unwrap();
+        assert_eq!(q.clauses.len(), 3); // Match, OptionalMatch, Return
+        match &q.clauses[1] {
+            QueryClause::Match { optional, .. } => assert!(*optional),
+            other => panic!("expected optional Match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unwind() {
+        let q = parse("UNWIND [1, 2, 3] AS x RETURN x").unwrap();
+        match &q.clauses[0] {
+            QueryClause::Unwind { alias, .. } => assert_eq!(alias, "x"),
+            other => panic!("expected Unwind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_with_clause() {
+        let q = parse("MATCH (n) WITH n RETURN n").unwrap();
+        assert!(q.clauses.iter().any(|c| matches!(c, QueryClause::With { .. })));
+    }
+
+    #[test]
+    fn test_case_searched() {
+        let q = parse("MATCH (n) RETURN CASE WHEN n.x = 1 THEN 'one' ELSE 'other' END").unwrap();
+        match &return_items(&q)[0].expr {
+            Expr::CaseSearched { branches, else_ } => {
+                assert_eq!(branches.len(), 1);
+                assert!(else_.is_some());
+            }
+            other => panic!("expected CaseSearched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_case_simple() {
+        let q = parse("MATCH (n) RETURN CASE n.x WHEN 1 THEN 'one' WHEN 2 THEN 'two' END").unwrap();
+        match &return_items(&q)[0].expr {
+            Expr::CaseSimple { branches, else_, .. } => {
+                assert_eq!(branches.len(), 2);
+                assert!(else_.is_none());
+            }
+            other => panic!("expected CaseSimple, got {other:?}"),
+        }
+    }
 }
+
