@@ -1,0 +1,25 @@
+[package]
+name        = "pg_eddy"
+description = "High-performance native LPG store for PostgreSQL 18 via a custom Table Access Method"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+authors.workspace     = true
+repository.workspace  = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["pg18"]
+pg18    = ["pgrx/pg18"]
+pg_test = []
+
+[dependencies]
+pgrx.workspace      = true
+serde.workspace     = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+pgrx-tests = "=0.18.0"

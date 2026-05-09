@@ -1,0 +1,5 @@
+[toolchain]
+# pgrx 0.18.0 requires Rust 1.85+ (Edition 2024 stabilised in 1.85)
+# Pinned to the stable channel; update when pgrx is upgraded.
+channel = "stable"
+components = ["rustfmt", "clippy", "rust-src"]

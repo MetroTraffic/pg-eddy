@@ -1252,7 +1252,13 @@ fails, stop and reconsider the approach.
 **Deliverables**:
 - [ ] Cargo workspace: `pg_eddy/` (extension), `pg_eddy_http/` (placeholder
       HTTP binary for future Bolt/REST API)
-- [ ] `pg_eddy.control` with `trusted = false`, `schema = 'pg_eddy'`
+- [ ] `pg_eddy.control` with `trusted = false`, `superuser = true`; no
+      `schema =` field — PostgreSQL 18 rejects schema names beginning with
+      `pg_` (reserved for system use; `ERRCODE_RESERVED_NAME`). Extension
+      objects install in whatever schema the user specifies at
+      `CREATE EXTENSION pg_eddy SCHEMA <name>` time (default: `public`).
+      The internal schema `_pg_eddy` is valid (underscore prefix is not
+      reserved and is used by convention for extension-internal objects).
 - [ ] `shared_preload_libraries = 'pg_eddy'` required from this version
 - [ ] Custom WAL resource manager skeleton registered via `RegisterCustomRmgr()`
       at `_PG_init` (no-op redo; proves the registration path works; appears

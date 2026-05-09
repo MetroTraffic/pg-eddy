@@ -1,0 +1,12 @@
+[package]
+name        = "pg_eddy_http"
+description = "Placeholder for future pg-eddy HTTP/Bolt API server"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+authors.workspace     = true
+repository.workspace  = true
+
+[[bin]]
+name = "pg_eddy_http"
+path = "src/main.rs"
