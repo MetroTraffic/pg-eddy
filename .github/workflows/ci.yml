@@ -50,6 +50,11 @@ jobs:
         working-directory: pg_eddy
         run: cargo clippy --features pg18 -- -D warnings
 
+      - name: Make PG extension dirs writable
+        run: |
+          sudo chmod a+w $(pg_config --pkglibdir)
+          sudo chmod a+w $(pg_config --sharedir)/extension
+
       - name: Run pgrx tests
         working-directory: pg_eddy
         run: cargo pgrx test pg18

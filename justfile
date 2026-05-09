@@ -2,6 +2,8 @@
 # Usage: just <recipe>
 # Requires: https://github.com/casey/just
 
+set shell := ["bash", "-c"]
+
 pg_version := "18"
 
 # Build the extension (debug)
@@ -24,24 +26,24 @@ test:
 # Requires: TAP::Parser::SourceHandler::pgTAP (sudo cpanm TAP::Parser::SourceHandler::pgTAP)
 # and postgresql-server-dev-18 for PostgreSQL::Test::Cluster.
 tap:
-    PG_REGRESS=/usr/lib/postgresql/18/lib/pgxs/src/test/regress/pg_regress \
-    PERL5LIB="/usr/lib/postgresql/18/lib/pgxs/src/test/perl:$PERL5LIB" \
-    PATH="/usr/lib/postgresql/18/bin:$PATH" \
+    PG_REGRESS='/usr/lib/postgresql/18/lib/pgxs/src/test/regress/pg_regress' \
+    PERL5LIB="/usr/lib/postgresql/18/lib/pgxs/src/test/perl:${PERL5LIB}" \
+    PATH="/usr/lib/postgresql/18/bin:${PATH}" \
     prove -v tests/tap/*.pl
 
 # Run the openCypher TCK harness (all groups)
 tck:
-    PG_REGRESS=/usr/lib/postgresql/18/lib/pgxs/src/test/regress/pg_regress \
-    PERL5LIB="/usr/lib/postgresql/18/lib/pgxs/src/test/perl:$PERL5LIB" \
-    PATH="/usr/lib/postgresql/18/bin:$PATH" \
+    PG_REGRESS='/usr/lib/postgresql/18/lib/pgxs/src/test/regress/pg_regress' \
+    PERL5LIB="/usr/lib/postgresql/18/lib/pgxs/src/test/perl:${PERL5LIB}" \
+    PATH="/usr/lib/postgresql/18/bin:${PATH}" \
     prove -v tests/tck/run_tck.pl
 
 # Run a specific TCK clause group, e.g.: just tck-group match
 tck-group group:
-    PG_REGRESS=/usr/lib/postgresql/18/lib/pgxs/src/test/regress/pg_regress \
-    PERL5LIB="/usr/lib/postgresql/18/lib/pgxs/src/test/perl:$PERL5LIB" \
-    PATH="/usr/lib/postgresql/18/bin:$PATH" \
-    TCK_GROUPS="{{group}}" \
+    TCK_GROUPS={{group}} \
+    PG_REGRESS='/usr/lib/postgresql/18/lib/pgxs/src/test/regress/pg_regress' \
+    PERL5LIB="/usr/lib/postgresql/18/lib/pgxs/src/test/perl:${PERL5LIB}" \
+    PATH="/usr/lib/postgresql/18/bin:${PATH}" \
     prove -v tests/tck/run_tck.pl
 
 # Run clippy lints
