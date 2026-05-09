@@ -1,0 +1,158 @@
+/// Cypher AST — typed intermediate representation for parsed Cypher queries.
+///
+/// v0.6.0 scope: single-clause MATCH/RETURN with WHERE, node and relationship
+/// patterns, property comparisons, AND/OR/NOT, IS NULL.
+/// A complete Cypher query (v0.6.0: single MATCH … RETURN).
+#[derive(Debug, Clone)]
+pub struct Query {
+    pub match_clause: MatchClause,
+    pub where_clause: Option<Expr>,
+    pub return_clause: ReturnClause,
+}
+
+/// MATCH clause: one or more comma-separated patterns.
+#[derive(Debug, Clone)]
+pub struct MatchClause {
+    pub patterns: Vec<Pattern>,
+}
+
+/// A single pattern: a chain of nodes connected by relationships.
+/// `(a)-[r:KNOWS]->(b)-[:LIKES]->(c)` is one pattern with 3 nodes and 2 rels.
+#[derive(Debug, Clone)]
+pub struct Pattern {
+    pub elements: Vec<PatternElement>,
+}
+
+/// A node or relationship in a pattern chain.
+#[derive(Debug, Clone)]
+pub enum PatternElement {
+    Node(NodePattern),
+    Relationship(RelPattern),
+}
+
+/// A node pattern: `(variable:Label {prop: value})`.
+#[derive(Debug, Clone)]
+pub struct NodePattern {
+    pub variable: Option<String>,
+    pub labels: Vec<String>,
+    pub properties: Vec<(String, Expr)>,
+}
+
+/// A relationship pattern: `-[variable:TYPE {prop: value}]->`.
+#[derive(Debug, Clone)]
+pub struct RelPattern {
+    pub variable: Option<String>,
+    pub rel_types: Vec<String>,
+    pub direction: RelDirection,
+    pub properties: Vec<(String, Expr)>,
+}
+
+/// Direction of a relationship in a pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelDirection {
+    Out,   // -[]->(b)
+    In,    // <-[]-(b)
+    Both,  // -[]-(b)  (undirected)
+}
+
+/// RETURN clause items.
+#[derive(Debug, Clone)]
+pub struct ReturnClause {
+    pub distinct: bool,
+    pub items: Vec<ReturnItem>,
+}
+
+/// A single RETURN item: expression optionally aliased.
+#[derive(Debug, Clone)]
+pub struct ReturnItem {
+    pub expr: Expr,
+    pub alias: Option<String>,
+}
+
+/// Expression tree — covers comparisons, boolean logic, literals, property
+/// access, parameters, and function calls needed for v0.6.0.
+#[derive(Debug, Clone)]
+pub enum Expr {
+    /// Variable reference: `n`
+    Variable(String),
+    /// Property access: `n.name`
+    Property(Box<Expr>, String),
+    /// Integer literal
+    IntLit(i64),
+    /// Float literal
+    FloatLit(f64),
+    /// String literal
+    StringLit(String),
+    /// Boolean literal
+    BoolLit(bool),
+    /// NULL literal
+    NullLit,
+    /// Parameter reference: `$param`
+    Parameter(String),
+    /// Binary comparison: =, <>, <, >, <=, >=
+    Compare(Box<Expr>, CmpOp, Box<Expr>),
+    /// Boolean AND
+    And(Box<Expr>, Box<Expr>),
+    /// Boolean OR
+    Or(Box<Expr>, Box<Expr>),
+    /// Boolean NOT
+    Not(Box<Expr>),
+    /// IS NULL
+    IsNull(Box<Expr>),
+    /// IS NOT NULL
+    IsNotNull(Box<Expr>),
+    /// Arithmetic: +, -, *, /, %
+    Arith(Box<Expr>, ArithOp, Box<Expr>),
+    /// Unary minus
+    Neg(Box<Expr>),
+    /// Function call: id(n), labels(n), type(r), etc.
+    FunctionCall(String, Vec<Expr>),
+    /// Star expression (for COUNT(*))
+    Star,
+}
+
+/// Comparison operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmpOp {
+    Eq,
+    Neq,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+}
+
+/// Arithmetic operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
+impl std::fmt::Display for CmpOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CmpOp::Eq => write!(f, "="),
+            CmpOp::Neq => write!(f, "<>"),
+            CmpOp::Lt => write!(f, "<"),
+            CmpOp::Gt => write!(f, ">"),
+            CmpOp::Le => write!(f, "<="),
+            CmpOp::Ge => write!(f, ">="),
+        }
+    }
+}
+
+impl std::fmt::Display for ArithOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArithOp::Add => write!(f, "+"),
+            ArithOp::Sub => write!(f, "-"),
+            ArithOp::Mul => write!(f, "*"),
+            ArithOp::Div => write!(f, "/"),
+            ArithOp::Mod => write!(f, "%"),
+        }
+    }
+}

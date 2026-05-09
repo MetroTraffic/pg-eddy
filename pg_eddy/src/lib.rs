@@ -10,6 +10,7 @@ use pgrx::prelude::*;
 use pgrx::datum::DatumWithOid;
 
 mod catalog;
+mod cypher;
 mod error;
 mod storage;
 
@@ -1062,6 +1063,68 @@ fn am_stats() -> pgrx::JsonB {
 }
 
 // ---------------------------------------------------------------------------
+// Cypher query API (Phase 5)
+// ---------------------------------------------------------------------------
+
+/// Execute a Cypher query and return results as SETOF JSONB.
+///
+/// `query`  — a Cypher MATCH…RETURN statement.
+/// `params` — optional JSONB object with query parameters ($name references).
+///
+/// Example:
+/// ```sql
+/// SELECT * FROM cypher('MATCH (n:Person) WHERE n.age > 30 RETURN n', '{}');
+/// ```
+#[pg_extern]
+fn cypher(query: &str, params: Option<pgrx::JsonB>) -> SetOfIterator<'static, pgrx::JsonB> {
+    let param_map: std::collections::HashMap<String, serde_json::Value> = match params {
+        Some(pgrx::JsonB(serde_json::Value::Object(m))) => {
+            m.into_iter().collect()
+        }
+        _ => std::collections::HashMap::new(),
+    };
+
+    let ast = match cypher::parser::parse(query) {
+        Ok(q) => q,
+        Err(e) => error!("pg_eddy cypher parse error: {e}"),
+    };
+
+    let plan = match cypher::planner::plan(&ast) {
+        Ok(p) => p,
+        Err(e) => error!("pg_eddy cypher plan error: {e}"),
+    };
+
+    let rows = match cypher::executor::execute(&plan, &param_map) {
+        Ok(r) => r,
+        Err(e) => error!("pg_eddy cypher exec error: {e}"),
+    };
+
+    let results = cypher::executor::rows_to_jsonb(rows);
+    SetOfIterator::new(results)
+}
+
+/// Return the logical execution plan for a Cypher query as text.
+///
+/// Example:
+/// ```sql
+/// SELECT cypher_explain('MATCH (a:Person)-[:KNOWS]->(b) RETURN a, b');
+/// ```
+#[pg_extern]
+fn cypher_explain(query: &str) -> String {
+    let ast = match cypher::parser::parse(query) {
+        Ok(q) => q,
+        Err(e) => error!("pg_eddy cypher parse error: {e}"),
+    };
+
+    let plan = match cypher::planner::plan(&ast) {
+        Ok(p) => p,
+        Err(e) => error!("pg_eddy cypher plan error: {e}"),
+    };
+
+    cypher::planner::explain(&plan, 0)
+}
+
+// ---------------------------------------------------------------------------
 // pg_test module — pgrx unit tests
 // ---------------------------------------------------------------------------
 #[cfg(any(test, feature = "pg_test"))]
@@ -1453,6 +1516,159 @@ mod tests {
         assert!(crate::delete_edge(e3));
         let likes_after: Vec<i64> = crate::find_edges(None, Some(c), Some("LIKES".into())).collect();
         assert!(likes_after.is_empty(), "LIKES edge should be gone from index after delete");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 5 Cypher engine tests
+    // -----------------------------------------------------------------------
+
+    #[pg_test]
+    fn test_cypher_match_all_nodes() {
+        crate::create_node(
+            vec!["CypherTest".into()],
+            pgrx::JsonB(serde_json::json!({"name": "Alice"})),
+        );
+        crate::create_node(
+            vec!["CypherTest".into()],
+            pgrx::JsonB(serde_json::json!({"name": "Bob"})),
+        );
+
+        let results: Vec<pgrx::JsonB> = crate::cypher(
+            "MATCH (n:CypherTest) RETURN n",
+            None,
+        ).collect();
+        assert!(results.len() >= 2, "should find at least 2 CypherTest nodes, got {}", results.len());
+    }
+
+    #[pg_test]
+    fn test_cypher_where_filter() {
+        crate::create_node(
+            vec!["FilterTest".into()],
+            pgrx::JsonB(serde_json::json!({"age": 25})),
+        );
+        crate::create_node(
+            vec!["FilterTest".into()],
+            pgrx::JsonB(serde_json::json!({"age": 35})),
+        );
+
+        let results: Vec<pgrx::JsonB> = crate::cypher(
+            "MATCH (n:FilterTest) WHERE n.age > 30 RETURN n",
+            None,
+        ).collect();
+        assert_eq!(results.len(), 1, "only node with age=35 should match");
+    }
+
+    #[pg_test]
+    fn test_cypher_expand() {
+        let a = crate::create_node(
+            vec!["ExpandTest".into()],
+            pgrx::JsonB(serde_json::json!({"name": "A"})),
+        );
+        let b = crate::create_node(
+            vec!["ExpandTest".into()],
+            pgrx::JsonB(serde_json::json!({"name": "B"})),
+        );
+        crate::create_edge(a, b, "KNOWS", pgrx::JsonB(serde_json::json!({})));
+
+        let results: Vec<pgrx::JsonB> = crate::cypher(
+            "MATCH (a:ExpandTest)-[:KNOWS]->(b:ExpandTest) RETURN a, b",
+            None,
+        ).collect();
+        assert!(results.len() >= 1, "should find at least 1 KNOWS edge");
+    }
+
+    #[pg_test]
+    fn test_cypher_return_property() {
+        crate::create_node(
+            vec!["PropReturn".into()],
+            pgrx::JsonB(serde_json::json!({"name": "Charlie"})),
+        );
+
+        let results: Vec<pgrx::JsonB> = crate::cypher(
+            "MATCH (n:PropReturn) RETURN n.name",
+            None,
+        ).collect();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, serde_json::json!("Charlie"));
+    }
+
+    #[pg_test]
+    fn test_cypher_return_id() {
+        let nid = crate::create_node(
+            vec!["IdTest".into()],
+            pgrx::JsonB(serde_json::json!({})),
+        );
+
+        let results: Vec<pgrx::JsonB> = crate::cypher(
+            "MATCH (n:IdTest) RETURN id(n)",
+            None,
+        ).collect();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, serde_json::json!(nid));
+    }
+
+    #[pg_test]
+    fn test_cypher_explain() {
+        let plan = crate::cypher_explain(
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b",
+        );
+        assert!(plan.contains("LabelScan"), "explain should contain LabelScan");
+        assert!(plan.contains("Expand"), "explain should contain Expand");
+        assert!(plan.contains("Project"), "explain should contain Project");
+    }
+
+    #[pg_test]
+    fn test_cypher_inline_properties() {
+        crate::create_node(
+            vec!["InlineTest".into()],
+            pgrx::JsonB(serde_json::json!({"name": "X"})),
+        );
+        crate::create_node(
+            vec!["InlineTest".into()],
+            pgrx::JsonB(serde_json::json!({"name": "Y"})),
+        );
+
+        let results: Vec<pgrx::JsonB> = crate::cypher(
+            "MATCH (n:InlineTest {name: 'X'}) RETURN n.name",
+            None,
+        ).collect();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, serde_json::json!("X"));
+    }
+
+    #[pg_test]
+    fn test_cypher_is_null() {
+        crate::create_node(
+            vec!["NullTest".into()],
+            pgrx::JsonB(serde_json::json!({"name": "Alice"})),
+        );
+        crate::create_node(
+            vec!["NullTest".into()],
+            pgrx::JsonB(serde_json::json!({})),
+        );
+
+        let results: Vec<pgrx::JsonB> = crate::cypher(
+            "MATCH (n:NullTest) WHERE n.name IS NULL RETURN n",
+            None,
+        ).collect();
+        assert_eq!(results.len(), 1, "only the node without name should match IS NULL");
+    }
+
+    #[pg_test]
+    fn test_cypher_labels_function() {
+        crate::create_node(
+            vec!["LabelFnTest".into(), "Extra".into()],
+            pgrx::JsonB(serde_json::json!({})),
+        );
+
+        let results: Vec<pgrx::JsonB> = crate::cypher(
+            "MATCH (n:LabelFnTest) RETURN labels(n)",
+            None,
+        ).collect();
+        assert_eq!(results.len(), 1);
+        let arr = results[0].0.as_array().unwrap();
+        assert!(arr.iter().any(|v| v == "LabelFnTest"));
+        assert!(arr.iter().any(|v| v == "Extra"));
     }
 }
 
