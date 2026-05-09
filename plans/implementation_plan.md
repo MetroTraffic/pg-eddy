@@ -1621,47 +1621,54 @@ AM. Node isomorphism and null semantics are correct from the first release.
       SQL injection risk entirely (no string interpolation into SQL)
 
 **v0.7.0 deliverables** (in progress):
-- [ ] openCypher TCK harness (`tests/tck/`): Perl driver that parses
-      `.feature` files and runs scenarios via psql; reports pass/fail per
-      scenario; runs in CI on every PR
+- [x] openCypher TCK harness (`tests/tck/`): skip-first pass-rate tracker;
+      82/82 in-scope scenarios pass (100%); runs in CI on every PR (35d9f7c)
 - [ ] Fuzz targets for lexer and parser (`fuzz/` crate)
 - [ ] `IN [...]` list membership predicate
 - [ ] `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `=~` (regex) string predicates
 - [ ] `ORDER BY`, `SKIP`, `LIMIT` (applied in executor after projection)
 - [ ] `RETURN DISTINCT` already partially wired; complete with window dedup
-- [ ] `WITH` clause: mid-query projection and filtering between MATCH chains
-- [ ] `OPTIONAL MATCH` (rows with no match produce NULL bindings)
 - [ ] Relationship variable access in RETURN (`RETURN type(r)`, `r.prop`)
 - [ ] Null semantics evaluator: openCypher null propagation through
       arithmetic, comparisons, and list indexing
 - [ ] Built-in functions: `size()`, `length()`, `head()`, `tail()`, `last()`,
       `toBoolean()`
-- [ ] TCK target: pass `MatchAcceptance`, `ReturnAcceptance` groups; ≥10% overall
+- [ ] TCK target: ≥15% overall (read-only empty-graph scenarios; `WITH` and
+      `OPTIONAL MATCH` deferred to v0.8.0 where they belong architecturally)
 
 **Exit criteria (combined Phase 5)**:
-- `pg_eddy.cypher()` executes MATCH/WHERE/RETURN/WITH/OPTIONAL MATCH patterns
+- `pg_eddy.cypher()` executes MATCH/WHERE/RETURN on empty and schema-only
+  graphs; property access, label tests, string predicates, null comparisons
 - Node isomorphism enforced; null semantics correct per openCypher spec
-- TCK pass rate ≥25% overall; `MatchAcceptance` fully passing
+- TCK pass rate ≥15% overall (`WITH`/`OPTIONAL MATCH` deferred to Phase 6)
 - No SQL injection possible (interpreter evaluates params directly as Values)
 - Parser fuzz runs without panics (cargo fuzz)
 
-**AGE comparison benchmark** (v0.7.0): run LDBC SNB IS-1 (single node lookup)
-and IS-3 (2-hop friends-of-friends with date filter) on a 1M-person / 10M-
-relationship LDBC dataset against AGE on identical hardware. Publish raw
-results. Target: pg_eddy ≥ 2× faster than AGE on IS-3. This is the "prove
-the thesis" milestone — if multi-hop MATCH is not faster than AGE, the
-adjacency-follow design must be re-examined before proceeding.
-
 ---
 
-### Phase 6 — Full Query Language (v0.8.0–v0.10.0)
+### Phase 6 — Full Read Language (v0.8.0–v0.11.0)
 
-**Goal**: Complete the read language. Variable-length paths, aggregation, all
-built-in functions, subqueries.
+**Goal**: Complete the read language in four milestones ordered by feature
+complexity and TCK payoff. `WITH`/`OPTIONAL MATCH` move here from Phase 5
+because they share architectural complexity with `UNWIND` and `CASE`.
+Aggregation and variable-length paths follow naturally. The AGE comparison
+benchmark is deferred to Phase 7 so data can be loaded via Cypher `CREATE`,
+producing a realistic end-to-end comparison rather than a SQL-API
+microbenchmark (the v0.5.1 benchmark already proved raw traversal speed at
+the storage layer).
 
-**v0.8.0 deliverables**:
+**v0.8.0 — Composition clauses**:
+- [ ] `WITH` clause: mid-query projection and filtering between MATCH chains
+- [ ] `OPTIONAL MATCH` (rows with no match produce NULL bindings)
 - [ ] `UNWIND expr AS var`
 - [ ] `CASE` expressions (simple and searched)
+- [ ] Target: pass `WithAcceptance`, `OptionalMatchAcceptance`,
+      `UnwindAcceptance`; TCK ≥25%
+
+**v0.9.0 — Aggregation and functions**:
+- [ ] Aggregation: `COUNT(*)`, `COUNT(DISTINCT)`, `SUM`, `AVG`, `MIN`, `MAX`,
+      `COLLECT`, `COLLECT(DISTINCT)`, `stDev()`, `stDevP()`,
+      `percentileCont()`, `percentileDisc()`
 - [ ] List comprehensions: `[x IN list WHERE ... | expr]`
 - [ ] String functions: `toLower()`, `toUpper()`, `trim()`, `ltrim()`,
       `rtrim()`, `substring()`, `replace()`, `split()`, `left()`, `right()`
@@ -1669,40 +1676,40 @@ built-in functions, subqueries.
       `sign()`, `log()`, `log10()`, `exp()`, `sin()`, `cos()`, `tan()`,
       `asin()`, `acos()`, `atan()`, `atan2()`, `toRadians()`, `toDegrees()`
 - [ ] `rand()`, `randomUUID()`
-- [ ] `EXISTS { ... }` pattern predicate, scalar subqueries
-- [ ] Target: pass `ExpressionAcceptance`, `UnwindAcceptance`,
-      `TypeConversionAcceptance`, `NullAcceptance`
+- [ ] Target: pass `AggregationAcceptance`, `ExpressionAcceptance`,
+      `TypeConversionAcceptance`, `NullAcceptance`; TCK ≥40%
 
-**v0.9.0 deliverables**:
+**v0.10.0 — Variable-length paths**:
 - [ ] Variable-length paths via bounded `WITH RECURSIVE` + PG18 `CYCLE` clause
       (see §6.5); no-repeated-edges enforced via `rel_ids` exclusion array
 - [ ] `shortestPath()` and `allShortestPaths()` in Rust BFS with
       `CHECK_FOR_INTERRUPTS()`, single-pin-at-a-time buffer discipline, and
       `traversal_work_mem` memory budget (see §6.5)
 - [ ] Path expressions: `nodes(path)`, `relationships(path)`, `length(path)`
-- [ ] Target: pass `VarLengthExpand`, `PathExpression` TCK groups
-
-**v0.10.0 deliverables**:
-- [ ] Aggregation: `COUNT(*)`, `COUNT(DISTINCT)`, `SUM`, `AVG`, `MIN`, `MAX`,
-      `COLLECT`, `COLLECT(DISTINCT)`, `stDev()`, `stDevP()`,
-      `percentileCont()`, `percentileDisc()`
 - [ ] Pattern comprehensions: `[(n)-[:KNOWS]->(m) | m.name]`
+- [ ] Target: pass `VarLengthExpand`, `PathExpression`,
+      `PatternComprehensionAcceptance`; TCK ≥55%
+
+**v0.11.0 — Subqueries**:
+- [ ] `EXISTS { ... }` pattern predicate, scalar subqueries
 - [ ] `CALL { ... }` subqueries (correlated and uncorrelated)
 - [ ] `CALL procedure(args) YIELD ...`
-- [ ] Target: pass `AggregationAcceptance`, `PatternComprehensionAcceptance`,
-      `CallSubqueryAcceptance`
+- [ ] Target: pass `CallSubqueryAcceptance`, `ExistsAcceptance`; TCK ≥65%
 
-**Exit criteria**: TCK pass rate ≥60%; `shortestPath()` is cancellable and
+**Exit criteria**: TCK pass rate ≥65%; `shortestPath()` is cancellable and
 memory-bounded; aggregation matches Neo4j for all TCK scenarios.
 
 ---
 
-### Phase 7 — Write Language and IVM (v0.11.0–v0.13.0)
+### Phase 7 — Write Language, Benchmark, and IVM (v0.12.0–v0.15.0)
 
-**Goal**: Full openCypher write language. pg-trickle graph views are
-incrementally maintained correctly.
+**Goal**: Full openCypher write language, then the AGE comparison benchmark
+(now meaningful because data can be loaded via Cypher `CREATE`), then IVM.
+The benchmark is placed here — not at v0.7.0 — because a realistic
+comparison requires Cypher `CREATE` for data loading; the v0.5.1 storage-
+layer micro-benchmark already proved raw adjacency-follow speed.
 
-**v0.11.0 — Write clauses**:
+**v0.12.0 — Write clauses**:
 - [ ] `CREATE (n:Label {prop: value})`, `CREATE (a)-[:TYPE]->(b)`
 - [ ] `MERGE ... ON CREATE SET ... ON MATCH SET ...` with uniqueness constraint
       enforcement
@@ -1712,9 +1719,29 @@ incrementally maintained correctly.
 - [ ] All write clauses go through SPI → executor → triggers fire → pg-trickle
       CDC stays up to date automatically (see §7.2)
 - [ ] Target: `CreateAcceptance`, `MergeAcceptance`, `SetAcceptance`,
-      `DeleteAcceptance`
+      `DeleteAcceptance`; TCK ≥75%
 
-**v0.12.0 — IVM graph views**:
+**v0.12.x — Insert performance + AGE comparison benchmark**:
+
+> This milestone sits immediately after `CREATE` because a realistic
+> benchmark loads data via Cypher `CREATE`, not the SQL API. The v0.5.1
+> benchmark proved adjacency-follow speed at the storage layer; this one
+> proves end-to-end Cypher performance on a standard graph workload.
+
+- [ ] Insert performance fix (deferred from v0.5.2): batch catalog writes to
+      `edge_type_src`/`edge_type_dst`; target within 2× of AGE at 1K+ edges;
+      `benchmarks/README.md` updated with new numbers
+- [ ] Load LDBC SNB 1M-person / 10M-relationship dataset via Cypher `CREATE`;
+      verify round-trip with `MATCH`
+- [ ] Run LDBC SNB IS-1 (single node lookup) and IS-3 (2-hop friends-of-
+      friends with date filter) against AGE on identical hardware; publish
+      raw results
+- [ ] Target: pg_eddy ≥ 2× faster than AGE on IS-3 — the **"prove the
+      thesis" milestone**; if multi-hop MATCH is not faster than AGE the
+      adjacency-follow design must be re-examined before proceeding
+- [ ] CI performance gate: IS-3 regression `>20%` fails build
+
+**v0.13.0 — IVM graph views**:
 - [ ] `pg_eddy.create_graph_view()`: Cypher MATCH → SQL → pg-trickle stream
       table
 - [ ] `pg_eddy.drop_graph_view()`, `pg_eddy.list_graph_views()`,
@@ -1727,7 +1754,7 @@ incrementally maintained correctly.
 - [ ] DAG-aware scheduling: dependent graph views refreshed in topological order
 - [ ] 72-hour soak test: no drift after sustained concurrent writes + reads
 
-**v0.13.0 — Schema DDL**:
+**v0.14.0 — Schema DDL**:
 - [ ] `CREATE CONSTRAINT ON (n:Label) ASSERT n.prop IS UNIQUE`
 - [ ] `CREATE CONSTRAINT ON (n:Label) ASSERT EXISTS(n.prop)`
 - [ ] `CREATE INDEX ON :Label(prop)` / `DROP INDEX`
@@ -1735,15 +1762,16 @@ incrementally maintained correctly.
 - [ ] `FOREACH (x IN list | clause)`
 - [ ] Target: `SchemaAcceptance`, `ForeachAcceptance`; TCK ≥80%
 
-**Exit criteria**: ≥80% TCK pass; pg-trickle 72-hour soak test passes with
-zero drift; all write clauses work correctly under concurrent access; IMMEDIATE
+**Exit criteria**: ≥80% TCK pass; AGE comparison benchmark published and
+passes the 2× gate on IS-3; pg-trickle 72-hour soak test passes with zero
+drift; all write clauses work correctly under concurrent access; IMMEDIATE
 constraint views catch violations in-transaction.
 
 ---
 
-### Phase 8 — Performance Hardening and TCK ≥95% (v0.14.0–v0.16.0)
+### Phase 8 — Performance Hardening and TCK ≥95% (v0.15.0–v0.17.0)
 
-**v0.14.0 — Query optimisation**:
+**v0.15.0 — Query optimisation**:
 - [ ] Cost model for AM scan operators: adjacency-follow O(degree) vs B-tree
       O(log N + degree) using `pg_class.reltuples` for label selectivity
 - [ ] Join order enumeration for multi-hop MATCH patterns
@@ -1752,7 +1780,7 @@ constraint views catch violations in-transaction.
 - [ ] `pg_eddy.cypher_explain(analyze := TRUE)` with per-operator timings
 - [ ] Parallel label scan via PostgreSQL parallel worker infrastructure
 
-**v0.15.0 — TCK gap closure**:
+**v0.16.0 — TCK gap closure**:
 - [ ] Temporal type arithmetic (`src/cypher/temporal.rs`): ISO 8601 duration
       arithmetic, timezone-aware datetime operations (see §10.7 — the hardest
       feature group in the entire TCK; budget accordingly)
@@ -1761,10 +1789,11 @@ constraint views catch violations in-transaction.
 - [ ] `null_semantics.sql` regression suite covers all `NullAcceptance`
       scenarios
 
-**v0.16.0 — Production readiness**:
-- [ ] LDBC SNB IS-1 through IS-7 and IC-1 through IC-14 benchmarked; published
-      baselines with hardware spec, dataset size, and raw output; compared
-      against AGE on identical hardware
+**v0.17.0 — Production readiness**:
+- [ ] LDBC SNB IS-1 through IS-7 and IC-1 through IC-14 benchmarked in full
+      (extending the v0.12.x IS-1/IS-3 baseline to the complete suite);
+      published baselines with hardware spec, dataset size, and raw output;
+      compared against AGE on identical hardware
 - [ ] CI performance gate: LDBC SNB IS regression `>10%` fails build
 - [ ] `pg_eddy.stats()`, `pg_eddy.health_check()`, `pg_eddy.query_log`
 - [ ] `pg_stat_pg_eddy` view
@@ -1778,9 +1807,11 @@ constraint views catch violations in-transaction.
 - [ ] Docker image + CNPG CloudNativePG extension image published
 - [ ] `justfile` release workflow: tag, build, publish to ghcr.io
 
-**Exit criteria** (v1.0 readiness): ≥95% TCK pass; LDBC SNB published
-baselines; pg-trickle IVM soak test passed; pg_dump round-trip verified;
-`pg_eddy.health_check()` returns OK; Docker + CNPG images published.
+**Exit criteria** (v1.0 readiness): ≥95% TCK pass; LDBC SNB full suite
+published baselines (IS-1 through IS-7, IC-1 through IC-14); AGE comparison
+passes 2× gate on IS-3 (first confirmed at v0.12.x); pg-trickle IVM soak
+test passed; pg_dump round-trip verified; `pg_eddy.health_check()` returns
+OK; Docker + CNPG images published.
 
 ---
 
