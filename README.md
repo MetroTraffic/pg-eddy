@@ -19,36 +19,9 @@ pg_eddy delivers **adjacency-aware graph storage** inside PostgreSQL. Instead of
 - **Faster multi-hop queries**: adjacency-follow design is 2–5× faster than AGE on MATCH patterns
 - **Incremental view maintenance**: optional integration with [pg-trickle](https://github.com/trickle-labs/pg-trickle) for incrementally-maintained graph views
 
-## Features (Current & Planned)
+## Status
 
-### ✅ Delivered (v0.1–v0.2)
-
-- [x] Custom Table Access Method with split-region node pages (Region 1: adjacency headers, Region 2: MVCC records)
-- [x] WAL-safe node insertion and crash recovery via `XLOG_PG_EDDY_NODE_INSERT`
-- [x] Property binary encoding: 12 type tags (Integer, Float, String, List, Map, Date, Duration, etc.)
-- [x] Label and property-key registry with SPI-backed catalog
-- [x] Basic CRUD: `create_node()`, `get_node()`, `node_count()`
-- [x] Health check: `pg_eddy.health_check()` → `'pg_eddy OK'`
-
-### 🚧 In Progress (v0.3–v0.5)
-
-- [ ] Edge storage with singly-linked adjacency chains
-- [ ] Logical deletes (set xmax) and VACUUM compaction
-- [ ] MVCC isolation and transaction abort handling
-- [ ] B-tree indexes on labels, types, and properties
-- [ ] Bulk CSV import (`load_csv_nodes()`, `load_csv_edges()`)
-
-### 📋 Planned (v0.6–v1.0+)
-
-- [ ] OpenCypher query engine (parser, planner, SQL codegen)
-- [ ] `pg_eddy.cypher()` function
-- [ ] Variable-length paths, aggregation, subqueries
-- [ ] Full write language (CREATE, MERGE, DELETE)
-- [ ] pg-trickle integration: incremental graph views
-- [ ] Constraint graphs (IMMEDIATE refresh mode)
-- [ ] WAL-based CDC output plugin (post-v1.0)
-
-See [plans/implementation_plan.md](plans/implementation_plan.md) for the complete phased roadmap.
+For a detailed feature breakdown and release history, see [CHANGELOG.md](CHANGELOG.md). For the complete roadmap with phases, exit criteria, and design rationale, see [plans/implementation_plan.md](plans/implementation_plan.md).
 
 ## Installation
 
@@ -203,21 +176,6 @@ just lint       # Run clippy
 just run        # Start a development PostgreSQL instance
 ```
 
-## Project Phases
-
-| Phase | Version | Goal | Status |
-|---|---|---|---|
-| **0** | v0.1.0 | AM skeleton, extension loads | ✅ Released |
-| **1** | v0.2.0 | Node storage, MVCC, WAL | ✅ Released |
-| **2** | v0.3.0 | Edge storage, adjacency chains | 🚧 In Progress |
-| **3** | v0.4.0 | VACUUM, pg-trickle verification | 📋 Planned |
-| **4** | v0.5.0 | Indexes, constraints, bulk import | 📋 Planned |
-| **5** | v0.6–v0.7 | Cypher parser & basic queries | 📋 Planned |
-| **6** | v0.8–v0.10 | Full query language, aggregation | 📋 Planned |
-| **7** | v0.11–v0.13 | Write language & IVM | 📋 Planned |
-
-See [plans/implementation_plan.md](plans/implementation_plan.md) for detailed exit criteria and deliverables.
-
 ## Performance Expectations
 
 pg_eddy targets **2–5× faster** multi-hop MATCH patterns than Apache AGE on graphs that fit in `shared_buffers`. Per-hop traversal is O(degree) via adjacency-follow (no index lookups).
@@ -236,15 +194,7 @@ pg_eddy targets **2–5× faster** multi-hop MATCH patterns than Apache AGE on g
 
 ## Contributing
 
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-### Key Areas for Contribution
-
-- **Phase 2 (Edge Storage)**: implement `tuple_insert` and `tuple_delete` for edges
-- **Phase 3 (VACUUM)**: build the `relation_vacuum` callback and chain compaction
-- **Phase 5 (Cypher Parser)**: hand-written recursive-descent lexer/parser with TCK harness
-- **Testing**: expand unit tests, property-based tests, crash recovery tests
-- **Benchmarks**: micro-benchmark harness against AGE and Neo4j
+We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines, and [plans/implementation_plan.md](plans/implementation_plan.md) for the current phase and next priorities.
 
 ## Compatibility
 
@@ -278,11 +228,3 @@ pg_eddy's design draws inspiration from:
 ## Roadmap
 
 See [plans/implementation_plan.md](plans/implementation_plan.md) for the detailed technical roadmap with phase gates, exit criteria, and strategic rationale.
-
-**Next milestone (v0.3.0)**: Edge storage with singly-linked adjacency chains, logical deletes, and VACUUM compaction.
-
----
-
-**Current Version**: [v0.2.0](https://github.com/trickle-labs/pg-eddy/releases/tag/v0.2.0) (2026-05-09)
-
-**Maintenance Status**: Active development. Phase 1 complete; Phase 2 in progress.
