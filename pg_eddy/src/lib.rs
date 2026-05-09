@@ -1,4 +1,4 @@
-// pg_eddy — Phase 4: Label index, overflow props, physical VACUUM (v0.5.0)
+// pg_eddy — Phase 4.x v0.5.1: TAP infra, rel-type indexes, find_edges
 //
 // This is the extension entry point.  At _PG_init we:
 //   1. Register the custom WAL resource manager.
@@ -18,7 +18,7 @@ pgrx::pg_module_magic!();
 // ---------------------------------------------------------------------------
 // Extension SQL — schemas, registry tables, AM objects, and SQL functions.
 // ---------------------------------------------------------------------------
-extension_sql_file!("../sql/pg_eddy--0.5.0.sql", name = "pg_eddy_schema", finalize);
+extension_sql_file!("../sql/pg_eddy--0.5.1.sql", name = "pg_eddy_schema", finalize);
 
 // ---------------------------------------------------------------------------
 // _PG_init  — runs at postmaster start (shared_preload_libraries)
@@ -132,7 +132,7 @@ fn get_node(node_id: i64) -> Option<pgrx::JsonB> {
 }
 
 /// Count all visible nodes in the graph.
-#[pg_extern]
+#[pg_extern(name = "count_nodes")]
 fn node_count() -> i64 {
     unsafe {
         use pgrx::pg_sys;
@@ -237,6 +237,21 @@ fn create_edge(
         pg_sys::table_close(node_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
     }
 
+    // Maintain rel-type catalog indexes (v0.5.1).
+    Spi::run_with_args(
+        "INSERT INTO _pg_eddy.edge_type_src(type_id, src_node_id, edge_id)
+         VALUES ($1, $2, $3)",
+        &[DatumWithOid::from(type_id), DatumWithOid::from(source), DatumWithOid::from(edge_id)],
+    )
+    .unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_src insert: {e}"));
+
+    Spi::run_with_args(
+        "INSERT INTO _pg_eddy.edge_type_dst(type_id, dst_node_id, edge_id)
+         VALUES ($1, $2, $3)",
+        &[DatumWithOid::from(type_id), DatumWithOid::from(target), DatumWithOid::from(edge_id)],
+    )
+    .unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_dst insert: {e}"));
+
     edge_id
 }
 
@@ -278,17 +293,33 @@ fn get_edge(rel_id: i64) -> Option<pgrx::JsonB> {
 /// Returns `true` if the edge was found and deleted, `false` if not found.
 #[pg_extern]
 fn delete_edge(rel_id: i64) -> bool {
-    unsafe {
+    let found = unsafe {
         use pgrx::pg_sys;
         let edge_rel = open_edges_relation();
-        let found = crate::storage::edge_store::delete_edge(edge_rel, rel_id);
+        let f = crate::storage::edge_store::delete_edge(edge_rel, rel_id);
         pg_sys::table_close(edge_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
-        found
+        f
+    };
+
+    if found {
+        // Remove from rel-type catalog indexes (v0.5.1).
+        Spi::run_with_args(
+            "DELETE FROM _pg_eddy.edge_type_src WHERE edge_id = $1",
+            &[DatumWithOid::from(rel_id)],
+        )
+        .unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_src delete: {e}"));
+        Spi::run_with_args(
+            "DELETE FROM _pg_eddy.edge_type_dst WHERE edge_id = $1",
+            &[DatumWithOid::from(rel_id)],
+        )
+        .unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_dst delete: {e}"));
     }
+
+    found
 }
 
 /// Count all non-deleted edges in the graph.
-#[pg_extern]
+#[pg_extern(name = "count_edges")]
 fn edge_count() -> i64 {
     unsafe {
         use pgrx::pg_sys;
@@ -337,6 +368,140 @@ fn neighbours(
             if e.source_node_id == node_id { e.target_node_id } else { e.source_node_id }
         }
     }).collect();
+
+    SetOfIterator::new(ids.into_iter())
+}
+
+/// Find edge IDs connecting specific endpoints and/or of a specific type.
+///
+/// All parameters are optional filters; pass `NULL` to skip a filter:
+/// - `src_node_id` — only edges originating from this node
+/// - `dst_node_id` — only edges terminating at this node
+/// - `rel_type`    — only edges of this relationship type
+///
+/// When `rel_type` AND either endpoint is given, uses the catalog index tables
+/// (`_pg_eddy.edge_type_src` / `_pg_eddy.edge_type_dst`) for an O(|result|)
+/// lookup. Without a type filter falls back to the adjacency chain.
+///
+/// Returns each matching edge's `rel_id`.
+#[pg_extern]
+fn find_edges(
+    src_node_id: Option<i64>,
+    dst_node_id: Option<i64>,
+    rel_type: Option<String>,
+) -> SetOfIterator<'static, i64> {
+    use crate::catalog::labels::ensure_rel_type;
+    use crate::storage::edge_store::{Direction, adjacency_follow};
+
+    let type_id_opt: Option<i32> = rel_type.as_deref().map(ensure_rel_type);
+
+    // Fast path: type + src → use edge_type_src index.
+    if let (Some(tid), Some(src)) = (type_id_opt, src_node_id) {
+        let rows = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT edge_id FROM _pg_eddy.edge_type_src
+                      WHERE type_id = $1 AND src_node_id = $2",
+                    None,
+                    &[DatumWithOid::from(tid), DatumWithOid::from(src)],
+                )
+                .unwrap_or_else(|e| pgrx::error!("pg_eddy find_edges SPI: {e}"))
+                .map(|row| {
+                    row["edge_id"]
+                        .value::<i64>()
+                        .unwrap_or(None)
+                        .unwrap_or(0)
+                })
+                .collect::<Vec<i64>>()
+        });
+        let filtered: Vec<i64> = if let Some(dst) = dst_node_id {
+            // Secondary filter by destination via edge_type_dst.
+            let dst_set: std::collections::HashSet<i64> = Spi::connect(|client| {
+                client
+                    .select(
+                        "SELECT edge_id FROM _pg_eddy.edge_type_dst
+                          WHERE type_id = $1 AND dst_node_id = $2",
+                        None,
+                        &[DatumWithOid::from(tid), DatumWithOid::from(dst)],
+                    )
+                    .unwrap_or_else(|e| pgrx::error!("pg_eddy find_edges SPI: {e}"))
+                    .map(|row| row["edge_id"].value::<i64>().unwrap_or(None).unwrap_or(0))
+                    .collect()
+            });
+            rows.into_iter().filter(|eid| dst_set.contains(eid)).collect()
+        } else {
+            rows
+        };
+        return SetOfIterator::new(filtered.into_iter());
+    }
+
+    // Fast path: type + dst → use edge_type_dst index.
+    if let (Some(tid), Some(dst)) = (type_id_opt, dst_node_id) {
+        let rows = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT edge_id FROM _pg_eddy.edge_type_dst
+                      WHERE type_id = $1 AND dst_node_id = $2",
+                    None,
+                    &[DatumWithOid::from(tid), DatumWithOid::from(dst)],
+                )
+                .unwrap_or_else(|e| pgrx::error!("pg_eddy find_edges SPI: {e}"))
+                .map(|row| row["edge_id"].value::<i64>().unwrap_or(None).unwrap_or(0))
+                .collect::<Vec<i64>>()
+        });
+        return SetOfIterator::new(rows.into_iter());
+    }
+
+    // Fallback: use adjacency chain for endpoint-only filters.
+    let anchor_node = src_node_id.or(dst_node_id);
+    let dir = if src_node_id.is_some() { Direction::Out } else if dst_node_id.is_some() { Direction::In } else { Direction::Both };
+
+    let edges = if let Some(node) = anchor_node {
+        unsafe {
+            use pgrx::pg_sys;
+            let node_rel = open_nodes_relation();
+            let edge_rel = open_edges_relation();
+            let snapshot = pg_sys::GetActiveSnapshot();
+            let result = adjacency_follow(node_rel, edge_rel, node, dir, type_id_opt, snapshot);
+            pg_sys::table_close(edge_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+            pg_sys::table_close(node_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+            result
+        }
+    } else if let Some(tid) = type_id_opt {
+        // Type-only filter with no endpoint: use the src catalog index (covers all edges of that type).
+        let rows = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT edge_id FROM _pg_eddy.edge_type_src WHERE type_id = $1",
+                    None,
+                    &[DatumWithOid::from(tid)],
+                )
+                .unwrap_or_else(|e| pgrx::error!("pg_eddy find_edges SPI: {e}"))
+                .map(|row| row["edge_id"].value::<i64>().unwrap_or(None).unwrap_or(0))
+                .collect::<Vec<i64>>()
+        });
+        return SetOfIterator::new(rows.into_iter());
+    } else {
+        // No filters at all: full edge scan via adjacency chains from every node.
+        // This is O(N+E) — use only for small graphs or tooling purposes.
+        Spi::connect(|client| {
+            client
+                .select("SELECT edge_id FROM _pg_eddy.edge_type_src", None, &[])
+                .unwrap_or_else(|e| pgrx::error!("pg_eddy find_edges SPI: {e}"))
+                .map(|row| row["edge_id"].value::<i64>().unwrap_or(None).unwrap_or(0))
+                .collect::<Vec<i64>>()
+        });
+        // Return empty — callers should always supply at least one filter.
+        return SetOfIterator::new(std::iter::empty());
+    };
+
+    // Apply remaining dst filter if we traversed from src.
+    let ids: Vec<i64> = edges
+        .into_iter()
+        .filter(|e| dst_node_id.map_or(true, |d| e.target_node_id == d))
+        .filter(|e| src_node_id.map_or(true, |s| e.source_node_id == s))
+        .map(|e| e.edge_id)
+        .collect();
 
     SetOfIterator::new(ids.into_iter())
 }
@@ -638,6 +803,22 @@ fn detach_delete_node(node_id: i64) -> bool {
             crate::storage::edge_store::delete_edge(edge_rel, *eid);
         }
         pg_sys::table_close(edge_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+    }
+
+    // Clean up rel-type catalog indexes for deleted edges (v0.5.1).
+    if !all_edge_ids.is_empty() {
+        // Use ANY($1) to delete all in one round-trip.
+        let ids_array: Vec<i64> = all_edge_ids.clone();
+        Spi::run_with_args(
+            "DELETE FROM _pg_eddy.edge_type_src WHERE edge_id = ANY($1)",
+            &[DatumWithOid::from(ids_array.as_slice())],
+        )
+        .unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_src batch delete: {e}"));
+        Spi::run_with_args(
+            "DELETE FROM _pg_eddy.edge_type_dst WHERE edge_id = ANY($1)",
+            &[DatumWithOid::from(ids_array.as_slice())],
+        )
+        .unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_dst batch delete: {e}"));
     }
 
     // Delete the node.
@@ -1232,6 +1413,46 @@ mod tests {
         let result = crate::get_node(node_id).expect("big node should be visible");
         let data = result.0["properties"]["data"].as_str().unwrap();
         assert_eq!(data.len(), 2500, "overflow props should be fully recovered");
+    }
+
+    #[pg_test]
+    fn test_find_edges() {
+        let a = crate::create_node(vec!["A".into()], pgrx::JsonB(serde_json::json!({})));
+        let b = crate::create_node(vec!["B".into()], pgrx::JsonB(serde_json::json!({})));
+        let c = crate::create_node(vec!["C".into()], pgrx::JsonB(serde_json::json!({})));
+
+        let e1 = crate::create_edge(a, b, "KNOWS", pgrx::JsonB(serde_json::json!({})));
+        let e2 = crate::create_edge(a, c, "KNOWS", pgrx::JsonB(serde_json::json!({})));
+        let e3 = crate::create_edge(b, c, "LIKES", pgrx::JsonB(serde_json::json!({})));
+
+        // src filter
+        let from_a: Vec<i64> = crate::find_edges(Some(a), None, None).collect();
+        assert_eq!(from_a.len(), 2, "2 edges from A");
+        assert!(from_a.contains(&e1) && from_a.contains(&e2));
+
+        // dst filter
+        let to_c: Vec<i64> = crate::find_edges(None, Some(c), None).collect();
+        assert_eq!(to_c.len(), 2, "2 edges to C");
+        assert!(to_c.contains(&e2) && to_c.contains(&e3));
+
+        // type + src (index path)
+        let a_knows: Vec<i64> = crate::find_edges(Some(a), None, Some("KNOWS".into())).collect();
+        assert_eq!(a_knows.len(), 2, "2 KNOWS edges from A");
+
+        // type + dst (index path)
+        let likes_to_c: Vec<i64> = crate::find_edges(None, Some(c), Some("LIKES".into())).collect();
+        assert_eq!(likes_to_c.len(), 1, "1 LIKES edge to C");
+        assert_eq!(likes_to_c[0], e3);
+
+        // src + dst + type (intersection)
+        let a_to_b_knows: Vec<i64> = crate::find_edges(Some(a), Some(b), Some("KNOWS".into())).collect();
+        assert_eq!(a_to_b_knows.len(), 1, "1 KNOWS edge from A to B");
+        assert_eq!(a_to_b_knows[0], e1);
+
+        // delete and verify removal from index
+        assert!(crate::delete_edge(e3));
+        let likes_after: Vec<i64> = crate::find_edges(None, Some(c), Some("LIKES".into())).collect();
+        assert!(likes_after.is_empty(), "LIKES edge should be gone from index after delete");
     }
 }
 

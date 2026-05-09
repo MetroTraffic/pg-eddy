@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "pg_eddy"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "pgrx",
  "pgrx-tests",
@@ -933,7 +933,7 @@ dependencies = [
 
 [[package]]
 name = "pg_eddy_http"
-version = "0.5.0"
+version = "0.5.1"
 
 [[package]]
 name = "pgrx"

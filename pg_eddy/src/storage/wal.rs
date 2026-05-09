@@ -414,19 +414,25 @@ unsafe fn redo_node_insert(record: *mut pg_sys::XLogReaderState) {
     // If this was a NODE_INSERT_OVF record, handle the overflow block (block 1).
     // With REGBUF_FORCE_IMAGE the full overflow page image was captured;
     // XLogReadBufferForRedo restores it automatically.
-    let mut ovf_buf: pg_sys::Buffer = 0;
-    let ovf_action = unsafe { pg_sys::XLogReadBufferForRedo(record, 1, &mut ovf_buf) };
-    if ovf_action == pg_sys::XLogRedoAction::BLK_RESTORED {
-        // Overflow page restored from full page image; mark dirty.
-        let lsn = unsafe { xlog_rec_get_lsn(record) };
-        let ovf_page = unsafe { pg_sys::BufferGetPage(ovf_buf) };
-        unsafe {
-            pg_sys::PageSetLSN(ovf_page, lsn);
-            pg_sys::MarkBufferDirty(ovf_buf);
+    // IMPORTANT: only do this for OVF records; regular NODE_INSERT records have
+    // no block 1 and calling XLogReadBufferForRedo for it would PANIC.
+    let is_ovf = unsafe { xlog_rec_get_info(record) } & !(pg_sys::XLR_INFO_MASK as u8)
+        == XLOG_PG_EDDY_NODE_INSERT_OVF;
+    if is_ovf {
+        let mut ovf_buf: pg_sys::Buffer = 0;
+        let ovf_action = unsafe { pg_sys::XLogReadBufferForRedo(record, 1, &mut ovf_buf) };
+        if ovf_action == pg_sys::XLogRedoAction::BLK_RESTORED {
+            // Overflow page restored from full page image; mark dirty.
+            let lsn = unsafe { xlog_rec_get_lsn(record) };
+            let ovf_page = unsafe { pg_sys::BufferGetPage(ovf_buf) };
+            unsafe {
+                pg_sys::PageSetLSN(ovf_page, lsn);
+                pg_sys::MarkBufferDirty(ovf_buf);
+            }
         }
-    }
-    if ovf_buf != 0 {
-        unsafe { pg_sys::UnlockReleaseBuffer(ovf_buf) };
+        if ovf_buf != 0 {
+            unsafe { pg_sys::UnlockReleaseBuffer(ovf_buf) };
+        }
     }
 }
 

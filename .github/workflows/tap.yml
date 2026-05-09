@@ -1,0 +1,79 @@
+name: TAP Tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tap:
+    name: TAP crash / MVCC / concurrency tests (PG18)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL 18 + dev headers
+        run: |
+          sudo sh -c 'curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | gpg --dearmor -o /usr/share/keyrings/postgresql.gpg'
+          echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] \
+            http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            postgresql-18 \
+            postgresql-server-dev-18 \
+            libssl-dev \
+            pkg-config \
+            perl \
+            cpanminus
+
+      - name: Install TAP::Parser::SourceHandler::pgTAP
+        run: sudo cpanm --notest TAP::Parser::SourceHandler::pgTAP
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@1.85
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-tap-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-tap-
+
+      - name: Install cargo-pgrx
+        run: OPENSSL_NO_VENDOR=1 cargo install cargo-pgrx --version 0.18.0 --locked
+
+      - name: Initialize pgrx with PG18
+        run: cargo pgrx init --pg18 /usr/lib/postgresql/18/bin/pg_config
+
+      - name: Build release extension
+        working-directory: pg_eddy
+        run: cargo pgrx package --pg-config /usr/lib/postgresql/18/bin/pg_config
+
+      - name: Install extension into system PostgreSQL
+        run: |
+          # pgrx package puts files under target/release/pg_eddy-pg18/
+          PG_LIB=$(pg_config --pkglibdir)
+          PG_EXT=$(pg_config --sharedir)/extension
+          sudo cp target/release/pg_eddy-pg18/usr/lib/postgresql/18/lib/pg_eddy.so "$PG_LIB/"
+          sudo cp target/release/pg_eddy-pg18/usr/share/postgresql/18/extension/pg_eddy*.sql "$PG_EXT/"
+          sudo cp target/release/pg_eddy-pg18/usr/share/postgresql/18/extension/pg_eddy.control "$PG_EXT/"
+
+      - name: Run TAP tests
+        env:
+          # PostgreSQL::Test::Cluster needs to know where binaries are.
+          PG_CONFIG: /usr/lib/postgresql/18/bin/pg_config
+          PGHOST: /tmp
+        run: |
+          export PATH="/usr/lib/postgresql/18/bin:$PATH"
+          export PERL5LIB="/usr/lib/postgresql/18/lib/pgxs/src/test/perl:$PERL5LIB"
+          prove -v tests/tap/

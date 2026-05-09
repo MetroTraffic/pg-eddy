@@ -694,7 +694,7 @@ unsafe fn find_or_extend_page(rel: pg_sys::Relation, item_size: usize) -> pg_sys
 unsafe fn read_node_at_offset(
     page: pg_sys::Page,
     _buf: pg_sys::Buffer,
-    _snapshot: pg_sys::Snapshot,
+    snapshot: pg_sys::Snapshot,
     off: pg_sys::OffsetNumber,
 ) -> Option<NodeRecord> {
     let iid = unsafe { pg_sys::PageGetItemId(page, off) };
@@ -706,20 +706,41 @@ unsafe fn read_node_at_offset(
     let item_len = unsafe { (*iid).lp_len() } as usize;
     let item = unsafe { pg_sys::PageGetItem(page as *const _, iid) as *const u8 };
 
-    // MVCC xmin check: exclude tuples from aborted or in-progress transactions.
+    // MVCC xmin check: the inserting transaction must be committed and visible
+    // to this snapshot.
     let hdr = item as *const pg_sys::HeapTupleHeaderData;
     let infomask = unsafe { (*hdr).t_infomask };
     let xmin_committed = (infomask & pg_sys::HEAP_XMIN_COMMITTED as u16) != 0;
     let xmin_invalid_flag = (infomask & pg_sys::HEAP_XMIN_INVALID as u16) != 0;
     let xmin_visible = if xmin_committed {
-        true
+        // Committed — check it's not still in the snapshot (i.e., committed
+        // before the snapshot was taken).
+        let xmin = unsafe { (*hdr).t_choice.t_heap.t_xmin };
+        if snapshot.is_null() {
+            true
+        } else {
+            !unsafe { pg_sys::XidInMVCCSnapshot(xmin, snapshot) }
+        }
     } else if xmin_invalid_flag {
         false
     } else {
+        // Status not yet cached in infomask — check the xmin directly.
         let xmin = unsafe { (*hdr).t_choice.t_heap.t_xmin };
-        xmin != pg_sys::InvalidTransactionId
-            && (unsafe { pg_sys::TransactionIdIsCurrentTransactionId(xmin) }
-                || unsafe { pg_sys::TransactionIdDidCommit(xmin) })
+        if xmin == pg_sys::InvalidTransactionId {
+            false
+        } else if unsafe { pg_sys::TransactionIdIsCurrentTransactionId(xmin) } {
+            // This transaction's own insert is always visible to itself.
+            true
+        } else if unsafe { pg_sys::TransactionIdDidCommit(xmin) } {
+            // Committed — visible if not in snapshot.
+            if snapshot.is_null() {
+                true
+            } else {
+                !unsafe { pg_sys::XidInMVCCSnapshot(xmin, snapshot) }
+            }
+        } else {
+            false
+        }
     };
     if !xmin_visible {
         return None;

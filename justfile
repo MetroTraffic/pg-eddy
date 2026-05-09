@@ -12,6 +12,15 @@ dev:
 test:
     cargo pgrx test pg18
 
+# Run TAP crash / MVCC / concurrency tests against system PostgreSQL 18
+# Requires: TAP::Parser::SourceHandler::pgTAP (sudo cpanm TAP::Parser::SourceHandler::pgTAP)
+# and postgresql-server-dev-18 for PostgreSQL::Test::Cluster.
+tap:
+    PG_REGRESS=/usr/lib/postgresql/18/lib/pgxs/src/test/regress/pg_regress \
+    PERL5LIB="/usr/lib/postgresql/18/lib/pgxs/src/test/perl:$PERL5LIB" \
+    PATH="/usr/lib/postgresql/18/bin:$PATH" \
+    prove -v tests/tap/*.pl
+
 # Run clippy lints
 lint:
     cargo clippy --features pg18 -- -D warnings
