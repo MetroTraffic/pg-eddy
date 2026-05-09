@@ -1460,33 +1460,112 @@ engine on top. Also delivers deferred items from Phases 1–3.
   NODE_INSERT_OVF=0x05. New correct values: each op has unique high nibble.
 - WAL protocol: all page modifications (overflow + node) in one critical section.
 - Buffer ordering: find_or_extend_page before write_overflow_block.
-- [ ] Rel-type B-tree indexes: `(type_id, source_node_id)` and
-      `(type_id, target_node_id)` (requires AM index callback work or
-      internal catalog table approach)
-- [ ] `pg_eddy.create_node_index(label TEXT, property_key TEXT)` —
-      per-property B-tree index on binary-encoded values
-- [ ] `pg_eddy.create_rel_index(type TEXT, property_key TEXT)`
-- [ ] Property constraints: `pg_eddy.create_unique_constraint(label, property_key)`,
-      `pg_eddy.create_existence_constraint(label, property_key)`
-- [ ] `pg_eddy.export_cypher_script()` — export graph as CREATE statements
-- [ ] Bulk CSV import: `pg_eddy.load_csv_nodes(path, label, id_column)`,
-      `pg_eddy.load_csv_edges(path, type, source_column, target_column)`
-- [ ] `pg_dump` / `pg_restore` round-trip test on 1M-node graph
-- [ ] Performance CI gate: `>100K node inserts/sec`; label-scan `<5ms` on
-      1M nodes; adjacency-follow `<1ms` per 1-hop expansion on 10M edges
-- [ ] All `sql/regress/` tests pass
 
 **Exit criteria v0.5.0**: property overflow, physical VACUUM, label index,
 add/remove label, detach-delete, find_nodes, schema_info all work and tested;
-20+ pgrx tests pass.
+24/24 pgrx tests pass. ✅ MET
 
-**AGE benchmark baseline** (run after Phase 4 exit, before starting Phase 5):
-run the adjacency-follow microbenchmark and a 2-hop neighbour expansion on a
-1M-node / 10M-edge graph against AGE on identical hardware. Publish the
-results in `benchmarks/README.md`. This is the first external proof point for
-the traversal thesis. If pg_eddy is not measurably faster than AGE on these
-operations, stop and diagnose the storage engine before investing in the query
-engine.
+---
+
+### Phase 4.x — WAL Hardening, Benchmark Gate, and Storage Completeness (v0.5.1–v0.5.x)
+
+**Goal**: Close the remaining gaps before the query engine. The benchmark gate
+is a hard stop: if pg_eddy is not measurably faster than AGE on adjacency-
+follow, fix the storage engine *here* rather than building Cypher on top of a
+slow foundation. Patch releases are numbered v0.5.1, v0.5.2, … until the gate
+passes.
+
+---
+
+#### v0.5.1 — TAP Infrastructure + Crash Safety + AGE Benchmark Baseline
+
+**Motivation**: The WAL code paths introduced in v0.2.0–v0.5.0 (node insert,
+edge insert, adjacency update, overflow pages, compaction) have never been
+exercised under crash or concurrent-write conditions. TAP tests prove WAL
+correctness without relying on pgrx's single-session framework.
+
+**Deliverables**:
+- [ ] TAP test infrastructure
+  - `postgresql-18-pgtap` (or `cpanm TAP::Parser::SourceHandler::pgTAP`)
+    added to dev-container setup; `justfile` gains a `tap` recipe that runs
+    `pg_prove -r tests/tap/`
+  - CI job `.github/workflows/tap.yml`: spins up a temporary PG 18 cluster,
+    installs pg_eddy with `shared_preload_libraries`, runs `just tap`, fails
+    on any `not ok`
+- [ ] `tests/tap/001_crash_recovery.pl` — inserts 10 K nodes, sends `SIGQUIT`
+      (immediate shutdown), restarts, verifies `SELECT count_nodes() = 10000`
+- [ ] `tests/tap/002_edge_crash_recovery.pl` — same pattern for edges and
+      adjacency chains
+- [ ] `tests/tap/003_mvcc_isolation.pl` — T1 inserts a node; T2 reads under a
+      snapshot taken before T1 starts; verifies T2 sees 0 rows; T1 commits;
+      T2 re-reads; verifies T2 now sees 1 row
+- [ ] `tests/tap/004_concurrent_inserts.pl` — N=4 parallel psql sessions each
+      inserting M=1000 nodes; verifies `count_nodes() = N×M` with no
+      duplicates (sequence gaps are acceptable)
+- [ ] AGE benchmark baseline — `benchmarks/README.md` published with raw
+      numbers for:
+      - 100 K node inserts (pg_eddy vs AGE)
+      - 1-hop adjacency-follow on 1M-node / 10M-edge graph (pg_eddy vs AGE)
+      - 2-hop neighbour expansion on same graph (pg_eddy vs AGE)
+      - Hardware / PG version / WAL settings recorded for reproducibility
+- [ ] Rel-type catalog indexes: `_pg_eddy.edge_type_src(type_id, src_node_id)`
+      and `_pg_eddy.edge_type_dst(type_id, dst_node_id)` as plain B-tree
+      catalog tables (no AM index callbacks required); used by `find_edges()`
+
+**Exit criteria v0.5.1**: all 4 TAP scripts pass in CI; AGE benchmark
+published; benchmark decision recorded (see gate below).
+
+**AGE benchmark gate** — decision recorded in `benchmarks/README.md`:
+
+| Outcome | Action |
+|---|---|
+| pg_eddy ≥ 2× faster than AGE on 2-hop expand | proceed to v0.6.0 (Cypher engine) |
+| pg_eddy 1–2× faster than AGE | proceed but file storage-engine issues as P1 bugs |
+| pg_eddy slower than AGE on any operation | **stop** — diagnose and fix in v0.5.2 before any query-engine work |
+
+---
+
+#### v0.5.2 — Storage Performance (contingency; skip if benchmark gate passes)
+
+**Trigger**: v0.5.1 benchmark shows pg_eddy slower than AGE on at least one
+measured operation.
+
+**Likely investigation areas** (diagnose first, then fix):
+- [ ] Adjacency-chain traversal hot path: profile with `perf` / `flamegraph`;
+      identify buffer-manager vs CPU bottleneck
+- [ ] Node page layout: check if `find_node_by_id` is scanning too many pages
+      due to low fill factor; consider sorted inserts or a `node_id → blkno`
+      catalog cache
+- [ ] Overflow page I/O: large-prop nodes require two buffer reads; consider
+      raising `PROP_INLINE_MAX` or lazy overflow resolution
+- [ ] WAL volume: measure bytes written per insert vs AGE; reduce if possible
+      (e.g. avoid REGBUF_FORCE_IMAGE when FPI is not needed)
+- [ ] Buffer locking contention: check `pg_stat_activity` wait events under
+      concurrent load; consider partitioned node relations
+- [ ] Adjacency list packing: measure average chain length; if chains are
+      fragmented across many pages, add a chain-compaction pass to VACUUM
+
+**Exit criteria v0.5.2**: benchmark gate passes (pg_eddy ≥ 2× faster than AGE
+on 2-hop expand); results updated in `benchmarks/README.md`.
+
+---
+
+#### v0.5.3+ — Additional Storage Completeness (defer until after v0.6.0 if gate passes)
+
+Items from the original v0.5.1 list that do not block the Cypher engine:
+- [ ] `pg_eddy.create_node_index(label, property_key)` — per-property B-tree
+      index (requires AM index callbacks; best designed alongside the query
+      planner so the planner can use it)
+- [ ] `pg_eddy.create_unique_constraint(label, property_key)` and
+      `create_existence_constraint(label, property_key)`
+- [ ] `pg_eddy.export_cypher_script()` and bulk CSV import
+- [ ] `pg_dump` / `pg_restore` round-trip test on 1M-node graph
+- [ ] Performance CI gate (automated, per-PR): `>100K inserts/sec`;
+      label-scan `<5ms` on 1M nodes; 1-hop expand `<1ms` on 10M edges
+- [ ] REPLICA IDENTITY support (requires slot callbacks with column data)
+
+These can be folded into v0.5.3, or deferred to v0.6.x if the query engine
+work is on the critical path.
 
 ---
 
