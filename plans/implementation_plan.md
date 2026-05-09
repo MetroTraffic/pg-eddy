@@ -16,7 +16,7 @@ The project delivers two capabilities in deliberate sequence:
    traversal, native OpenCypher query engine targeting the openCypher TCK
    conformance suite, and proven performance advantage over AGE on multi-hop
    MATCH patterns
-2. **Incremental view maintenance** (layered, v0.4+ trigger CDC, post-v1.0
+2. **Incremental view maintenance** (layered, Phase 7 trigger CDC, post-v1.0
    WAL CDC): first-class integration with
    [pg-trickle](https://github.com/trickle-labs/pg-trickle) for
    incrementally-maintained graph views — a capability no other PostgreSQL
@@ -42,9 +42,9 @@ fails, pg-trickle integration is irrelevant. See §9 for the strategic phasing.
   features layer progressively on a stable core
 - **pg-trickle as a first-class optional**: IVM-backed graph views are a key
   product feature, not an afterthought — but the graph engine must prove its
-  traversal thesis before IVM investment scales up. Trigger-based CDC is
-  validated early (Phase 3) as a compatibility gate; WAL-based CDC is a
-  post-v1.0 performance unlock
+  traversal thesis before IVM investment scales up. Trigger-based CDC and full
+  IVM are built in Phase 7 on a proven, stable storage engine; WAL-based CDC
+  is a post-v1.0 performance unlock
 
 ### Target Users and Success Criteria
 
@@ -975,7 +975,7 @@ This requires explicit understanding of how pg-trickle's WAL mode works:
    triggers to capture the full changed row-set within the transaction. The
    executor populates transition tables by reading from the AM's result slots.
    pg_eddy's AM must implement the transition table callbacks correctly so that
-   IMMEDIATE mode gets valid row images. Verified in Phase 3.
+   IMMEDIATE mode gets valid row images. Verified in Phase 7 alongside IVM.
 
 **Bulk import CDC contract**: `pg_eddy.load_csv_nodes()` and
 `pg_eddy.load_csv_edges()` use SPI by default (trigger-based CDC works
@@ -997,8 +997,8 @@ custom integrations), and (2) the pg-trickle WAL CDC path described in §7.5.
 Implementation is deferred until after the graph engine and trigger-based IVM
 are proven. Current pg-trickle integration is trigger-based only (see above).
 
-**Verification gate** (Phase 3, v0.4.0): before writing the Cypher query
-engine, verify that:
+**Integration verification** (Phase 7, v0.11.0–v0.12.0): when implementing
+IVM in Phase 7, verify that:
 1. A pg-trickle stream table can be defined over a SQL SELECT on
    `pg_eddy.nodes` and `pg_eddy.edges`
 2. A Cypher `CREATE (n:Person {name:'Alice'})` (executed via SPI INSERT) causes
@@ -1015,9 +1015,6 @@ engine, verify that:
    incompatibility so users are not confused by silent data loss in WAL mode)
 7. Confirm that `create_graph_view()` correctly forces `cdc_mode = 'trigger'`
    on all pg_eddy source tables
-
-Failing any of tests 1–5 means the project cannot proceed. Tests 6–7 are
-verification of documented limitations and expected behaviour.
 
 ### 7.3 Constraint Graph Views (IMMEDIATE mode)
 
@@ -1223,12 +1220,10 @@ sequence, not in parallel:
    prove that adjacency-follow inside PostgreSQL's buffer manager is
    fundamentally faster than heap+index approaches. **If this fails, nothing
    else matters.**
-2. **Reactive graph maintenance** (Phase 3 gate → Phase 7 IVM → post-v1.0
-   WAL CDC): CDC integration, incremental view maintenance, streaming
-   semantics. Trigger-based CDC is validated early in Phase 3 as a
-   lightweight compatibility check. Full graph view IVM is built in Phase 7
-   on top of a proven, stable storage engine. WAL CDC (§7.5) is a post-v1.0
-   performance optimization.
+2. **Reactive graph maintenance** (Phase 7 IVM → post-v1.0 WAL CDC): CDC
+   integration, incremental view maintenance, streaming semantics. Full graph
+   view IVM is built in Phase 7 on top of a proven, stable storage engine.
+   WAL CDC (§7.5) is a post-v1.0 performance optimization.
 
 This sequencing reduces risk (blurred failure signals when debugging storage
 vs CDC simultaneously), increases velocity (focused iteration on one hard
@@ -1372,11 +1367,11 @@ ordering prevents deadlocks under concurrent edge inserts to the same node.
 
 ---
 
-### Phase 3 — MVCC, VACUUM, and pg-trickle Verification (v0.4.0)
+### Phase 3 — MVCC and VACUUM (v0.4.0)
 
-**Goal**: Prove MVCC correctness and prove that pg-trickle works on the
-custom AM. **This is the go/no-go gate for the project.** Build nothing further
-until all six CDC verification tests pass.
+**Goal**: Prove MVCC correctness and storage durability on the custom AM.
+**This is the storage correctness gate.** Build nothing further until all
+MVCC and VACUUM tests pass.
 
 **Deliverables**:
 - [ ] Node update: `tuple_update` callback — new MVCC version of Region 2;
@@ -1389,41 +1384,15 @@ until all six CDC verification tests pass.
 - [ ] VACUUM: `relation_vacuum` callback — identify dead slots (xmax visible
       to all active transactions), reclaim slot space, rebuild adjacency
       chains skipping dead edges, correct degree counters (see §5.7)
-- [ ] **REPLICA IDENTITY for CDC**: node and edge tables declare `node_id` /
-      `rel_id` as the AM-level primary key and expose `REPLICA IDENTITY
-      DEFAULT`. Verify that DELETE triggers see correct `OLD.node_id` values
-      in pg-trickle's change buffer (without REPLICA IDENTITY, pg-trickle
-      falls back to full refresh and loses differential incrementality)
-- [ ] **Transition table support (IMMEDIATE mode)**: implement the AM
-      transition table callbacks so that `REFERENCING NEW TABLE AS new_rows
-      OLD TABLE AS old_rows` in AFTER triggers captures the correct row-set.
-      Verified by creating a test stream table with `refresh_mode =
-      'IMMEDIATE'` and confirming it updates within the same transaction
-- [ ] **pg-trickle CDC integration — all seven tests must pass**:
-  - [ ] Create a pg-trickle stream table over a SQL SELECT on `pg_eddy.nodes`
-        with `cdc_mode = 'trigger'` (mandatory for custom AM tables — see §7.2)
-  - [ ] `pg_eddy.create_node(ARRAY['Person'], '{"name":"Alice"}')` causes the
-        stream table to update on the next pg-trickle tick
-  - [ ] `pg_eddy.delete_node(id)` causes the row to be removed from the
-        stream table; OLD row data is correct (REPLICA IDENTITY verified)
-  - [ ] DIFFERENTIAL mode: only the changed rows are processed per tick
-  - [ ] IMMEDIATE mode: stream table updates within the same transaction as
-        the write, via transition tables
-  - [ ] Setting `pg_trickle.cdc_mode = 'wal'` on a pg_eddy source table
-        captures **zero** changes (expected; documents the pgoutput
-        incompatibility; pg_eddy emits a WARNING if WAL mode is active)
-  - [ ] `create_graph_view()` automatically forces `cdc_mode = 'trigger'`
+- [ ] **REPLICA IDENTITY**: node and edge tables declare `node_id` / `rel_id`
+      as the AM-level primary key and expose `REPLICA IDENTITY DEFAULT`.
+      Verify that DELETE triggers see correct `OLD.node_id` values (required
+      for correct trigger-based CDC when pg-trickle is integrated in Phase 7)
 - [ ] `pg_eddy.am_stats() RETURNS JSONB` — page utilisation, slot density,
       fragmentation, dead-slot count
 
-**Exit criteria**: all seven pg-trickle CDC tests pass; MVCC isolation test
-passes; VACUUM reclaims dead slots and cleans adjacency lists. If any CDC test
-fails, diagnose and fix before proceeding to Phase 4.
-
-> **Note**: the logical decoding output plugin (`wal_decode.rs`) and WAL CDC
-> spike are **not** Phase 3 deliverables. The output plugin is post-v1.0 work
-> (see §7.5). Phase 3 validates trigger-based CDC only — the minimum needed
-> to confirm pg-trickle compatibility before building the query engine.
+**Exit criteria**: MVCC isolation test passes; VACUUM reclaims dead slots and
+cleans adjacency lists; `am_stats()` returns correct metrics.
 
 ---
 

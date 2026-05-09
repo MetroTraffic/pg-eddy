@@ -1,4 +1,4 @@
-// pg_eddy — Phase 1: Node Storage
+// pg_eddy — Phase 2: Edge Storage + Adjacency Lists
 //
 // This is the extension entry point.  At _PG_init we:
 //   1. Register the custom WAL resource manager.
@@ -17,7 +17,7 @@ pgrx::pg_module_magic!();
 // ---------------------------------------------------------------------------
 // Extension SQL — schemas, registry tables, AM objects, and SQL functions.
 // ---------------------------------------------------------------------------
-extension_sql_file!("../sql/pg_eddy--0.2.0.sql", name = "pg_eddy_schema", finalize);
+extension_sql_file!("../sql/pg_eddy--0.3.0.sql", name = "pg_eddy_schema", finalize);
 
 // ---------------------------------------------------------------------------
 // _PG_init  — runs at postmaster start (shared_preload_libraries)
@@ -152,6 +152,233 @@ unsafe fn open_nodes_relation() -> pgrx::pg_sys::Relation {
     unsafe { pg_sys::table_open(rel_oid, pg_sys::NoLock as pg_sys::LOCKMODE) }
 }
 
+/// Open `_pg_eddy.edges` with `NoLock`.
+///
+/// # Safety
+/// The returned `Relation` must be closed before the current transaction ends.
+unsafe fn open_edges_relation() -> pgrx::pg_sys::Relation {
+    use pgrx::pg_sys;
+
+    let schema_name = std::ffi::CString::new("_pg_eddy").unwrap();
+    let rel_name = std::ffi::CString::new("edges").unwrap();
+
+    let schema_oid = unsafe { pg_sys::get_namespace_oid(schema_name.as_ptr(), false) };
+    let rel_oid = unsafe { pg_sys::get_relname_relid(rel_name.as_ptr(), schema_oid) };
+
+    if rel_oid == pg_sys::Oid::INVALID {
+        error!("pg_eddy: relation _pg_eddy.edges not found");
+    }
+
+    unsafe { pg_sys::table_open(rel_oid, pg_sys::NoLock as pg_sys::LOCKMODE) }
+}
+
+// ---------------------------------------------------------------------------
+// Edge API SQL functions
+// ---------------------------------------------------------------------------
+
+/// Create an edge between two existing nodes.
+///
+/// `source`     — node_id of the source (start) node.
+/// `target`     — node_id of the target (end) node.
+/// `rel_type`   — relationship type name (e.g. `'KNOWS'`).
+/// `properties` — JSONB property map (may be `'{}'`).
+///
+/// Returns the new edge's rel_id.
+#[pg_extern]
+fn create_edge(
+    source: i64,
+    target: i64,
+    rel_type: &str,
+    properties: pgrx::JsonB,
+) -> i64 {
+    use crate::catalog::labels::{ensure_prop_key, ensure_rel_type, next_edge_id};
+    use crate::storage::prop_store;
+
+    let type_id = ensure_rel_type(rel_type);
+
+    let prop_obj = match &properties.0 {
+        serde_json::Value::Object(m) => m.clone(),
+        _ => serde_json::Map::new(),
+    };
+    let prop_bytes = prop_store::encode(&prop_obj, |name| -> Result<i32, std::convert::Infallible> {
+        Ok(ensure_prop_key(name))
+    })
+    .unwrap_or_default();
+
+    let edge_id = next_edge_id();
+
+    unsafe {
+        use pgrx::pg_sys;
+        let node_rel = open_nodes_relation();
+        let edge_rel = open_edges_relation();
+        crate::storage::edge_store::insert_edge(
+            node_rel, edge_rel, edge_id, type_id, source, target, &prop_bytes,
+        );
+        pg_sys::table_close(edge_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        pg_sys::table_close(node_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+    }
+
+    edge_id
+}
+
+/// Retrieve an edge by its rel_id, returning its data as JSONB.
+///
+/// Returns `NULL` if the edge does not exist or has been deleted.
+#[pg_extern]
+fn get_edge(rel_id: i64) -> Option<pgrx::JsonB> {
+    use crate::catalog::labels::{prop_key_name, rel_type_name};
+    use crate::storage::prop_store;
+
+    let record = unsafe {
+        use pgrx::pg_sys;
+        let edge_rel = open_edges_relation();
+        let snapshot = pg_sys::GetActiveSnapshot();
+        let result = crate::storage::edge_store::find_edge_by_id(edge_rel, rel_id, snapshot);
+        pg_sys::table_close(edge_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        result
+    };
+
+    record.map(|r| {
+        let mut out = serde_json::Map::new();
+        out.insert("rel_id".into(), serde_json::Value::Number(r.edge_id.into()));
+        out.insert("rel_type".into(), serde_json::Value::String(rel_type_name(r.rel_type_id)));
+        out.insert("source_node_id".into(), serde_json::Value::Number(r.source_node_id.into()));
+        out.insert("target_node_id".into(), serde_json::Value::Number(r.target_node_id.into()));
+        let props = prop_store::decode(&r.prop_bytes, |kid| prop_key_name(kid));
+        out.insert("properties".into(), serde_json::Value::Object(props));
+        pgrx::JsonB(serde_json::Value::Object(out))
+    })
+}
+
+/// Logically delete an edge by its rel_id.
+///
+/// The edge is marked as deleted (xmax set); physical reclamation happens
+/// during VACUUM (Phase 3). The adjacency chain is not modified immediately;
+/// traversal skips deleted edges via MVCC visibility.
+///
+/// Returns `true` if the edge was found and deleted, `false` if not found.
+#[pg_extern]
+fn delete_edge(rel_id: i64) -> bool {
+    unsafe {
+        use pgrx::pg_sys;
+        let edge_rel = open_edges_relation();
+        let found = crate::storage::edge_store::delete_edge(edge_rel, rel_id);
+        pg_sys::table_close(edge_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        found
+    }
+}
+
+/// Count all non-deleted edges in the graph.
+#[pg_extern]
+fn edge_count() -> i64 {
+    unsafe {
+        use pgrx::pg_sys;
+        let edge_rel = open_edges_relation();
+        let snapshot = pg_sys::GetActiveSnapshot();
+        let count = crate::storage::edge_store::count_edges(edge_rel, snapshot);
+        pg_sys::table_close(edge_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        count
+    }
+}
+
+/// Return the set of neighbour node_ids reachable from `node_id` in
+/// `direction` (`'OUT'`, `'IN'`, or `'BOTH'`), optionally filtered by
+/// relationship type name.
+///
+/// This follows the singly-linked adjacency chain directly — O(degree)
+/// with no index scan.
+#[pg_extern]
+fn neighbours(
+    node_id: i64,
+    direction: &str,
+    rel_type: Option<String>,
+) -> SetOfIterator<'static, i64> {
+    use crate::catalog::labels::ensure_rel_type;
+    use crate::storage::edge_store::{Direction, adjacency_follow};
+
+    let dir = Direction::from_str(direction);
+    let rel_type_filter: Option<i32> = rel_type.as_deref().map(ensure_rel_type);
+
+    let edges = unsafe {
+        use pgrx::pg_sys;
+        let node_rel = open_nodes_relation();
+        let edge_rel = open_edges_relation();
+        let snapshot = pg_sys::GetActiveSnapshot();
+        let result = adjacency_follow(node_rel, edge_rel, node_id, dir, rel_type_filter, snapshot);
+        pg_sys::table_close(edge_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        pg_sys::table_close(node_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        result
+    };
+
+    let ids: Vec<i64> = edges.into_iter().map(|e| {
+        if matches!(dir, Direction::In) {
+            e.source_node_id
+        } else {
+            // OUT or BOTH: return the "other" end
+            if e.source_node_id == node_id { e.target_node_id } else { e.source_node_id }
+        }
+    }).collect();
+
+    SetOfIterator::new(ids.into_iter())
+}
+
+/// Adjacency-follow SRF: follows the adjacency chain from `node_id` in
+/// `direction` and returns full edge information for each visible edge.
+///
+/// `direction` — `'OUT'`, `'IN'`, or `'BOTH'`.
+/// `rel_type`  — optional relationship type filter; `NULL` returns all types.
+///
+/// Returns one row per edge: (rel_id, other_node_id, rel_type_id, rel_properties).
+#[pg_extern]
+fn expand(
+    node_id: i64,
+    direction: &str,
+    rel_type: Option<String>,
+) -> TableIterator<
+    'static,
+    (
+        name!(rel_id, i64),
+        name!(other_node_id, i64),
+        name!(rel_type_id, i32),
+        name!(rel_properties, pgrx::JsonB),
+    ),
+> {
+    use crate::catalog::labels::{ensure_rel_type, prop_key_name, rel_type_name};
+    use crate::storage::edge_store::{Direction, adjacency_follow};
+    use crate::storage::prop_store;
+
+    let dir = Direction::from_str(direction);
+    let rel_type_filter: Option<i32> = rel_type.as_deref().map(ensure_rel_type);
+
+    let edges = unsafe {
+        use pgrx::pg_sys;
+        let node_rel = open_nodes_relation();
+        let edge_rel = open_edges_relation();
+        let snapshot = pg_sys::GetActiveSnapshot();
+        let result = adjacency_follow(node_rel, edge_rel, node_id, dir, rel_type_filter, snapshot);
+        pg_sys::table_close(edge_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        pg_sys::table_close(node_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        result
+    };
+
+    let rows: Vec<(i64, i64, i32, pgrx::JsonB)> = edges
+        .into_iter()
+        .map(|e| {
+            let other = if e.source_node_id == node_id {
+                e.target_node_id
+            } else {
+                e.source_node_id
+            };
+            let props = prop_store::decode(&e.prop_bytes, |kid| prop_key_name(kid));
+            let _ = rel_type_name; // suppress unused warning — available if needed
+            let props_json = pgrx::JsonB(serde_json::Value::Object(props));
+            (e.edge_id, other, e.rel_type_id, props_json)
+        })
+        .collect();
+
+    TableIterator::new(rows.into_iter())
+}
+
 // ---------------------------------------------------------------------------
 // pg_test module — pgrx unit tests
 // ---------------------------------------------------------------------------
@@ -202,6 +429,108 @@ mod tests {
         crate::create_node(vec![], pgrx::JsonB(serde_json::json!({})));
         let after = crate::node_count();
         assert_eq!(after, before + 2, "node_count should increase by 2");
+    }
+
+    #[pg_test]
+    fn test_create_and_get_edge() {
+        let src = crate::create_node(
+            vec!["Person".into()],
+            pgrx::JsonB(serde_json::json!({"name": "Alice"})),
+        );
+        let tgt = crate::create_node(
+            vec!["Person".into()],
+            pgrx::JsonB(serde_json::json!({"name": "Bob"})),
+        );
+        assert!(src > 0 && tgt > 0);
+
+        let eid = crate::create_edge(
+            src,
+            tgt,
+            "KNOWS",
+            pgrx::JsonB(serde_json::json!({"since": 2020})),
+        );
+        assert!(eid > 0, "edge_id should be positive");
+
+        let result = crate::get_edge(eid);
+        assert!(result.is_some(), "get_edge should find the edge");
+        let json = result.unwrap().0;
+        assert_eq!(json["rel_id"], serde_json::json!(eid));
+        assert_eq!(json["rel_type"], serde_json::json!("KNOWS"));
+        assert_eq!(json["source_node_id"], serde_json::json!(src));
+        assert_eq!(json["target_node_id"], serde_json::json!(tgt));
+        assert_eq!(json["properties"]["since"], serde_json::json!(2020));
+    }
+
+    #[pg_test]
+    fn test_delete_edge() {
+        let src = crate::create_node(vec![], pgrx::JsonB(serde_json::json!({})));
+        let tgt = crate::create_node(vec![], pgrx::JsonB(serde_json::json!({})));
+        let eid = crate::create_edge(src, tgt, "LINK", pgrx::JsonB(serde_json::json!({})));
+
+        // Edge should exist before delete.
+        assert!(crate::get_edge(eid).is_some());
+
+        let deleted = crate::delete_edge(eid);
+        assert!(deleted, "delete_edge should return true for existing edge");
+
+        // Edge should no longer be visible after logical delete.
+        let after = crate::get_edge(eid);
+        assert!(after.is_none(), "deleted edge should not be visible");
+    }
+
+    #[pg_test]
+    fn test_edge_count() {
+        let before = crate::edge_count();
+        let n1 = crate::create_node(vec![], pgrx::JsonB(serde_json::json!({})));
+        let n2 = crate::create_node(vec![], pgrx::JsonB(serde_json::json!({})));
+        let n3 = crate::create_node(vec![], pgrx::JsonB(serde_json::json!({})));
+        crate::create_edge(n1, n2, "A", pgrx::JsonB(serde_json::json!({})));
+        crate::create_edge(n2, n3, "A", pgrx::JsonB(serde_json::json!({})));
+        assert_eq!(crate::edge_count(), before + 2);
+    }
+
+    #[pg_test]
+    fn test_neighbours() {
+        let alice = crate::create_node(
+            vec!["Person".into()],
+            pgrx::JsonB(serde_json::json!({"name": "Alice"})),
+        );
+        let bob = crate::create_node(
+            vec!["Person".into()],
+            pgrx::JsonB(serde_json::json!({"name": "Bob"})),
+        );
+        let carol = crate::create_node(
+            vec!["Person".into()],
+            pgrx::JsonB(serde_json::json!({"name": "Carol"})),
+        );
+
+        // Alice → Bob, Alice → Carol
+        crate::create_edge(alice, bob, "KNOWS", pgrx::JsonB(serde_json::json!({})));
+        crate::create_edge(alice, carol, "KNOWS", pgrx::JsonB(serde_json::json!({})));
+
+        let out_ids: Vec<i64> = crate::neighbours(alice, "OUT", None).collect();
+        assert_eq!(out_ids.len(), 2, "Alice should have 2 outgoing neighbours");
+        assert!(out_ids.contains(&bob), "Bob should be a neighbour of Alice");
+        assert!(out_ids.contains(&carol), "Carol should be a neighbour of Alice");
+
+        // Bob's incoming neighbours should include Alice.
+        let in_ids: Vec<i64> = crate::neighbours(bob, "IN", None).collect();
+        assert!(in_ids.contains(&alice), "Alice should be an incoming neighbour of Bob");
+    }
+
+    #[pg_test]
+    fn test_expand() {
+        let src = crate::create_node(vec![], pgrx::JsonB(serde_json::json!({})));
+        let tgt = crate::create_node(vec![], pgrx::JsonB(serde_json::json!({})));
+        let eid = crate::create_edge(
+            src, tgt, "EDGE", pgrx::JsonB(serde_json::json!({})),
+        );
+
+        let rows: Vec<_> = crate::expand(src, "OUT", None).collect();
+        assert_eq!(rows.len(), 1, "expand should return 1 row");
+        let (rel_id, other, _type_id, _props) = &rows[0];
+        assert_eq!(*rel_id, eid);
+        assert_eq!(*other, tgt);
     }
 }
 

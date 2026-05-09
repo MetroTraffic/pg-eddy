@@ -57,3 +57,32 @@ pub fn next_node_id() -> i64 {
         .unwrap_or_else(|e| panic!("pg_eddy: next_node_id SPI error: {e}"))
         .unwrap_or_else(|| panic!("pg_eddy: nextval returned NULL"))
 }
+
+/// Look up or insert a relationship type by name, returning its `type_id`.
+pub fn ensure_rel_type(name: &str) -> i32 {
+    Spi::get_one_with_args::<i32>(
+        "INSERT INTO _pg_eddy.rel_type_registry(name) VALUES ($1)
+         ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+         RETURNING type_id",
+        &[DatumWithOid::from(name)],
+    )
+    .unwrap_or_else(|e| panic!("pg_eddy: ensure_rel_type SPI error: {e}"))
+    .unwrap_or_else(|| panic!("pg_eddy: ensure_rel_type returned NULL for '{name}'"))
+}
+
+/// Return the name of a relationship type by its id, or `"?"` if not found.
+pub fn rel_type_name(id: i32) -> String {
+    Spi::get_one_with_args::<String>(
+        "SELECT name FROM _pg_eddy.rel_type_registry WHERE type_id = $1",
+        &[DatumWithOid::from(id)],
+    )
+    .unwrap_or(None)
+    .unwrap_or_else(|| format!("?{id}"))
+}
+
+/// Allocate the next edge id from `_pg_eddy.edge_id_seq`.
+pub fn next_edge_id() -> i64 {
+    Spi::get_one::<i64>("SELECT nextval('_pg_eddy.edge_id_seq')")
+        .unwrap_or_else(|e| panic!("pg_eddy: next_edge_id SPI error: {e}"))
+        .unwrap_or_else(|| panic!("pg_eddy: nextval returned NULL"))
+}

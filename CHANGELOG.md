@@ -6,8 +6,129 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.3.0](#030--2026-05-09--edge-storage--adjacency-lists) — Edge Storage + Adjacency Lists
 - [0.2.0](#020--2026-05-09--node-storage) — Node Storage
 - [0.1.0](#010--2026-05-09--am-skeleton) — AM Skeleton
+
+---
+
+## [0.3.0] — 2026-05-09 — Edge Storage + Adjacency Lists
+
+v0.3.0 implements Phase 2 of the pg_eddy roadmap. Edges are stored with
+singly-linked adjacency chains. Edge deletes are logical only (set xmax);
+physical compaction is deferred to Phase 3 VACUUM. 14/14 pgrx tests pass.
+
+### Storage Layout — Edge Pages
+
+Each edge page (8 KB) uses standard `PageInit(page, BLCKSZ, 0)` — no
+`pd_special` area. Edge slots contain:
+
+```
+HeapTupleHeaderData (24 B)
+rel_id           (8 B, i64 LE)   — globally unique edge id
+rel_type_id      (4 B, i32 LE)   — relationship type (from rel_type_registry)
+source_node_id   (8 B, i64 LE)
+target_node_id   (8 B, i64 LE)
+next_out_page    (4 B, u32 LE)   — next edge in source's outgoing chain
+next_out_slot    (2 B, u16 LE)   — 0 = end of chain
+next_in_page     (4 B, u32 LE)   — next edge in target's incoming chain
+next_in_slot     (2 B, u16 LE)   — 0 = end of chain
+prop_inline_len  (2 B, u16 LE)
+prop_overflow_page (4 B, u32 LE) — 0 = no overflow (Phase 2: overflow = PE200)
+prop_data        (up to 48 B)    — inline binary properties
+```
+
+Adjacency heads are stored in the **node page** `pd_special` area
+(`NodeAdjHeader` entries), NOT inside edge records, so inserting an edge never
+creates a new MVCC version of the source or target node record.
+
+### Adjacency Chain Protocol
+
+- **Insert at head**: new edges are inserted at the front of the out-chain
+  (source) and in-chain (target). The `next_*` pointers are set to the
+  previous head before the insert.
+- **Delete = logical only**: `xmax` is set; the slot remains in the chain.
+  Traversal skips invisible slots; VACUUM (Phase 3) rebuilds the chain.
+- **Lock ordering**: source node page is always locked before target node page
+  (by block number) to prevent deadlocks under concurrent inserts.
+
+### WAL Records
+
+| Record | Opcode | Covers | Approx. size |
+|---|---|---|---|
+| `XLOG_PG_EDDY_EDGE_INSERT` | `0x10` | Edge page (new slot) | 80–120 B |
+| `XLOG_PG_EDDY_EDGE_DELETE` | `0x11` | Edge page (xmax set) | 12 B |
+| `XLOG_PG_EDDY_ADJ_UPDATE`  | `0x20` | Node page (new adj header) | 30 B |
+
+Each `create_edge` call emits three WAL records (one per opcode above, two
+`ADJ_UPDATE` for source and target). All are within a single critical section.
+
+### Catalog
+
+- `ensure_rel_type(name)` / `rel_type_name(id)` — SPI-backed relationship type
+  registry with idempotent upsert.
+- `next_edge_id()` — allocates a dense sequential edge id via
+  `nextval('_pg_eddy.edge_id_seq')`.
+
+### Simplified MVCC (Phase 2)
+
+Tuple visibility checks use the PostgreSQL commit log (`TransactionIdDidCommit`,
+`TransactionIdIsCurrentTransactionId`) to filter out ghost tuples from
+rolled-back transactions. Full `HeapTupleSatisfiesVisibility` with snapshot
+isolation is Phase 3.
+
+### SQL API
+
+New functions installed by this release:
+
+| Function | Returns | Description |
+|---|---|---|
+| `create_edge(source BIGINT, target BIGINT, type TEXT, properties JSONB)` | `BIGINT` | Insert an edge; returns its `rel_id` |
+| `get_edge(rel_id BIGINT)` | `JSONB` | Read an edge by id; `NULL` if not found or deleted |
+| `delete_edge(rel_id BIGINT)` | `BOOLEAN` | Logically delete an edge; `TRUE` if found |
+| `edge_count()` | `BIGINT` | Count all non-deleted edges |
+| `neighbours(node_id BIGINT, direction TEXT, rel_type TEXT)` | `SETOF BIGINT` | Follow adjacency chain; returns neighbour node ids |
+| `expand(node_id BIGINT, direction TEXT, rel_type TEXT)` | `TABLE(...)` | Like neighbours but returns full edge info |
+
+`direction` is `'OUT'`, `'IN'`, or `'BOTH'`. `rel_type` is `NULL` for all
+types.
+
+### Migration
+
+Upgrade from v0.2.0:
+
+```sql
+ALTER EXTENSION pg_eddy UPDATE TO '0.3.0';
+-- or run: psql -f sql/pg_eddy--0.2.0--0.3.0.sql
+```
+
+New objects added by the migration:
+
+| Object | Type | Description |
+|---|---|---|
+| `_pg_eddy.edge_id_seq` | SEQUENCE | Dense sequential edge id allocator |
+| `create_edge(...)` | FUNCTION | Edge insert API |
+| `get_edge(...)` | FUNCTION | Edge read API |
+| `delete_edge(...)` | FUNCTION | Edge logical delete API |
+| `edge_count()` | FUNCTION | Edge count API |
+| `neighbours(...)` | FUNCTION | Adjacency-follow SRF (node ids) |
+| `expand(...)` | FUNCTION | Adjacency-follow SRF (full edge rows) |
+
+### Deliverable Checklist (Phase 2)
+
+- [x] Edge page layout: MVCC records + singly-linked chain pointers
+- [x] `tuple_insert` for edges with adjacency chain maintenance
+- [x] Logical delete for edges (xmax set, no chain modification)
+- [x] WAL redo for `EDGE_INSERT`, `EDGE_DELETE`, `ADJ_UPDATE`
+- [x] Lock ordering: source node page locked before target node page
+- [x] Adjacency-follow scan (`neighbours`, `expand`) — O(degree), no index
+- [x] `create_edge`, `get_edge`, `delete_edge`, `edge_count`
+- [x] `neighbours(node_id, direction, rel_type)` — SETOF BIGINT
+- [x] `expand(node_id, direction, rel_type)` — TABLE(rel_id, other_node_id, rel_type_id, rel_properties)
+- [ ] Property overflow pages (deferred; > 48 B properties raise PE200)
+- [ ] Slot callback verification with SQL trigger (Phase 3)
+- [ ] Early pg-trickle smoke test (Phase 3)
+- [ ] Concurrency / crash-safe edge tests (Phase 3)
 
 ---
 

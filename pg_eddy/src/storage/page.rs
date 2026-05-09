@@ -95,6 +95,51 @@ impl NodeAdjHeader {
 }
 
 // ---------------------------------------------------------------------------
+// Edge record wire layout constants
+//
+// An edge record in an edge page item slot has this layout (after HeapTupleHeaderData):
+//   rel_id           (8B, i64 LE)
+//   rel_type_id      (4B, i32 LE)
+//   source_node_id   (8B, i64 LE)
+//   target_node_id   (8B, i64 LE)
+//   next_out_page    (4B, u32 LE)   — page of next outgoing edge (0=none if next_out_slot=0)
+//   next_out_slot    (2B, u16 LE)   — slot of next outgoing edge (0 = end of chain)
+//   next_in_page     (4B, u32 LE)
+//   next_in_slot     (2B, u16 LE)
+//   prop_inline_len  (2B, u16 LE)
+//   prop_overflow_page (4B, u32 LE)
+//   prop_data        (up to PROP_INLINE_MAX bytes)
+//
+// CHAIN SENTINEL: a head pointer with slot == 0 means "no edges".
+//   The initial adjacency header has all zeros, so out_head_sl == 0 → empty.
+// ---------------------------------------------------------------------------
+
+/// Offset of rel_id within edge record data portion (after HeapTupleHeader).
+pub const OFF_EDGE_REL_ID: usize = 0;
+/// Offset of rel_type_id (i32).
+pub const OFF_EDGE_REL_TYPE_ID: usize = 8;
+/// Offset of source_node_id (i64).
+pub const OFF_EDGE_SOURCE_NODE_ID: usize = 12;
+/// Offset of target_node_id (i64).
+pub const OFF_EDGE_TARGET_NODE_ID: usize = 20;
+/// Offset of next_out_page (u32).
+pub const OFF_EDGE_NEXT_OUT_PAGE: usize = 28;
+/// Offset of next_out_slot (u16).
+pub const OFF_EDGE_NEXT_OUT_SLOT: usize = 32;
+/// Offset of next_in_page (u32).
+pub const OFF_EDGE_NEXT_IN_PAGE: usize = 34;
+/// Offset of next_in_slot (u16).
+pub const OFF_EDGE_NEXT_IN_SLOT: usize = 38;
+/// Offset of prop_inline_len (u16).
+pub const OFF_EDGE_PROP_INLINE_LEN: usize = 40;
+/// Offset of prop_overflow_page (u32).
+pub const OFF_EDGE_PROP_OVERFLOW_PAGE: usize = 42;
+/// Offset of inline property data.
+pub const OFF_EDGE_PROP_DATA: usize = 46;
+/// Fixed data size (without inline props).
+pub const EDGE_FIXED_DATA_SIZE: usize = 46;
+
+// ---------------------------------------------------------------------------
 // Node record wire layout helpers
 //
 // A node record in a page item slot has this layout:
