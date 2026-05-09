@@ -246,20 +246,28 @@ a new node tuple version. On a high-degree node (1M edges), this causes severe
 tuple bloat and VACUUM pressure. The split avoids this entirely.
 
 **Region 1 — Adjacency Header Array** (at page start, fixed-size, NOT
-MVCC-versioned): one 20-byte entry per node slot on the page. Updated
+MVCC-versioned): one 24-byte entry per node slot on the page. Updated
 **in-place under exclusive buffer lock** when edges are inserted or deleted —
-WAL-logged as a compact `XLOG_PG_EDDY_ADJ_UPDATE` record (~28 bytes). Never
+WAL-logged as a compact `XLOG_PG_EDDY_ADJ_UPDATE` record (~32 bytes). Never
 creates new tuple versions.
 
 ```
 ┌─────────────────────────────────────────────────┐  ← page offset 0
 │ adj[0]: out_head_pg(4) out_head_sl(2)           │
 │         in_head_pg(4)  in_head_sl(2)            │
-│         out_degree(4)  in_degree(4)   20 B/entry│
+│         out_degree(4)  in_degree(4)             │
+│         graph_partition_id(4)         24 B/entry│
 │ adj[1]: ...                                     │
 │ adj[N-1]: ...                                   │
-└─────────────────────────────────────────────────┘  ← offset N×20
+└─────────────────────────────────────────────────┘  ← offset N×24
 ```
+
+- `graph_partition_id`: reserved for future distributed execution (see §16,
+  Citus). Set to `0` in v0.x (single-instance). When populated, identifies
+  which partition/community this node belongs to, enabling community-based
+  colocation on Citus workers. Written at node creation; updatable via a
+  future `pg_eddy.repartition()` API. The 4-byte cost per adjacency header
+  is paid from day 1 to avoid a storage format migration later.
 
 **Region 2 — MVCC Node Records** (variable-length, standard MVCC visibility
 via `HeapTupleIsVisible`):
@@ -283,7 +291,7 @@ via `HeapTupleIsVisible`):
   Overflow Page.
 
 **Why this split matters**: inserting an edge updates only two adjacency
-headers (in-place, ~28 bytes WAL each), never the MVCC node records. A
+headers (in-place, ~32 bytes WAL each), never the MVCC node records. A
 high-degree node (1M edges) does not cause tuple bloat when new edges are
 added. Updating node properties creates a new MVCC version of Region 2 only,
 leaving adjacency headers untouched.
@@ -457,7 +465,7 @@ custom WAL resource manager via `RegisterCustomRmgr()` (available since PG14,
 well-supported in PG18). `GenericXLogStart`/`GenericXLogFinish` is explicitly
 rejected: it logs entire 8 KB pages. A single edge insert would produce ~24 KB
 of WAL (edge page + two adjacency-header page images) — roughly 400× more
-than necessary. Custom records are 28–200 bytes per operation.
+than necessary. Custom records are 30–200 bytes per operation.
 
 Custom WAL record types (`src/storage/wal_records.rs`):
 
@@ -468,7 +476,7 @@ Custom WAL record types (`src/storage/wal_records.rs`):
 | `XLOG_PG_EDDY_NODE_DELETE` | page_id, slot_idx, xmax, xmax_xid | 30 B |
 | `XLOG_PG_EDDY_EDGE_INSERT` | page_id, slot_idx, full edge slot | 100 B |
 | `XLOG_PG_EDDY_EDGE_DELETE` | page_id, slot_idx, xmax, xmax_xid | 30 B |
-| `XLOG_PG_EDDY_ADJ_UPDATE` | node_page, adj_slot_idx, new_out_head (page+slot), new_in_head (page+slot), new_out_degree, new_in_degree | 36 B |
+| `XLOG_PG_EDDY_ADJ_UPDATE` | node_page, adj_slot_idx, new_out_head (page+slot), new_in_head (page+slot), new_out_degree, new_in_degree, graph_partition_id | 40 B |
 | `XLOG_PG_EDDY_LABEL_SET` | node_page, node_slot, new_label_ids[] | 20–80 B |
 
 Each record type has a redo function registered in the rmgr's `rm_redo`
@@ -1077,7 +1085,7 @@ pg_eddy.refresh_graph_view(name TEXT) RETURNS VOID
 
 1. **Binary format from day 1**: the output plugin emits the compact binary
    event frame defined in §5.5, not JSON. This avoids a format migration
-   later and keeps per-event overhead minimal (~28–200 bytes).
+   later and keeps per-event overhead minimal (~30–200 bytes).
 
 2. **Apply directly into change buffer tables**: the pg-trickle bgworker
    writes decoded events into `pgtrickle_changes.changes_<oid>` in the same
@@ -2000,8 +2008,11 @@ scope:
   (named graph namespaces, `USE graph_name` syntax) is a post-v1.0 feature.
   AGE users expect named graphs; this is a known adoption gap. The storage
   layer is designed to support multi-graph via a `graph_id` column in the
-  adjacency header and catalog tables, but the query engine and SQL API do not
-  expose it until post-v1.0.
+  MVCC node/edge records and catalog tables, but the query engine and SQL API
+  do not expose it until post-v1.0. (Note: `graph_id` is distinct from
+  `graph_partition_id` in the adjacency header — the former identifies which
+  named graph a node belongs to, the latter identifies its distribution
+  partition for Citus.)
 - **pg-trickle WAL CDC via custom output plugin**: the concrete architecture
   for enabling WAL-based CDC on pg_eddy tables is defined in §7.5. pg_eddy's
   output plugin decodes custom RMGR records into binary event frames;
@@ -2024,7 +2035,45 @@ scope:
 - **SPARQL / RDF bridge**: interoperability with pg-ripple — project LPG
   subgraphs as RDF for SPARQL consumption
 - **Distributed execution via Citus**: horizontal sharding of node/edge pages
-  across Citus worker nodes; shard by community/partition for locality
+  across Citus worker nodes; shard by community/partition for locality.
+  **Scaling design rationale** (documented here to prevent day-1 decisions
+  that block future distribution):
+  - **Read scaling is free today**: PostgreSQL physical streaming replication
+    replicates pg_eddy's custom AM pages via WAL. Read replicas work
+    out-of-the-box with zero pg_eddy changes. This is pg_eddy's equivalent of
+    Neo4j Autonomous Clustering — and it's free, not a paid tier.
+  - **IDs are globally unique**: 64-bit node_id/rel_id via xxhash. No shard-
+    local assumptions. Safe for distribution without ID remapping.
+  - **APIs are logical, not physical**: all user-facing APIs (`cypher()`,
+    `expand()`, `neighbours()`) use logical IDs, never page/slot TIDs. A
+    distributed `expand()` could route cross-shard hops transparently without
+    API changes.
+  - **Adjacency chains are inherently local**: the `(page_id, slot_id)` chain
+    pointers in edge records are physical references within a single relation
+    on a single instance. This is by design — it's the source of O(degree)
+    traversal performance. Any distributed approach must handle cross-shard
+    edges differently (e.g., edge proxies on the coordinator, remote expand
+    RPCs, or community-based colocation that minimizes cross-shard edges).
+    Neo4j only solved this with Infinigraph in late 2025 after 15 years of
+    single-instance design. pg_eddy should not attempt this before v1.0.
+  - **Partition strategy**: Citus distribution key options for graphs:
+    (a) `node_id` hash — even distribution but random cross-shard edges;
+    (b) `community_id` / `partition_id` — colocate densely-connected
+    subgraphs on the same worker to minimize cross-shard hops (requires
+    community detection as a preprocessing step, e.g., via Louvain or label
+    propagation); (c) label-based — colocate all nodes of a label on one
+    worker (only useful for label-homogeneous workloads). Option (b) is the
+    most promising but requires a `graph_partition_id` column in the adjacency
+    header — **this column should be reserved in the header format from
+    Phase 1** even if unused until post-v1.0.
+  - **pg_eddy.expand() must remain the traversal boundary**: all traversal
+    goes through the `expand()` SRF, never raw adjacency chain following in
+    user code. This means a distributed version only needs to intercept
+    `expand()` calls that cross shard boundaries — the contract is clean.
+  - **Federation (Neo4j Fabric equivalent)**: PostgreSQL FDW + postgres_fdw
+    already enables cross-database queries. pg_eddy graph views could
+    reference remote pg_eddy tables via FDW. This is a natural extension of
+    the existing PostgreSQL infrastructure, not a custom protocol.
 - **pg-trickle graph analytics**: PageRank, betweenness centrality, connected
   components as pg-trickle stream tables that stay incrementally up to date
 - **Graph Neural Network embeddings**: store node/edge embeddings alongside
