@@ -52,6 +52,18 @@ cargo pgrx run pg18                # start psql session
 
 Or use `just` (see `justfile`).
 
+## Testing
+
+The project includes three test suites:
+
+- **Unit tests** — `cargo pgrx test pg18` for in-extension Rust tests
+- **TAP tests** — `prove tests/tap/*.pl` for crash recovery and edge cases
+- **OpenCypher TCK** — `perl tests/tck/run_tck.pl` for query engine conformance
+
+**Important**: Whenever the TCK pass rate changes, update the badge in `README.md`
+line 6: `[![OpenCypher TCK](https://img.shields.io/badge/OpenCypher%20TCK-NN%2FNNNN%20passed-orange.svg)](tests/tck/)`
+Replace `NN/NNNN` with the new count (e.g., `82/3881 passed`).
+
 ## Release Checklist
 
 Before releasing a new version:
@@ -63,5 +75,7 @@ Before releasing a new version:
 3. **Run tests** — Execute `cargo pgrx test pg18` to ensure all tests pass.
 4. **Run clippy** — Execute `cargo clippy --features pg18` to check for linting
    issues.
-5. **Create git tag** — Tag the release with `git tag vX.Y.Z` and push to
+5. **Update TCK badge** — If TCK pass rate changed, update `README.md` badge as
+   noted in the Testing section above.
+6. **Create git tag** — Tag the release with `git tag vX.Y.Z` and push to
    repository.
