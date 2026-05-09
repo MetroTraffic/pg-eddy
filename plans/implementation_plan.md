@@ -1243,40 +1243,40 @@ problem at a time), and produces a compelling product at each milestone:
 
 ---
 
-### Phase 0 — AM Skeleton (v0.1.0)
+### Phase 0 — AM Skeleton (v0.1.0) ✅ Released 2026-05-09
 
 **Goal**: The custom AM is registered and the extension loads. Prove AM
 registration works end-to-end before writing any storage logic. If this phase
 fails, stop and reconsider the approach.
 
 **Deliverables**:
-- [ ] Cargo workspace: `pg_eddy/` (extension), `pg_eddy_http/` (placeholder
+- [x] Cargo workspace: `pg_eddy/` (extension), `pg_eddy_http/` (placeholder
       HTTP binary for future Bolt/REST API)
-- [ ] `pg_eddy.control` with `trusted = false`, `superuser = true`; no
+- [x] `pg_eddy.control` with `trusted = false`, `superuser = true`; no
       `schema =` field — PostgreSQL 18 rejects schema names beginning with
       `pg_` (reserved for system use; `ERRCODE_RESERVED_NAME`). Extension
       objects install in whatever schema the user specifies at
       `CREATE EXTENSION pg_eddy SCHEMA <name>` time (default: `public`).
       The internal schema `_pg_eddy` is valid (underscore prefix is not
       reserved and is used by convention for extension-internal objects).
-- [ ] `shared_preload_libraries = 'pg_eddy'` required from this version
-- [ ] Custom WAL resource manager skeleton registered via `RegisterCustomRmgr()`
+- [x] `shared_preload_libraries = 'pg_eddy'` required from this version
+- [x] Custom WAL resource manager skeleton registered via `RegisterCustomRmgr()`
       at `_PG_init` (no-op redo; proves the registration path works; appears
       in `pg_stat_wal`)
-- [ ] `CREATE ACCESS METHOD pg_eddy_node TYPE TABLE HANDLER pg_eddy_node_handler`
+- [x] `CREATE ACCESS METHOD pg_eddy_node TYPE TABLE HANDLER pg_eddy_node_handler`
       and `pg_eddy_edge` in the extension SQL
-- [ ] Node and edge backing tables created `USING pg_eddy_node` /
+- [x] Node and edge backing tables created `USING pg_eddy_node` /
       `USING pg_eddy_edge` at `CREATE EXTENSION` time
-- [ ] All AM callbacks registered as stubs returning "not implemented" except
+- [x] All AM callbacks registered as stubs returning "not implemented" except
       full-table scan (`scan_begin` / `scan_getnextslot` / `scan_end`), which
       returns empty
-- [ ] Internal schema `_pg_eddy` created; label/type/property key registry
+- [x] Internal schema `_pg_eddy` created; label/type/property key registry
       tables (standard heap)
-- [ ] CI: GitHub Actions with `cargo pgrx test pg18`, `cargo clippy`,
+- [x] CI: GitHub Actions with `cargo pgrx test pg18`, `cargo clippy`,
       `cargo deny`
-- [ ] `justfile` with `dev`, `test`, `lint`, `package` targets
-- [ ] `rust-toolchain.toml` pinned to pgrx 0.18-required stable toolchain
-- [ ] `AGENTS.md`, `CONTRIBUTING.md`, `LICENSE` (Apache 2.0)
+- [x] `justfile` with `dev`, `test`, `lint`, `package` targets
+- [x] `rust-toolchain.toml` pinned to pgrx 0.18-required stable toolchain
+- [x] `AGENTS.md`, `CONTRIBUTING.md`, `LICENSE` (Apache 2.0)
 
 **Exit criteria**: `CREATE EXTENSION pg_eddy` succeeds with
 `shared_preload_libraries = 'pg_eddy'`; `SELECT * FROM pg_eddy.nodes` returns
@@ -1284,28 +1284,28 @@ empty without panicking; WAL resource manager appears in `pg_stat_wal`.
 
 ---
 
-### Phase 1 — Node Storage (v0.2.0)
+### Phase 1 — Node Storage (v0.2.0) ✅ Released 2026-05-09
 
 **Goal**: Nodes can be created, read back, and survive crash recovery. The
 split-region page layout (§5.2.1) and custom WAL records (§5.5) are proven
 correct before adding edges.
 
 **Deliverables**:
-- [ ] Node page layout: Region 1 (fixed-size adjacency header array, in-place
+- [x] Node page layout: Region 1 (fixed-size adjacency header array, in-place
       updated under exclusive buffer lock) + Region 2 (MVCC node records,
       variable-length, see §5.2.1)
-- [ ] `tuple_insert` for nodes: allocate slot in Region 2, initialise
+- [x] `tuple_insert` for nodes: allocate slot in Region 2, initialise
       adjacency header in Region 1, WAL-log `XLOG_PG_EDDY_NODE_INSERT`
-- [ ] WAL redo function for `XLOG_PG_EDDY_NODE_INSERT`
-- [ ] Full sequential scan with MVCC visibility via `HeapTupleIsVisible()`
-- [ ] Property binary encoding (`src/storage/prop_store.rs`): all scalar types
+- [x] WAL redo function for `XLOG_PG_EDDY_NODE_INSERT`
+- [x] Full sequential scan with MVCC visibility via `HeapTupleIsVisible()`
+- [x] Property binary encoding (`src/storage/prop_store.rs`): all scalar types
       (Integer, Float, Boolean, String, Date, LocalDateTime, Duration), List,
       Map, Null — encode/decode round-trip tests via `proptest`
 - [ ] Property overflow pages for properties exceeding 48 bytes
-- [ ] Label registry tables + backend-local `HashMap<String, i64>` cache
-- [ ] `pg_eddy.create_node(labels TEXT[], properties JSONB) RETURNS BIGINT`
-- [ ] `pg_eddy.get_node(node_id BIGINT) RETURNS JSONB`
-- [ ] `pg_eddy.node_count() RETURNS BIGINT`
+- [x] Label registry tables + backend-local `HashMap<String, i64>` cache
+- [x] `pg_eddy.create_node(labels TEXT[], properties JSONB) RETURNS BIGINT`
+- [x] `pg_eddy.get_node(node_id BIGINT) RETURNS JSONB`
+- [x] `pg_eddy.node_count() RETURNS BIGINT`
 - [ ] Crash-safe test: insert 10K nodes, `pg_ctl stop -m immediate`, verify
       all nodes recovered correctly
 
