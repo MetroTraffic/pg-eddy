@@ -11,20 +11,15 @@ while remaining a fully transactional, MVCC-safe PostgreSQL extension that can
 be operated with standard PostgreSQL tooling (pg_dump, pg_restore, EXPLAIN,
 PgBouncer, CNPG).
 
-The project delivers two capabilities in deliberate sequence:
-1. **Graph engine** (primary, v0.1–v1.0): custom AM with adjacency-follow
-   traversal, native OpenCypher query engine targeting the openCypher TCK
-   conformance suite, and proven performance advantage over AGE on multi-hop
-   MATCH patterns
-2. **Incremental view maintenance** (layered, Phase 7 trigger CDC, post-v1.0
-   WAL CDC): first-class integration with
-   [pg-trickle](https://github.com/trickle-labs/pg-trickle) for
-   incrementally-maintained graph views — a capability no other PostgreSQL
-   graph extension offers
+The project delivers a **graph engine** (v0.1–v1.0): custom AM with
+adjacency-follow traversal, native OpenCypher query engine targeting the
+openCypher TCK conformance suite, and proven performance advantage over AGE
+on multi-hop MATCH patterns.
 
-These two axes are **loosely coupled**. The graph engine must be proven correct
-and fast before investing in the reactive/IVM story. If the storage thesis
-fails, pg-trickle integration is irrelevant. See §9 for the strategic phasing.
+A future **incremental view maintenance** (IVM) layer — integration with
+[pg-trickle](https://github.com/trickle-labs/pg-trickle) for
+incrementally-maintained graph views — is planned separately.
+See [`plans/ivm_plan.md`](ivm_plan.md) for the IVM design and roadmap.
 
 ### Design Principles
 
@@ -40,11 +35,6 @@ fails, pg-trickle integration is irrelevant. See §9 for the strategic phasing.
   pgrx C-interop; all query and storage logic in safe Rust
 - **Incremental adoption**: each release is independently useful; advanced
   features layer progressively on a stable core
-- **pg-trickle as a first-class optional**: IVM-backed graph views are a key
-  product feature, not an afterthought — but the graph engine must prove its
-  traversal thesis before IVM investment scales up. Trigger-based CDC and full
-  IVM are built in Phase 7 on a proven, stable storage engine; WAL-based CDC
-  is a post-v1.0 performance unlock
 
 ### Target Users and Success Criteria
 
@@ -53,9 +43,7 @@ fails, pg-trickle integration is irrelevant. See §9 for the strategic phasing.
    separate Neo4j instance
 2. Applications requiring ACID transactions spanning both relational and graph
    data in the same database
-3. Teams using pg-trickle who want incrementally-maintained graph views (live
-   friend recommendations, fraud pattern monitors, dependency graphs)
-4. Environments where operational simplicity matters: single backup procedure,
+3. Environments where operational simplicity matters: single backup procedure,
    single monitoring stack, single connection pool
 
 **Why pg_eddy over Apache AGE?**
@@ -64,16 +52,12 @@ fails, pg-trickle integration is irrelevant. See §9 for the strategic phasing.
 - AGE uses heap tables with B-tree indexes for traversal — multi-hop MATCH is
   O(k × log N) per hop; pg_eddy's adjacency-follow is O(degree) per hop
 - AGE has no incremental view maintenance story
-- AGE TCK compliance has known gaps in temporal types, null semantics, and
-  subquery handling
 
 **Why pg_eddy over a standalone Neo4j for some users?**
 - One system to operate instead of two: one backup, one monitoring stack, one
   connection pool
 - Full ACID transactions spanning graph and relational data in the same
   transaction
-- pg-trickle IVM for incrementally-maintained graph views with no equivalent
-  in Neo4j
 
 **Honest benchmark expectations**: every adjacency-follow hop in pg_eddy goes
 through PostgreSQL's buffer manager (`ReadBuffer` + `LockBuffer` + slot read +
@@ -87,11 +71,10 @@ byte-offset arithmetic. The structural per-hop cost is real:
   be 2–5× faster on multi-hop MATCH patterns starting from a known node
 
 **Success at v1.0**:
-- ≥95% openCypher TCK pass rate; deviations documented with upstream references
+- 100% openCypher TCK pass rate (goal); deviations documented with upstream
+  references
 - Adjacency-follow measurably faster than AGE on LDBC SNB multi-hop queries;
   published baselines with hardware, dataset size, and raw output
-- pg-trickle DIFFERENTIAL and IMMEDIATE graph views pass a 72-hour soak test
-  with zero drift
 - `pg_dump`/restore round-trip lossless on 10M+ node graphs
 - `pg_eddy.health_check()` returns OK on a clean install
 - Docker image and CNPG extension image published
@@ -111,7 +94,6 @@ byte-offset arithmetic. The structural per-hop cost is real:
 | Hashing | `xxhash-rust` (XXH3-64) — node/edge ID generation, internal dedup |
 | Serialization | `serde` + `serde_json` — query results, error reports, config |
 | Testing | pgrx `#[pg_test]`, `cargo pgrx regress`, `proptest`, `cargo-fuzz`, openCypher TCK harness |
-| IVM (optional) | `pg_trickle` — stream tables, incremental graph view maintenance |
 | Benchmarks | `criterion` — micro-benchmarks; custom harness vs. Neo4j Community for end-to-end |
 
 ---
@@ -136,12 +118,6 @@ byte-offset arithmetic. The structural per-hop cost is real:
 │  Property Store (inline + overflow)                     │
 │  Label Index (B-tree)  │  Rel-type Index (B-tree)       │
 │  Property Index (B-tree per indexed property)           │
-└───────────────────┬─────────────────────────────────────┘
-                    │
-┌───────────────────▼─────────────────────────────────────┐
-│              Reactivity Layer (optional — pg_trickle)   │
-│  Graph stream tables: MATCH views, path aggregates      │
-│  IVM engine · DAG scheduler · CDC change capture        │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -214,8 +190,8 @@ per-backend `HashMap<String, i64>` (label/type names → IDs).
 
 > **Design constraint**: The custom AM is the foundation of pg_eddy from
 > v0.1.0. There is no heap-based prototype phase — if the AM cannot be made to
-> work correctly with PostgreSQL's MVCC, WAL, buffer management, and
-> pg-trickle CDC, the project stops. All phases build on a working custom AM.
+> work correctly with PostgreSQL's MVCC, WAL, and buffer management, the
+> project stops. All phases build on a working custom AM.
 > `shared_preload_libraries = 'pg_eddy'` is required from v0.1.0.
 
 ### 5.1 Motivation
@@ -494,7 +470,8 @@ PostgreSQL prepends the full page image to the WAL record. pg_eddy uses
 `XLogRegisterBuffer()` with `REGBUF_STANDARD` on all record types so FPW is
 handled correctly.
 
-**Logical decoding / CDC** (implementation deferred to post-v1.0 — see §7.5):
+**Logical decoding / CDC** (implementation deferred — see
+[`plans/ivm_plan.md`](ivm_plan.md) §4):
 pg_eddy will register a custom logical decoding output plugin
 (`src/storage/wal_decode.rs`) that intercepts pg_eddy WAL records and emits
 structured change events. This plugin will serve two purposes:
@@ -503,7 +480,7 @@ structured change events. This plugin will serve two purposes:
    plugin
 2. **pg-trickle WAL CDC path** — pg-trickle's bgworker can consume this
    plugin directly instead of `pgoutput` to enable WAL-based CDC for pg_eddy
-   tables (see §7.5)
+   tables (see [`plans/ivm_plan.md`](ivm_plan.md) §4)
 
 The specification is documented here so that the WAL record format (which
 *is* implemented from Phase 1 for crash recovery) remains compatible with
@@ -527,8 +504,8 @@ events** (the five types above). Internal storage operations — `ADJ_UPDATE`
 and `VACUUM_RECLAIM` (slot reclamation) — are **not** emitted. These are
 physical storage maintenance, not logical data changes.
 
-For trigger-based CDC (the only currently working pg-trickle integration
-path), see §7.2. For the future WAL CDC path via this output plugin, see §7.5.
+For trigger-based CDC and WAL CDC architecture, see
+[`plans/ivm_plan.md`](ivm_plan.md).
 
 ### 5.6 Indexes
 
@@ -868,279 +845,15 @@ pg_eddy.expand(
 
 ---
 
-## 7. pg-trickle Integration (IVM)
+## 7. pg-trickle Integration (IVM) — Separate Plan
 
-> **Dependency**: all features in this section require
-> `pg_trickle` to be installed. Core pg_eddy functionality works without it.
-> Detection uses:
-> ```rust
-> fn has_pg_trickle() -> bool {
->     Spi::get_one::<bool>(
->         "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_trickle')"
->     ).unwrap_or(Some(false)).unwrap_or(false)
-> }
-> ```
-
-### 7.1 Incremental Graph Views
-
-A Cypher MATCH query can be registered as a pg-trickle stream table:
-
-```sql
-SELECT pg_eddy.create_graph_view(
-    name     => 'friends_of_alice',
-    cypher   => 'MATCH (a:Person {name: $name})-[:KNOWS]->(b:Person)
-                 RETURN b.name AS friend, b.age AS age',
-    params   => '{"name": "Alice"}',
-    schedule => '1s'
-);
-```
-
-Internally:
-1. `create_graph_view()` translates the Cypher query to SQL via the existing
-   query engine
-2. A pg-trickle stream table is created over the generated SQL with
-   `cdc_mode = 'trigger'` explicitly set (custom AM tables are incompatible
-   with pg-trickle's WAL mode — see §7.2)
-3. pg-trickle's trigger-based CDC layer captures writes to `pg_eddy.nodes` and
-   `pg_eddy.edges` and incrementally maintains the stream table
-
-Graph stream table schema (auto-created):
-
-```sql
-pg_eddy.view_{name}(
-    <variable_name>  JSONB  -- one column per RETURN variable
-    ...
-)
-```
-
-When `decode = TRUE`, a view with human-readable property values is also created.
-
-### 7.2 pg-trickle CDC Mode
-
-**Executor path requirement (critical)**: pg-trickle's trigger-based CDC fires
-`AFTER INSERT/UPDATE/DELETE` row-level triggers, which are invoked by
-PostgreSQL's executor in `nodeModifyTable.c` via `ExecARInsertTriggers()`,
-`ExecARUpdateTriggers()`, and `ExecARDeleteTriggers()` — **only when writes go
-through the standard executor path**.
-
-All Cypher write clauses (CREATE, MERGE, SET, DELETE) must therefore be
-executed as standard SQL DML via SPI. The Cypher SQL generator emits
-`INSERT`/`UPDATE`/`DELETE` SQL; SPI routes through the executor, which calls
-the trigger manager automatically. No special pg_eddy code is needed to fire
-triggers — as long as every write path goes through SPI.
-
-**Trigger-based CDC is the only reliable integration path with pg-trickle.**
-This requires explicit understanding of how pg-trickle's WAL mode works:
-
-- pg-trickle's WAL-based CDC (`pg_trickle.cdc_mode = 'auto'` or `'wal'`) uses
-  **standard PostgreSQL logical replication**: it creates a publication and
-  replication slot per source table and calls `pg_logical_slot_get_changes()`
-  using the `pgoutput` plugin.
-- `pgoutput` decodes **heap AM WAL records** (`XLOG_HEAP_INSERT` etc.). It
-  cannot decode pg_eddy's custom RMGR records (`XLOG_PG_EDDY_*`). When
-  pg-trickle attempts WAL mode on a pg_eddy custom AM table, `pgoutput` sees
-  no decodable changes — **pg-trickle silently captures nothing**.
-- Therefore, `pg_trickle.cdc_mode` must be forced to `'trigger'` for all
-  pg_eddy source tables. The `create_graph_view()` API sets this explicitly:
-  ```sql
-  SELECT pgtrickle.alter_stream_table(view_name, p_cdc_mode => 'trigger');
-  ```
-- This is a permanent constraint for v1.0. WAL-based CDC for pg_eddy tables
-  requires pg-trickle adding support for a custom output plugin — the
-  architecture is defined in §7.5 but implementation is post-v1.0.
-- The write-side cost is therefore fixed at trigger overhead: **20–55 µs/row**
-  (not ~5 µs as WAL mode would provide). This must be communicated in
-  documentation alongside graph view creation.
-
-**Three additional trigger-based requirements**:
-
-1. **REPLICA IDENTITY**: pg-trickle requires `REPLICA IDENTITY DEFAULT`
-   (primary key) or `REPLICA IDENTITY FULL` on source tables to capture OLD
-   row values on UPDATE and DELETE. pg_eddy's node and edge tables must
-   declare `node_id` and `rel_id` as primary keys at the AM level, or use
-   `REPLICA IDENTITY FULL`. Without this, pg-trickle detects the absence of a
-   primary key and falls back to full refresh — losing differential
-   incrementality.
-
-2. **Slot callback / tuple deconstruction**: trigger functions read OLD/NEW row
-   values by deconstructing the tuple slot filled by the AM. pg_eddy's slot
-   callbacks (`slot_getsomeattrs`, `slot_getallattrs`) must produce a
-   complete, correctly-typed `TupleTableSlot` that standard trigger machinery
-   can deconstruct. If slot callbacks return incomplete or invalid data, trigger
-   functions see NULL or garbled values — CDC data would be silently wrong.
-   This must be verified in Phase 2 (see below).
-
-3. **Transition table support (IMMEDIATE mode)**: pg-trickle's IMMEDIATE mode
-   uses `REFERENCING NEW TABLE AS new_rows OLD TABLE AS old_rows` on AFTER
-   triggers to capture the full changed row-set within the transaction. The
-   executor populates transition tables by reading from the AM's result slots.
-   pg_eddy's AM must implement the transition table callbacks correctly so that
-   IMMEDIATE mode gets valid row images. Verified in Phase 7 alongside IVM.
-
-**Bulk import CDC contract**: `pg_eddy.load_csv_nodes()` and
-`pg_eddy.load_csv_edges()` use SPI by default (trigger-based CDC works
-automatically). A `fast := TRUE` option bypasses SPI for ~3× import
-throughput; when `fast := TRUE` is used:
-- Trigger-based CDC is **not fired** — pg-trickle stream tables will not
-  update until a manual `pg_eddy.refresh_graph_view()` call
-- WAL-based CDC does **not yet** work for pg_eddy custom AM tables (see §7.2);
-  when the custom output plugin WAL CDC path (§7.5) is implemented, `fast :=
-  TRUE` imports **will** be captured via WAL — this is one of the key benefits
-  of WAL CDC over trigger CDC
-- The function emits a `WARNING` if pg-trickle is installed and any graph
-  views exist: "fast import bypasses triggers; call refresh_graph_view()
-  before reading graph views"
-
-**pg_eddy's `wal_decode.rs`** (post-v1.0): a logical decoding output plugin
-that will serve two purposes: (1) external CDC consumers (Debezium, Kafka,
-custom integrations), and (2) the pg-trickle WAL CDC path described in §7.5.
-Implementation is deferred until after the graph engine and trigger-based IVM
-are proven. Current pg-trickle integration is trigger-based only (see above).
-
-**Integration verification** (Phase 7, v0.11.0–v0.12.0): when implementing
-IVM in Phase 7, verify that:
-1. A pg-trickle stream table can be defined over a SQL SELECT on
-   `pg_eddy.nodes` and `pg_eddy.edges`
-2. A Cypher `CREATE (n:Person {name:'Alice'})` (executed via SPI INSERT) causes
-   the stream table to update on the next pg-trickle tick
-3. `pg_eddy.delete_node(id)` causes the OLD row data in the pg-trickle change
-   buffer to be correctly populated (requires REPLICA IDENTITY and working slot
-   callbacks)
-4. DIFFERENTIAL mode: only the changed rows are processed per tick
-5. IMMEDIATE mode: stream table updates within the same transaction as the
-   write, using transition tables (verified via `BEGIN; create_node; SELECT
-   FROM stream_table`)
-6. Confirm that setting `pg_trickle.cdc_mode = 'wal'` on a pg_eddy source table
-   captures **zero** changes (expected — documenting the pg-eddy/pgoutput
-   incompatibility so users are not confused by silent data loss in WAL mode)
-7. Confirm that `create_graph_view()` correctly forces `cdc_mode = 'trigger'`
-   on all pg_eddy source tables
-
-### 7.3 Constraint Graph Views (IMMEDIATE mode)
-
-Graph integrity constraints can be expressed as Cypher MATCH patterns using
-`IMMEDIATE` refresh mode:
-
-```sql
-SELECT pg_eddy.create_graph_view(
-    name         => 'persons_without_email',
-    cypher       => 'MATCH (p:Person) WHERE p.email IS NULL RETURN p',
-    refresh_mode => 'IMMEDIATE'
-);
--- Any row in this view is a constraint violation, caught in-transaction.
-```
-
-### 7.4 SQL API
-
-```sql
-pg_eddy.create_graph_view(
-    name         TEXT,
-    cypher       TEXT,
-    params       JSONB  DEFAULT '{}',
-    schedule     TEXT   DEFAULT '1s',
-    refresh_mode TEXT   DEFAULT 'AUTO',
-    decode       BOOL   DEFAULT FALSE
-) RETURNS VOID
-
-pg_eddy.drop_graph_view(name TEXT) RETURNS VOID
-pg_eddy.list_graph_views() RETURNS TABLE(name TEXT, cypher TEXT, schedule TEXT, ...)
-pg_eddy.refresh_graph_view(name TEXT) RETURNS VOID
-```
-
-### 7.5 WAL CDC via Custom Output Plugin (Future)
-
-> **Status**: post-v1.0 performance optimization. The graph engine (Phases
-> 0–6) and trigger-based IVM (Phase 7) must be proven first. This section
-> documents the architecture for enabling WAL-based CDC for pg_eddy tables
-> — something that is impossible with pg-trickle's standard `pgoutput`-based
-> WAL mode (see §7.2 for why). The architecture is specified now so that
-> design decisions in the storage engine (WAL record format, logical change
-> boundaries) remain compatible with future WAL CDC.
-
-**Architecture**:
-
-```
-┌───────────────────────────────────────────────────────────────────┐
-│  pg_eddy custom AM writes                                         │
-│    ↓ WAL (custom RMGR records)                                    │
-│  pg_eddy output plugin (wal_decode.rs) ← registered via           │
-│    _PG_output_plugin_init()                                       │
-│    ↓ decodes RMGR records → binary event frames                   │
-│  Replication slot ('pg_eddy_cdc_slot')                            │
-│    ↓ pg_logical_slot_peek_binary_changes(plugin := 'pg_eddy')     │
-│  pg-trickle wal_decoder bgworker                                  │
-│    ↓ buffers events per xid                                       │
-│    ↓ on COMMIT → writes to pgtrickle_changes.changes_<oid>        │
-│    ↓ same column format as trigger CDC (action, new_*, old_*)     │
-│  Existing DVM engine (no changes needed)                          │
-│    ↓ processes change buffer normally                              │
-│  Slot advanced after successful apply                             │
-└───────────────────────────────────────────────────────────────────┘
-```
-
-**Key design decisions**:
-
-1. **Binary format from day 1**: the output plugin emits the compact binary
-   event frame defined in §5.5, not JSON. This avoids a format migration
-   later and keeps per-event overhead minimal (~30–200 bytes).
-
-2. **Apply directly into change buffer tables**: the pg-trickle bgworker
-   writes decoded events into `pgtrickle_changes.changes_<oid>` in the same
-   typed-column format that trigger CDC produces (`action`, `new_<col>`,
-   `old_<col>`). The existing DVM engine processes them normally — **no DVM
-   engine changes are needed**. This is the same approach pg-trickle's
-   existing WAL decoder uses for heap tables.
-
-3. **IMMEDIATE stays trigger-based**: IMMEDIATE mode requires statement-level
-   triggers with transition tables to maintain the stream table within the
-   same transaction. WAL CDC is inherently asynchronous (events are visible
-   only after COMMIT). Therefore IMMEDIATE mode always uses trigger-based CDC,
-   and WAL CDC applies only to DIFFERENTIAL and FULL scheduled refreshes.
-
-4. **Event filtering**: only the five logical mutation events are decoded
-   (NodeInserted, NodeUpdated, NodeDeleted, EdgeInserted, EdgeDeleted).
-   Physical storage operations (ADJ_UPDATE, VACUUM) are skipped by the output
-   plugin's `filter_cb` — they are not logical data changes.
-
-5. **Backpressure**: peek → apply → advance. The bgworker calls
-   `pg_logical_slot_peek_binary_changes()` (not `get`), applies the decoded
-   events to the change buffer, and only then calls
-   `pg_logical_slot_advance()` to confirm consumption. On failure, the slot
-   is not advanced and events are re-read on the next tick. This provides
-   at-least-once delivery with crash safety.
-
-6. **Slot management**: one replication slot per database, shared across all
-   pg_eddy source tables in that database. The slot is created lazily when the
-   first graph view opts into WAL CDC. `pg_trickle.slot_lag_warning_threshold_mb`
-   and `slot_lag_critical_threshold_mb` apply normally.
-
-**pg-trickle changes required** (coordination item):
-- New `cdc_mode = 'pg_eddy_wal'` (or similar) in `pgt_dependencies` that tells
-  the wal_decoder bgworker to use pg_eddy's output plugin instead of `pgoutput`
-- The rest of the WAL decoder machinery (slot management, transition
-  orchestration, buffer writing, frontier tracking) is reused as-is
-- Estimated pg-trickle change: ~200–400 lines in `src/wal_decoder.rs` and
-  `src/cdc.rs` to support a configurable output plugin per source
-
-**Expected performance improvement**: WAL CDC eliminates the per-row trigger
-overhead (20–55 µs/row) and replaces it with batch WAL decoding. Expected
-throughput improvement: **~4–10× reduction in write-side CDC overhead** for
-DIFFERENTIAL/FULL mode graph views. Trigger overhead for IMMEDIATE mode is
-unchanged.
-
-**Spike plan** (post-v1.0, 3 milestones):
-1. **Slot + plugin wiring**: register pg_eddy output plugin, create slot, verify
-   `pg_logical_slot_peek_binary_changes()` returns correct binary frames for
-   node/edge CRUD operations
-2. **bgworker consumer**: pg-trickle bgworker reads pg_eddy's slot, decodes
-   binary frames, writes to change buffer, verifies DVM engine processes them
-   correctly (DIFFERENTIAL mode end-to-end)
-3. **Benchmark harness**: compare trigger CDC vs WAL CDC on 10K/100K/1M edge
-   inserts; measure write throughput, CDC latency, WAL volume
-
-**Prerequisites**: all Phase 7 IVM deliverables complete (trigger-based graph
-views working, 72-hour soak test passed). Do not start WAL CDC work until the
-trigger-based IVM path is proven stable.
+> IVM / pg-trickle integration has been extracted to a dedicated plan:
+> [`plans/ivm_plan.md`](ivm_plan.md).
+>
+> This work depends on a stable, feature-complete graph engine (≥v0.12.0
+> with Cypher write clauses and ≥80% TCK compliance). The IVM plan covers
+> trigger-based CDC, incremental graph views, constraint views, and the
+> future WAL CDC output plugin architecture.
 
 ---
 
@@ -1194,9 +907,12 @@ trigger-based IVM path is proven stable.
 - `src/cypher/plan_cache.rs` — Cypher→SQL translation cache (keyed on
   structural hash of normalised AST; default size 512 entries)
 
-### 8.5 Ecosystem (`src/ecosystem/`)
+### 8.5 Ecosystem (`src/ecosystem/`) — Future
 
-- `src/ecosystem/trickle.rs` — pg-trickle detection and graph view management
+> See [`plans/ivm_plan.md`](ivm_plan.md). This module will be implemented
+> when IVM work begins.
+
+- `src/ecosystem/trickle.rs` — pg-trickle detection and graph view management (future)
 
 ### 8.6 Statistics & Monitoring (`src/stats/`)
 
@@ -1212,29 +928,26 @@ trigger-based IVM path is proven stable.
 
 ## 9. Phased Roadmap
 
-**Strategic phasing**: the roadmap solves two independent hard problems in
-sequence, not in parallel:
+**Strategic phasing**: the roadmap focuses on the core graph engine thesis —
+prove that adjacency-follow inside PostgreSQL's buffer manager is
+fundamentally faster than heap+index approaches. **If this fails, nothing
+else matters.**
 
-1. **Graph execution on PostgreSQL** (Phases 0–6): custom AM, traversal
-   efficiency, MVCC correctness, query engine. This is the core thesis —
-   prove that adjacency-follow inside PostgreSQL's buffer manager is
-   fundamentally faster than heap+index approaches. **If this fails, nothing
-   else matters.**
-2. **Reactive graph maintenance** (Phase 7 IVM → post-v1.0 WAL CDC): CDC
-   integration, incremental view maintenance, streaming semantics. Full graph
-   view IVM is built in Phase 7 on top of a proven, stable storage engine.
-   WAL CDC (§7.5) is a post-v1.0 performance optimization.
+IVM / pg-trickle integration is planned separately (see
+[`plans/ivm_plan.md`](ivm_plan.md)) and depends on a stable, feature-complete
+graph engine.
 
-This sequencing reduces risk (blurred failure signals when debugging storage
-vs CDC simultaneously), increases velocity (focused iteration on one hard
-problem at a time), and produces a compelling product at each milestone:
+Each milestone produces a compelling product:
 
 - **v0.5**: "The fastest traversal-oriented LPG inside PostgreSQL" (proven
-  by AGE benchmarks — no IVM required for this claim)
+  by AGE benchmarks)
 - **v0.8–v1.0**: "A high-performance LPG with OpenCypher and hybrid
   SQL+graph queries"
-- **v1.0+**: "A reactive graph engine with incremental view maintenance
-  and WAL-native CDC"
+
+**TCK targets**: the percentages below are **estimates**, not hard gates.
+The goal is to reach **100% openCypher TCK compliance**. Progress will vary
+as feature groups land; any shortfall is addressed in the TCK gap closure
+phase.
 
 ---
 
@@ -1340,8 +1053,8 @@ verify the adjacency chain is intact.
       visibility at each edge slot, without an index
 - [ ] **Slot callback verification**: deferred to Phase 3 (requires working
       slot callbacks with actual column data)
-- [ ] **Early pg-trickle smoke test**: deferred to Phase 7 (pg-trickle not
-      installed in this environment)
+- [ ] **Early pg-trickle smoke test**: deferred (see
+      [`plans/ivm_plan.md`](ivm_plan.md))
 - [x] `pg_eddy.create_edge(source BIGINT, target BIGINT, type TEXT, properties JSONB) RETURNS BIGINT`
 - [x] `pg_eddy.delete_edge(rel_id BIGINT) RETURNS BOOLEAN`
 - [x] `pg_eddy.neighbours(node_id BIGINT, direction TEXT, rel_type TEXT) RETURNS SETOF BIGINT`
@@ -1633,14 +1346,14 @@ AM. Node isomorphism and null semantics are correct from the first release.
       arithmetic, comparisons, and list indexing
 - [ ] Built-in functions: `size()`, `length()`, `head()`, `tail()`, `last()`,
       `toBoolean()`
-- [ ] TCK target: ≥15% overall (read-only empty-graph scenarios; `WITH` and
+- [ ] TCK estimate: ~15% overall (read-only empty-graph scenarios; `WITH` and
       `OPTIONAL MATCH` deferred to v0.8.0 where they belong architecturally)
 
 **Exit criteria (combined Phase 5)**:
 - `pg_eddy.cypher()` executes MATCH/WHERE/RETURN on empty and schema-only
   graphs; property access, label tests, string predicates, null comparisons
 - Node isomorphism enforced; null semantics correct per openCypher spec
-- TCK pass rate ≥15% overall (`WITH`/`OPTIONAL MATCH` deferred to Phase 6)
+- TCK pass rate ~15% estimated (`WITH`/`OPTIONAL MATCH` deferred to Phase 6)
 - No SQL injection possible (interpreter evaluates params directly as Values)
 - Parser fuzz runs without panics (cargo fuzz)
 
@@ -1663,7 +1376,7 @@ the storage layer).
 - [ ] `UNWIND expr AS var`
 - [ ] `CASE` expressions (simple and searched)
 - [ ] Target: pass `WithAcceptance`, `OptionalMatchAcceptance`,
-      `UnwindAcceptance`; TCK ≥25%
+      `UnwindAcceptance`; TCK ~25%
 
 **v0.9.0 — Aggregation and functions**:
 - [ ] Aggregation: `COUNT(*)`, `COUNT(DISTINCT)`, `SUM`, `AVG`, `MIN`, `MAX`,
@@ -1677,7 +1390,7 @@ the storage layer).
       `asin()`, `acos()`, `atan()`, `atan2()`, `toRadians()`, `toDegrees()`
 - [ ] `rand()`, `randomUUID()`
 - [ ] Target: pass `AggregationAcceptance`, `ExpressionAcceptance`,
-      `TypeConversionAcceptance`, `NullAcceptance`; TCK ≥40%
+      `TypeConversionAcceptance`, `NullAcceptance`; TCK ~40%
 
 **v0.10.0 — Variable-length paths**:
 - [ ] Variable-length paths via bounded `WITH RECURSIVE` + PG18 `CYCLE` clause
@@ -1688,24 +1401,24 @@ the storage layer).
 - [ ] Path expressions: `nodes(path)`, `relationships(path)`, `length(path)`
 - [ ] Pattern comprehensions: `[(n)-[:KNOWS]->(m) | m.name]`
 - [ ] Target: pass `VarLengthExpand`, `PathExpression`,
-      `PatternComprehensionAcceptance`; TCK ≥55%
+      `PatternComprehensionAcceptance`; TCK ~55%
 
 **v0.11.0 — Subqueries**:
 - [ ] `EXISTS { ... }` pattern predicate, scalar subqueries
 - [ ] `CALL { ... }` subqueries (correlated and uncorrelated)
 - [ ] `CALL procedure(args) YIELD ...`
-- [ ] Target: pass `CallSubqueryAcceptance`, `ExistsAcceptance`; TCK ≥65%
+- [ ] Target: pass `CallSubqueryAcceptance`, `ExistsAcceptance`; TCK ~65%
 
-**Exit criteria**: TCK pass rate ≥65%; `shortestPath()` is cancellable and
+**Exit criteria**: TCK pass rate ~65% estimated; `shortestPath()` is cancellable and
 memory-bounded; aggregation matches Neo4j for all TCK scenarios.
 
 ---
 
-### Phase 7 — Write Language, Benchmark, and IVM (v0.12.0–v0.15.0)
+### Phase 7 — Write Language and Benchmark (v0.12.0–v0.14.0)
 
 **Goal**: Full openCypher write language, then the AGE comparison benchmark
-(now meaningful because data can be loaded via Cypher `CREATE`), then IVM.
-The benchmark is placed here — not at v0.7.0 — because a realistic
+(now meaningful because data can be loaded via Cypher `CREATE`), then schema
+DDL. The benchmark is placed here — not at v0.7.0 — because a realistic
 comparison requires Cypher `CREATE` for data loading; the v0.5.1 storage-
 layer micro-benchmark already proved raw adjacency-follow speed.
 
@@ -1716,10 +1429,8 @@ layer micro-benchmark already proved raw adjacency-follow speed.
 - [ ] `SET n.prop = value`, `SET n += {map}`, `SET n = {map}`
 - [ ] `SET n:Label`, `REMOVE n:Label`, `REMOVE n.prop`
 - [ ] `DELETE n`, `DETACH DELETE n`
-- [ ] All write clauses go through SPI → executor → triggers fire → pg-trickle
-      CDC stays up to date automatically (see §7.2)
 - [ ] Target: `CreateAcceptance`, `MergeAcceptance`, `SetAcceptance`,
-      `DeleteAcceptance`; TCK ≥75%
+      `DeleteAcceptance`; TCK ~75%
 
 **v0.12.x — Insert performance + AGE comparison benchmark**:
 
@@ -1741,35 +1452,21 @@ layer micro-benchmark already proved raw adjacency-follow speed.
       adjacency-follow design must be re-examined before proceeding
 - [ ] CI performance gate: IS-3 regression `>20%` fails build
 
-**v0.13.0 — IVM graph views**:
-- [ ] `pg_eddy.create_graph_view()`: Cypher MATCH → SQL → pg-trickle stream
-      table
-- [ ] `pg_eddy.drop_graph_view()`, `pg_eddy.list_graph_views()`,
-      `pg_eddy.refresh_graph_view()`
-- [ ] `_pg_eddy.graph_views` catalog
-- [ ] DIFFERENTIAL refresh: changed nodes/edges only
-- [ ] IMMEDIATE refresh: view updated within the same transaction as the write
-- [ ] Constraint views (IMMEDIATE mode): any row = violation caught
-      in-transaction
-- [ ] DAG-aware scheduling: dependent graph views refreshed in topological order
-- [ ] 72-hour soak test: no drift after sustained concurrent writes + reads
-
-**v0.14.0 — Schema DDL**:
+**v0.13.0 — Schema DDL**:
 - [ ] `CREATE CONSTRAINT ON (n:Label) ASSERT n.prop IS UNIQUE`
 - [ ] `CREATE CONSTRAINT ON (n:Label) ASSERT EXISTS(n.prop)`
 - [ ] `CREATE INDEX ON :Label(prop)` / `DROP INDEX`
 - [ ] `SHOW CONSTRAINTS`, `SHOW INDEXES`
 - [ ] `FOREACH (x IN list | clause)`
-- [ ] Target: `SchemaAcceptance`, `ForeachAcceptance`; TCK ≥80%
+- [ ] Target: `SchemaAcceptance`, `ForeachAcceptance`; TCK ~80%
 
-**Exit criteria**: ≥80% TCK pass; AGE comparison benchmark published and
-passes the 2× gate on IS-3; pg-trickle 72-hour soak test passes with zero
-drift; all write clauses work correctly under concurrent access; IMMEDIATE
-constraint views catch violations in-transaction.
+**Exit criteria**: ~80% TCK pass estimated; AGE comparison benchmark
+published and passes the 2× gate on IS-3; all write clauses work correctly
+under concurrent access.
 
 ---
 
-### Phase 8 — Performance Hardening and TCK ≥95% (v0.15.0–v0.17.0)
+### Phase 8 — Performance Hardening and 100% TCK Compliance (v0.15.0–v0.17.0)
 
 **v0.15.0 — Query optimisation**:
 - [ ] Cost model for AM scan operators: adjacency-follow O(degree) vs B-tree
@@ -1785,7 +1482,8 @@ constraint views catch violations in-transaction.
       arithmetic, timezone-aware datetime operations (see §10.7 — the hardest
       feature group in the entire TCK; budget accordingly)
 - [ ] `LOAD CSV FROM 'path' AS row` (local filesystem only)
-- [ ] All remaining TCK group failures fixed; target: ≥95% pass rate
+- [ ] All remaining TCK group failures fixed; target: 100% pass rate
+      (document any spec deviations with upstream references)
 - [ ] `null_semantics.sql` regression suite covers all `NullAcceptance`
       scenarios
 
@@ -1802,16 +1500,16 @@ constraint views catch violations in-transaction.
 - [ ] Security: `cargo audit --deny warnings`, SBOM (CycloneDX), fuzz coverage
       report; `pg_eddy.max_cypher_depth` GUC (DoS prevention)
 - [ ] mdBook documentation site: installation, quickstart, Cypher reference,
-      storage AM internals, pg-trickle integration, performance cookbook,
+      storage AM internals, performance cookbook,
       security guide, troubleshooting
 - [ ] Docker image + CNPG CloudNativePG extension image published
 - [ ] `justfile` release workflow: tag, build, publish to ghcr.io
 
-**Exit criteria** (v1.0 readiness): ≥95% TCK pass; LDBC SNB full suite
-published baselines (IS-1 through IS-7, IC-1 through IC-14); AGE comparison
-passes 2× gate on IS-3 (first confirmed at v0.12.x); pg-trickle IVM soak
-test passed; pg_dump round-trip verified; `pg_eddy.health_check()` returns
-OK; Docker + CNPG images published.
+**Exit criteria** (v1.0 readiness): 100% TCK pass (goal; document any
+remaining spec deviations); LDBC SNB full suite published baselines (IS-1
+through IS-7, IC-1 through IC-14); AGE comparison passes 2× gate on IS-3
+(first confirmed at v0.12.x); pg_dump round-trip verified;
+`pg_eddy.health_check()` returns OK; Docker + CNPG images published.
 
 ---
 
@@ -1848,7 +1546,7 @@ OK; Docker + CNPG images published.
 | `bulk_import.sql` | CSV import of nodes and edges |
 | `concurrent.sql` | Parallel inserts and reads, no data corruption |
 | `am_scan.sql` | Adjacency-follow scan, label scan, property scan |
-| `ivm_views.sql` | Graph views with pg-trickle (skipped when not installed) |
+| `ivm_views.sql` | Graph views with pg-trickle (see [`plans/ivm_plan.md`](ivm_plan.md)) |
 | `pg_dump.sql` | pg_dump/pg_restore round-trip preserves graph exactly |
 
 ### 10.3 openCypher TCK Harness
@@ -2039,7 +1737,8 @@ pg-eddy/                               # Repository root
 │   └── bench/
 │       └── ldbc_snb.sql
 ├── plans/
-│   └── implementation_plan.md         # This document
+│   ├── implementation_plan.md         # This document
+│   └── ivm_plan.md                    # IVM / pg-trickle integration (separate plan)
 ├── docs/
 │   ├── book.toml
 │   └── src/
@@ -2048,7 +1747,6 @@ pg-eddy/                               # Repository root
 │       ├── quickstart.md
 │       ├── cypher-reference/
 │       ├── storage-am/
-│       ├── ivm-views/
 │       ├── performance/
 │       └── reference/
 ├── AGENTS.md
@@ -2128,7 +1826,7 @@ criterion  = { version = "0.5", features = ["html_reports"] }
 ```
 default_version = '0.1.0'
 module_pathname = '$libdir/pg_eddy'
-comment         = 'Native LPG graph database with OpenCypher and incremental view maintenance'
+comment         = 'Native LPG graph database with OpenCypher'
 schema          = 'pg_eddy'
 relocatable     = false
 superuser       = false
@@ -2175,7 +1873,7 @@ trailing period). Codes use the `PE` prefix:
 | `PE300`–`PE399` | Cypher plan/execution errors (type errors, runtime failures) |
 | `PE400`–`PE499` | Constraint errors (unique violation, existence violation) |
 | `PE500`–`PE599` | Import/export errors (CSV format, path access) |
-| `PE600`–`PE699` | IVM / pg-trickle integration errors |
+| `PE600`–`PE699` | IVM / pg-trickle integration errors (see [`plans/ivm_plan.md`](ivm_plan.md)) |
 | `PE700`–`PE799` | Admin errors (vacuum, reindex, migration) |
 | `PE800`–`PE899` | Configuration errors (invalid GUC combinations) |
 
@@ -2220,18 +1918,9 @@ scope:
   `graph_partition_id` in the adjacency header — the former identifies which
   named graph a node belongs to, the latter identifies its distribution
   partition for Citus.)
-- **pg-trickle WAL CDC via custom output plugin**: the concrete architecture
-  for enabling WAL-based CDC on pg_eddy tables is defined in §7.5. pg_eddy's
-  output plugin decodes custom RMGR records into binary event frames;
-  pg-trickle's bgworker consumes them via
-  `pg_logical_slot_peek_binary_changes()` and writes into standard change
-  buffer tables. This bypasses the `pgoutput` limitation entirely. Requires
-  ~200–400 lines of pg-trickle changes (configurable output plugin per source).
-  Expected outcome: ~4–10× reduction in write-side CDC overhead for
-  DIFFERENTIAL/FULL graph views. IMMEDIATE mode stays trigger-based. Spike
-  plan: 3 milestones (slot+plugin wiring, bgworker consumer, benchmark
-  harness). Target: post-v1.0, after trigger-based IVM is proven stable
-  (Phase 7 complete, 72-hour soak test passed).
+- **pg-trickle WAL CDC via custom output plugin**: see
+  [`plans/ivm_plan.md`](ivm_plan.md) §4 for the full architecture. This is a
+  post-v1.0 performance optimization on top of working trigger-based IVM.
 - **VarLengthExpand v2**: native expansion operator in Rust that uses the
   adjacency-follow SRF directly (not recursive CTEs), with pruning, early
   termination, and `traversal_work_mem` budgeting. Recursive CTEs are correct
@@ -2282,7 +1971,8 @@ scope:
     reference remote pg_eddy tables via FDW. This is a natural extension of
     the existing PostgreSQL infrastructure, not a custom protocol.
 - **pg-trickle graph analytics**: PageRank, betweenness centrality, connected
-  components as pg-trickle stream tables that stay incrementally up to date
+  components as incrementally-maintained views (depends on IVM — see
+  [`plans/ivm_plan.md`](ivm_plan.md))
 - **Graph Neural Network embeddings**: store node/edge embeddings alongside
   graph data; combined Cypher + vector similarity queries
 - **Bolt protocol**: native Bolt v5 wire protocol for Neo4j driver compatibility
@@ -2296,17 +1986,55 @@ scope:
 
 ---
 
-## 17. References
+## 17. Deferred Deliverables Tracker
+
+Items deferred from completed phases, consolidated here so nothing is lost.
+Each item notes its origin phase and its current planned target.
+
+### Storage Layer
+
+| Item | Origin | Target | Notes |
+|---|---|---|---|
+| REPLICA IDENTITY support | Phase 2 | Phase 7+ (IVM prerequisite) | Custom AM tables have no SQL columns; requires slot callbacks with column data. See [`plans/ivm_plan.md`](ivm_plan.md) §1. |
+| Slot callback verification | Phase 2 | Phase 7+ | Verify slot callbacks produce correct `TupleTableSlot` for trigger machinery. |
+| Insert performance fix (5× slower than AGE) | v0.5.2 | v0.12.x | Batch catalog writes to `edge_type_src`/`edge_type_dst`; target within 2× of AGE. Root cause: per-edge SPI INSERT overhead. |
+| Cross-page node update | Phase 3 | v0.13.0+ | Currently node update fails if new record won't fit on same page. |
+
+### Indexes, Constraints, Import/Export
+
+| Item | Origin | Target | Notes |
+|---|---|---|---|
+| Property indexes (`create_node_index`) | v0.5.3 | v0.13.0 | Per-property B-tree index; design alongside query planner for predicate pushdown. |
+| Unique constraints | v0.5.3 | v0.13.0 | `CREATE CONSTRAINT ... ASSERT n.prop IS UNIQUE` |
+| Existence constraints | v0.5.3 | v0.13.0 | `CREATE CONSTRAINT ... ASSERT EXISTS(n.prop)` |
+| CSV import/export | v0.5.3 | v0.12.0+ | `load_csv_nodes`, `load_csv_edges` with `fast := TRUE` option; `export_cypher_script()` |
+| `pg_dump`/`pg_restore` round-trip | v0.5.3 | v0.17.0 | Test on 1M+ node graph; must be lossless. |
+| Performance CI gate | v0.5.3 | v0.12.x | Automated per-PR: label-scan <5ms on 1M nodes; 1-hop expand <1ms on 10M edges. |
+
+### Testing
+
+| Item | Origin | Target | Notes |
+|---|---|---|---|
+| Fuzz targets (lexer, parser) | v0.7.0 | v0.7.0 | `fuzz/` crate with `fuzz_cypher_parser`, `fuzz_cypher_sql_gen`, etc. |
+| pg-trickle smoke test | Phase 2 | IVM plan | See [`plans/ivm_plan.md`](ivm_plan.md). |
+
+### IVM (Separate Plan)
+
+All IVM deliverables (graph views, constraint views, WAL CDC) are tracked in
+[`plans/ivm_plan.md`](ivm_plan.md) and are not listed here.
+
+---
+
+## 18. References
 
 - [openCypher Specification](https://opencypher.org/)
 - [openCypher TCK](https://github.com/opencypher/openCypher/tree/master/tck)
 - [PostgreSQL Table AM API](https://www.postgresql.org/docs/current/tableam.html)
 - [pgrx 0.18](https://github.com/pgcentralfoundation/pgrx)
-- [pg-trickle](https://github.com/trickle-labs/pg-trickle)
+- [pg-trickle](https://github.com/trickle-labs/pg-trickle) — IVM integration
+  planned separately (see [`plans/ivm_plan.md`](ivm_plan.md))
 - [pg-ripple](https://github.com/trickle-labs/pg-ripple) — sister project (RDF
   triplestore on PostgreSQL using pg-trickle, similar architecture without
   custom AM)
 - [LDBC Social Network Benchmark](https://ldbcouncil.org/benchmarks/snb/)
 - [Neo4j native graph storage whitepaper](https://neo4j.com/blog/native-vs-non-native-graph-technology/)
-- [DBSP: Incremental Computation on Streams](https://arxiv.org/abs/2203.16684)
-  (theoretical foundation for pg-trickle, relevant to incremental graph views)
