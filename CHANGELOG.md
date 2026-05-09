@@ -6,6 +6,8 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.5.1](#051--2026-05-09--tap-infrastructure-wal-hardening-and-age-benchmark) — TAP Infrastructure, WAL Hardening, and AGE Benchmark
+- [0.5.0](#050--2026-05-09--indexes-constraints-and-full-crud-api) — Indexes, Constraints, and Full CRUD API
 - [0.4.0](#040--2026-05-09--mvcc-and-vacuum) — MVCC and VACUUM
 - [0.3.0](#030--2026-05-09--edge-storage--adjacency-lists) — Edge Storage + Adjacency Lists
 - [0.2.0](#020--2026-05-09--node-storage) — Node Storage
@@ -13,7 +15,208 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ---
 
-## [0.4.0] — 2026-05-09 — MVCC and VACUUM
+## [0.5.1] — 2026-05-09 — TAP Infrastructure, WAL Hardening, and AGE Benchmark
+
+v0.5.1 completes Phase 4.x: multi-session TAP tests prove WAL correctness
+under crash and concurrent-write conditions; two critical correctness bugs are
+fixed; the AGE benchmark gate is passed (4.27× faster on 2-hop expand).
+25/25 pgrx tests + 11/11 TAP assertions pass.
+
+### Critical Bug Fixes
+
+**WAL redo PANIC on restart** — Any database that used v0.2.0–v0.5.0 would
+PANIC on the first restart after inserting nodes. `redo_node_insert` called
+`XLogReadBufferForRedo` for block 1 on every `NODE_INSERT` record, but block 1
+only exists on `NODE_INSERT_OVF` records (inserts with overflow property
+pages). PostgreSQL's WAL replayer PANICs when asked to locate a block that was
+never registered. Fixed with an `is_ovf` guard that only accesses block 1 when
+the record type is `XLOG_PG_EDDY_NODE_INSERT_OVF`.
+
+**MVCC isolation broken under REPEATABLE READ / SERIALIZABLE** — `count_nodes()`
+and all node scans were using `TransactionIdDidCommit(xmin)`, which returns
+`true` for any committed transaction — including transactions that committed
+*after* the reader's snapshot was taken. A REPEATABLE READ session therefore
+saw new nodes inserted by concurrent transactions, violating snapshot isolation.
+Fixed by checking `XidInMVCCSnapshot(xmin, snapshot)` when the xmin is
+committed: a node is only visible if its inserting transaction committed
+*before* the snapshot was taken.
+
+### TAP Test Infrastructure
+
+Four crash-safety and concurrency tests are now run by `just tap`:
+
+- **001_crash_recovery** — inserts 10 000 nodes, sends `SIGQUIT` (immediate
+  shutdown, no checkpoint), restarts the cluster, verifies `count_nodes() = 10000`.
+  This test was the one that caught the WAL redo PANIC above.
+- **002_edge_crash_recovery** — builds a 10-node / 20-edge ring graph, crashes
+  and restarts, verifies edge count and adjacency-chain integrity survive WAL
+  replay.
+- **003_mvcc_isolation** — T2 opens a REPEATABLE READ transaction and
+  snapshots an empty graph; T1 inserts and commits; T2 re-reads and must still
+  see zero nodes (snapshot isolation). T2 then commits and must see 1 node.
+  This test was the one that caught the MVCC bug above.
+- **004_concurrent_inserts** — 4 background sessions each insert 1 000 nodes
+  concurrently; verifies `count_nodes() = 4000` with all node IDs distinct
+  (no sequence collisions or lost writes).
+
+CI workflow `.github/workflows/tap.yml` runs all four scripts against a fresh
+PostgreSQL 18 cluster on every push.
+
+### New SQL Functions
+
+| Function | Returns | Description |
+|---|---|---|
+| `count_nodes()` | `BIGINT` | Alias for the internal `node_count()`; used by TAP tests and user queries |
+| `count_edges()` | `BIGINT` | Alias for the internal `edge_count()`; used by TAP tests and user queries |
+| `find_edges(src BIGINT, dst BIGINT, rel_type TEXT)` | `SETOF BIGINT` | Fast edge lookup using rel-type catalog indexes when type + endpoint are given; falls back to adjacency-chain scan |
+
+### Rel-type Catalog Indexes
+
+Two new internal catalog tables enable O(1) edge lookup by type and endpoint
+without scanning adjacency chains:
+
+- `_pg_eddy.edge_type_src(type_id, src_node_id, edge_id)` — indexed on
+  `(type_id, src_node_id)` and `edge_id`. Written on every `create_edge` call.
+- `_pg_eddy.edge_type_dst(type_id, dst_node_id, edge_id)` — same structure
+  for the destination endpoint.
+
+Both tables are used by `find_edges()` fast paths and will be used by the
+Cypher query planner in Phase 5.
+
+### AGE Benchmark Gate — PASSED ✅
+
+Results on a dev container (Debian 11, PostgreSQL 18.3, 1/50 scale):
+
+| Operation | pg_eddy | AGE | Ratio |
+|---|---|---|---|
+| Node insert (1K nodes) | 0.129 s | 0.026 s | 0.20× (slower — P1 bug) |
+| 1-hop adjacency follow | 12.52 ms | 12.24 ms | 0.98× (parity) |
+| **2-hop neighbour expand** | **11.49 ms** | **49.08 ms** | **4.27× faster** |
+
+The ≥2× gate on 2-hop expansion is cleared. **v0.6.0 (Cypher engine) starts
+next.** The insert regression (5× slower than AGE due to per-edge SPI writes
+to the catalog index tables) is filed as a P1 bug, deferred to v0.5.2 after
+the first Cypher milestone ships.
+
+### Schema Note
+
+PostgreSQL reserves all schema names beginning with `pg_`. The `schema =
+'pg_eddy'` field that was briefly attempted in the control file was rejected
+by PostgreSQL with `ERRCODE_RESERVED_NAME`. Functions install in `public`
+(or the schema chosen at `CREATE EXTENSION` time). Internal objects remain in
+`_pg_eddy` as before.
+
+### Migration
+
+Upgrade from v0.5.0:
+
+```sql
+ALTER EXTENSION pg_eddy UPDATE TO '0.5.1';
+-- or run: psql -f sql/pg_eddy--0.5.0--0.5.1.sql
+```
+
+New objects added by the migration:
+
+| Object | Type | Description |
+|---|---|---|
+| `_pg_eddy.edge_type_src` | TABLE | Rel-type → src-node → edge catalog index |
+| `_pg_eddy.edge_type_dst` | TABLE | Rel-type → dst-node → edge catalog index |
+| `count_nodes()` | FUNCTION | Alias for `node_count()` |
+| `count_edges()` | FUNCTION | Alias for `edge_count()` |
+| `find_edges(bigint, bigint, text)` | FUNCTION | Fast edge lookup by type + endpoint |
+
+---
+
+## [0.5.0] — 2026-05-09 — Indexes, Constraints, and Full CRUD API
+
+v0.5.0 completes Phase 4: the storage layer is feature-complete for building
+the query engine on top. Property overflow pages, physical VACUUM compaction,
+label indexes, and the full node/edge CRUD API are all implemented.
+24/24 pgrx tests pass.
+
+### Critical WAL Opcode Fix
+
+All WAL info bytes now use only the **high nibble** (bits 4–7). PostgreSQL's
+XLogInsert reserves bits 2–3 of the low nibble for its own flags and will
+PANIC if an extension sets them. The previous opcodes were broken:
+
+| Record | Old (broken) | New (correct) |
+|---|---|---|
+| `NODE_INSERT` | `0x00` | `0x00` (unchanged) |
+| `NODE_INSERT_OVF` | `0x05` | `0x10` |
+| `NODE_DELETE` | `0x02` | `0x20` |
+| `NODE_COMPACT` | `0x04` | `0x30` |
+| `EDGE_INSERT` | `0x10` | `0x40` |
+| `EDGE_DELETE` | `0x11` | `0x50` |
+| `ADJ_UPDATE` | `0x20` | `0x60` |
+| `VACUUM_PAGE` | `0x30` | `0x70` |
+
+**Databases created with v0.4.0 or earlier cannot be upgraded in-place** — the
+on-disk WAL records have the old opcodes. Create a fresh cluster for v0.5.0.
+
+### Property Overflow Pages
+
+Node records now support properties exceeding 48 bytes. When the inline
+property buffer is full, a **property overflow page** is allocated in the same
+node relation and its block number is stored in the `prop_overflow_page` field
+of the node record. The overflow page holds the full serialised property map.
+
+WAL coverage: the overflow block is written inside the same critical section
+as the node record, using `REGBUF_FORCE_IMAGE` so the full page image is
+captured. VACUUM skips overflow pages (they are reclaimed when the parent node
+record becomes dead-to-all-snapshots).
+
+### Physical VACUUM Compaction
+
+After `VACUUM _pg_eddy.nodes`, dead node slots are now physically removed from
+pages via `PageRepairFragmentation`. The page is WAL-logged as a full page
+image via `XLOG_PG_EDDY_NODE_COMPACT`. Zeroed-out adjacency headers for dead
+slots are cleared at the same time. Free space is correctly returned to
+PostgreSQL's free space map.
+
+### Label B-tree Index
+
+`_pg_eddy.label_index(label_id INT, node_id BIGINT)` is maintained by the
+Rust/SPI layer in `create_node`, `update_node`, `add_label`, `remove_label`,
+and `delete_node`. It enables O(|matching nodes|) label scans without sweeping
+all node pages.
+
+### New SQL Functions
+
+| Function | Returns | Description |
+|---|---|---|
+| `add_label(node_id BIGINT, label TEXT)` | `BOOLEAN` | Add a label to an existing node; `FALSE` if already present |
+| `remove_label(node_id BIGINT, label TEXT)` | `BOOLEAN` | Remove a label; `FALSE` if not present |
+| `detach_delete_node(node_id BIGINT)` | `BOOLEAN` | Delete all incident edges then delete the node atomically |
+| `find_nodes(label TEXT, property_filter JSONB)` | `SETOF BIGINT` | Fast label lookup via `label_index`; optional property post-filter |
+| `schema_info()` | `JSONB` | Label, rel-type, and property-key registry summary |
+
+### Migration
+
+Upgrade from v0.4.0:
+
+```sql
+ALTER EXTENSION pg_eddy UPDATE TO '0.5.0';
+-- or run: psql -f sql/pg_eddy--0.4.0--0.5.0.sql
+```
+
+**Note**: if your cluster has WAL generated by v0.4.0 or earlier, create a
+fresh cluster rather than upgrading — the WAL opcode change is not backward
+compatible.
+
+New objects added by the migration:
+
+| Object | Type | Description |
+|---|---|---|
+| `_pg_eddy.label_index` | TABLE | Label → node B-tree catalog index |
+| `add_label(bigint, text)` | FUNCTION | Add a label to a node |
+| `remove_label(bigint, text)` | FUNCTION | Remove a label from a node |
+| `detach_delete_node(bigint)` | FUNCTION | Detach-delete a node and all its edges |
+| `find_nodes(text, jsonb)` | FUNCTION | Label + property scan |
+| `schema_info()` | FUNCTION | Registry summary |
+
+---
+
 
 v0.4.0 implements Phase 3: correct MVCC semantics for nodes and a working
 VACUUM pass for both node and edge tables. 17/17 pgrx tests pass.
