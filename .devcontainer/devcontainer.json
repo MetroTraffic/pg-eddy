@@ -1,0 +1,21 @@
+{
+  "name": "pg-eddy",
+  "image": "mcr.microsoft.com/devcontainers/rust:1-bullseye",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer"
+      ]
+    }
+  },
+  "forwardPorts": [5432],
+  "postCreateCommand": [
+    "sudo apt-get update && sudo apt-get install -y curl gnupg2",
+    "curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg",
+    "echo 'deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] https://apt.postgresql.org/pub/repos/apt bullseye-pgdg main' | sudo tee /etc/apt/sources.list.d/pgdg.list",
+    "sudo apt-get update && sudo apt-get install -y postgresql-18 postgresql-server-dev-18 libpq-dev clang",
+    "sudo service postgresql start",
+    "cargo install --locked cargo-pgrx",
+    "cargo install --locked just"
+  ]
+}

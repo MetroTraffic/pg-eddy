@@ -2,6 +2,7 @@ use thiserror::Error;
 
 /// Canonical error type for pg_eddy.  All `PE###` codes are stable across versions.
 #[derive(Debug, Error)]
+#[allow(dead_code)]
 pub enum PgEddyError {
     // PE100 range — storage errors
     #[error("PE100: node not found: {0}")]

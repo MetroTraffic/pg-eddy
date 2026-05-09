@@ -1,21 +1,29 @@
-/// Table Access Method handler stubs — Phase 0.
+/// Table Access Method handler — Phase 1.
 ///
 /// Two AM objects are registered in the extension SQL:
 ///   CREATE ACCESS METHOD pg_eddy_node TYPE TABLE HANDLER pg_eddy_node_handler;
 ///   CREATE ACCESS METHOD pg_eddy_edge TYPE TABLE HANDLER pg_eddy_edge_handler;
 ///
-/// All callbacks return "not implemented" for Phase 0, except scan_begin /
-/// scan_getnextslot / scan_end which return an empty result set.
-///
-/// Real implementations are added in Phase 1 (nodes) and Phase 2 (edges).
+/// Phase 1: node scan and filelocator-init are wired to real storage.
+/// All edge callbacks remain "not implemented" until Phase 2.
 use pgrx::prelude::*;
 use pgrx::pg_sys;
 
+use crate::storage::node_store::NodeScanState;
+
 // ---------------------------------------------------------------------------
-// Scan stubs — return empty rather than erroring, so SELECT * FROM nodes works.
+// Scan state — embeds NodeScanState after TableScanDescData header.
+// We use a separate Box to avoid alignment issues.
 // ---------------------------------------------------------------------------
 
-/// scan_begin stub — allocates a minimal TableScanDescData.
+/// Opaque scan state allocated by `scan_begin`.
+struct PgEddyScanDesc {
+    base: pg_sys::TableScanDescData,
+    /// The actual node scan iterator; `None` for edge tables (Phase 2).
+    state: Option<NodeScanState>,
+}
+
+/// scan_begin — allocates a PgEddyScanDesc and starts node scan.
 ///
 /// # Safety
 /// Called by PostgreSQL's executor with valid, non-null pointers.
@@ -27,52 +35,79 @@ unsafe extern "C-unwind" fn stub_scan_begin(
     pscan: pg_sys::ParallelTableScanDesc,
     flags: u32,
 ) -> pg_sys::TableScanDesc {
-    let desc: *mut pg_sys::TableScanDescData = unsafe {
-        pg_sys::palloc0(std::mem::size_of::<pg_sys::TableScanDescData>()).cast()
-    };
-    unsafe {
-        (*desc).rs_rd = rel;
-        (*desc).rs_snapshot = snapshot;
-        (*desc).rs_nkeys = nkeys;
-        (*desc).rs_key = key;
-        (*desc).rs_flags = flags;
-        (*desc).rs_parallel = pscan;
-    }
-    desc
+    let state = unsafe { NodeScanState::begin(rel, snapshot) };
+    let desc = Box::new(PgEddyScanDesc {
+        base: pg_sys::TableScanDescData {
+            rs_rd: rel,
+            rs_snapshot: snapshot,
+            rs_nkeys: nkeys,
+            rs_key: key,
+            rs_flags: flags,
+            rs_parallel: pscan,
+            ..unsafe { std::mem::zeroed() }
+        },
+        state: Some(state),
+    });
+    // Safety: PG will pass this back to us; we own the memory via Box::into_raw.
+    Box::into_raw(desc) as pg_sys::TableScanDesc
 }
 
-/// scan_end stub — pfrees the descriptor.
+/// scan_end — drops the PgEddyScanDesc.
 ///
 /// # Safety
-/// Called by PostgreSQL's executor.
+/// Called by PostgreSQL's executor; scan must be a valid PgEddyScanDesc.
 unsafe extern "C-unwind" fn stub_scan_end(scan: pg_sys::TableScanDesc) {
-    unsafe { pg_sys::pfree(scan.cast()) };
+    // Reclaim the Box we allocated in scan_begin.
+    let _ = unsafe { Box::from_raw(scan as *mut PgEddyScanDesc) };
 }
 
-/// scan_rescan stub — no-op for Phase 0.
+/// scan_rescan — restart iteration from block 0.
 ///
 /// # Safety
 /// Called by PostgreSQL's executor.
 unsafe extern "C-unwind" fn stub_scan_rescan(
-    _scan: pg_sys::TableScanDesc,
+    scan: pg_sys::TableScanDesc,
     _key: *mut pg_sys::ScanKeyData,
     _set_params: bool,
     _allow_strat: bool,
     _allow_sync: bool,
     _allow_pagemode: bool,
 ) {
+    let desc = unsafe { &mut *(scan as *mut PgEddyScanDesc) };
+    let rel = desc.base.rs_rd;
+    let snapshot = desc.base.rs_snapshot;
+    desc.state = Some(unsafe { NodeScanState::begin(rel, snapshot) });
 }
 
-/// scan_getnextslot stub — always returns false (empty table).
+/// scan_getnextslot — fetch next visible node into `slot`.
+///
+/// Returns `true` if a node was returned, `false` when exhausted.
 ///
 /// # Safety
 /// Called by PostgreSQL's executor.
 unsafe extern "C-unwind" fn stub_scan_getnextslot(
-    _scan: pg_sys::TableScanDesc,
+    scan: pg_sys::TableScanDesc,
     _direction: pg_sys::ScanDirection::Type,
-    _slot: *mut pg_sys::TupleTableSlot,
+    slot: *mut pg_sys::TupleTableSlot,
 ) -> bool {
-    false
+    // `pg_eddy.nodes` has 0 columns, so we just return an empty virtual slot
+    // to signal "there is a row" — the user sees no columns anyway.
+    let desc = unsafe { &mut *(scan as *mut PgEddyScanDesc) };
+    let state = match &mut desc.state {
+        Some(s) => s,
+        None => return false,
+    };
+    let maybe = unsafe { state.next() };
+    if maybe.is_none() {
+        return false;
+    }
+    // Materialise an empty virtual tuple (no columns to fill).
+    unsafe {
+        pg_sys::ExecClearTuple(slot);
+        (*slot).tts_nvalid = 0;
+        pg_sys::ExecStoreVirtualTuple(slot);
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -176,27 +211,29 @@ unimplemented_callback!(stub_finish_bulk_insert(
     _rel: pg_sys::Relation,
     _options: std::ffi::c_int
 ));
-/// relation_set_new_filelocator — pg_eddy is a logical AM with no physical
-/// file-based storage, so there is nothing to initialize.  However PostgreSQL
-/// asserts that the out-params `freeze_xid` and `minmulti` are valid after
-/// this call (for permanent relations), so we must populate them.
+/// relation_set_new_filelocator — create the physical storage file.
+///
+/// PostgreSQL calls this when a new relation is created (e.g. `CREATE TABLE
+/// ... USING pg_eddy_node`).  We create the underlying storage file and
+/// set the freeze/minmulti out-params.  Pages are lazily allocated by
+/// `node_store::find_or_extend_page` when the first insert arrives.
 unsafe extern "C-unwind" fn stub_relation_set_new_filelocator(
     _rel: pg_sys::Relation,
-    _newrlocator: *const pg_sys::RelFileLocator,
-    _persistence: std::ffi::c_char,
+    newrlocator: *const pg_sys::RelFileLocator,
+    persistence: std::ffi::c_char,
     freeze_xid: *mut pg_sys::TransactionId,
     minmulti: *mut pg_sys::MultiXactId,
 ) {
-    // Phase 0: no storage to initialize.
-    // Must set out-params to valid values; PG18 asserts TransactionIdIsNormal
-    // for permanent relations before storing them in pg_class.
     unsafe {
+        // Set out-params (PG18 asserts TransactionIdIsNormal for permanent rels).
         if !freeze_xid.is_null() {
             *freeze_xid = pg_sys::GetCurrentTransactionId();
         }
         if !minmulti.is_null() {
             *minmulti = pg_sys::GetOldestMultiXactId();
         }
+        // Create the underlying storage file (0 blocks initially).
+        pg_sys::RelationCreateStorage(*newrlocator, persistence, true);
     }
 }
 
@@ -258,12 +295,18 @@ unimplemented_callback!(stub_index_validate_scan(
     _snapshot: pg_sys::Snapshot,
     _state: *mut pg_sys::ValidateIndexState
 ));
-/// relation_size — Phase 0 has no physical storage; report 0 blocks.
+/// relation_size — returns the physical size of the main fork in bytes.
+///
+/// IMPORTANT: must NOT call `RelationGetNumberOfBlocksInFork` here — that
+/// function calls `table_relation_size` which calls us back, causing infinite
+/// recursion and a stack-overflow SIGSEGV.  Use `smgrnblocks` directly.
 unsafe extern "C-unwind" fn stub_relation_size(
-    _rel: pg_sys::Relation,
-    _fork_number: pg_sys::ForkNumber::Type,
+    rel: pg_sys::Relation,
+    fork_number: pg_sys::ForkNumber::Type,
 ) -> pg_sys::uint64 {
-    0
+    let smgr = unsafe { pg_sys::RelationGetSmgr(rel) };
+    let nblocks = unsafe { pg_sys::smgrnblocks(smgr, fork_number) };
+    nblocks as pg_sys::uint64 * pg_sys::BLCKSZ as pg_sys::uint64
 }
 
 /// relation_needs_toast_table — logical AM, no TOAST needed.
