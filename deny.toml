@@ -1,0 +1,57 @@
+[graph]
+# Only check the pg18 feature set that we actually build/ship.
+features = ["pg18"]
+# No need to audit dev-dependency-only paths that aren't in the published binary.
+exclude-dev = false
+
+# ---------------------------------------------------------------------------
+# Advisories
+# ---------------------------------------------------------------------------
+[advisories]
+version = 2
+# serde_cbor (RUSTSEC-2021-0127) is pulled in transitively by pgrx 0.18.0.
+# There is no safe upgrade available and we cannot replace it ourselves.
+ignore = [
+    { id = "RUSTSEC-2021-0127", reason = "Transitive dep of pgrx 0.18.0; no upstream fix available yet." },
+]
+
+# ---------------------------------------------------------------------------
+# Licenses
+# ---------------------------------------------------------------------------
+[licenses]
+version = 2
+# Allow the common permissive and weak-copyleft licences used by our deps.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "OpenSSL",
+]
+# Confidence threshold for SPDX expression matching.
+confidence-threshold = 0.8
+
+
+# ---------------------------------------------------------------------------
+# Bans
+# ---------------------------------------------------------------------------
+[bans]
+# Deny multiple versions of the same crate to keep the dependency graph clean.
+# "warn" keeps the build green while we migrate; tighten to "deny" later.
+multiple-versions = "warn"
+# Wildcard deps in published crates are sloppy.
+wildcards = "allow"
+
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
