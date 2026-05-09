@@ -28,7 +28,7 @@ For a detailed feature breakdown and release history, see [CHANGELOG.md](CHANGEL
 ### Prerequisites
 
 - PostgreSQL 18.x
-- Rust 1.70+ (with `cargo`)
+- Rust 1.85+ (with `cargo`)
 - `cargo-pgrx` 0.18
 
 ### Build from Source
