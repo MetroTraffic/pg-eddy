@@ -2,7 +2,7 @@
 // We allow the old implicit-unsafe behavior here to keep the code readable.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-/// Custom WAL resource manager — Phase 2.
+/// Custom WAL resource manager — Phase 3.
 ///
 /// Uses `RM_EXPERIMENTAL_ID` (128) during development.  Before publishing any
 /// release that users might run in production, reserve a permanent ID on the
@@ -10,34 +10,26 @@
 ///
 /// WAL record types:
 ///   0x00 — XLOG_PG_EDDY_NODE_INSERT
+///   0x02 — XLOG_PG_EDDY_NODE_DELETE
 ///   0x10 — XLOG_PG_EDDY_EDGE_INSERT
 ///   0x11 — XLOG_PG_EDDY_EDGE_DELETE
 ///   0x20 — XLOG_PG_EDDY_ADJ_UPDATE
+///   0x30 — XLOG_PG_EDDY_VACUUM_PAGE
 ///
-/// WAL record layout for NODE_INSERT:
-///   Block 0:    target page (registered with REGBUF_STANDARD for full-page-write support)
-///   Block 0 data: the complete node item bytes
-///   Main data:  XLogNodeInsert { offset_number: u16, _pad: u16 }
-///
-/// WAL record layout for EDGE_INSERT:
-///   Block 0:    edge page (REGBUF_STANDARD)
-///   Block 0 data: the complete edge item bytes
-///   Main data:  XLogEdgeInsert { offset_number: u16, _pad: u16 }
-///
-/// WAL record layout for EDGE_DELETE:
-///   Block 0:    edge page (REGBUF_STANDARD)
-///   Main data:  XLogEdgeDelete { offset_number: u16, _pad: u16, xmax: u32 }
-///
-/// WAL record layout for ADJ_UPDATE:
+/// WAL record layout for NODE_DELETE:
 ///   Block 0:    node page (REGBUF_STANDARD)
-///   Block 0 data: u16 adj_slot_idx + 24 bytes new NodeAdjHeader (26 bytes total)
-///   Main data:  (none)
+///   Main data:  XLogNodeDelete { offset_number: u16, _pad: u16, xmax: u32 }
+///
+/// WAL record layout for VACUUM_PAGE:
+///   Block 0:    node or edge page (REGBUF_STANDARD)
+///   Main data:  XLogVacuumPage { n_dead: u16 } + n_dead * u16 offset numbers
 use pgrx::pg_sys;
 use std::mem::size_of;
 
 use crate::storage::page::{
     ADJ_HEADER_BYTES, NodeAdjHeader, XLOG_PG_EDDY_ADJ_UPDATE, XLOG_PG_EDDY_EDGE_DELETE,
-    XLOG_PG_EDDY_EDGE_INSERT, XLOG_PG_EDDY_NODE_INSERT,
+    XLOG_PG_EDDY_EDGE_INSERT, XLOG_PG_EDDY_NODE_DELETE, XLOG_PG_EDDY_NODE_INSERT,
+    XLOG_PG_EDDY_VACUUM_PAGE,
 };
 
 /// Development RMGR ID.  Replace with a reserved ID before production use.
@@ -51,6 +43,23 @@ struct XLogNodeInsert {
     /// The item offset at which the node record was placed.
     offset_number: u16,
     _pad: u16,
+}
+
+/// Main data appended to XLOG_PG_EDDY_NODE_DELETE records.
+#[repr(C)]
+struct XLogNodeDelete {
+    /// The item offset of the node being logically deleted.
+    offset_number: u16,
+    _pad: u16,
+    /// The xmax transaction id being set.
+    xmax: pg_sys::TransactionId,
+}
+
+/// Main data header for XLOG_PG_EDDY_VACUUM_PAGE records.
+/// Followed immediately by `n_dead` u16 offset numbers.
+#[repr(C)]
+struct XLogVacuumPage {
+    n_dead: u16,
 }
 
 /// Main data appended to XLOG_PG_EDDY_EDGE_INSERT records.
@@ -104,6 +113,63 @@ pub unsafe fn log_node_insert(
         );
         pg_sys::XLogInsert(RMGR_ID, XLOG_PG_EDDY_NODE_INSERT)
     }
+}
+
+// ---------------------------------------------------------------------------
+// log_node_delete — called by node_store::delete_node_by_id and
+// node_store::update_node inside the critical section.
+// ---------------------------------------------------------------------------
+
+/// WAL-log a node logical delete (xmax set) and return the resulting LSN.
+///
+/// # Safety
+/// Must be called while `buf` is held exclusively locked and inside a critical
+/// section.
+pub unsafe fn log_node_delete(
+    buf: pg_sys::Buffer,
+    _page: pg_sys::Page,
+    off: pg_sys::OffsetNumber,
+    xmax: pg_sys::TransactionId,
+) -> pg_sys::XLogRecPtr {
+    let xlrec = XLogNodeDelete { offset_number: off, _pad: 0, xmax };
+
+    pg_sys::XLogBeginInsert();
+    pg_sys::XLogRegisterBuffer(0, buf, pg_sys::REGBUF_STANDARD as u8);
+    pg_sys::XLogRegisterData(
+        &xlrec as *const XLogNodeDelete as *const _,
+        size_of::<XLogNodeDelete>() as u32,
+    );
+    pg_sys::XLogInsert(RMGR_ID, XLOG_PG_EDDY_NODE_DELETE)
+}
+
+// ---------------------------------------------------------------------------
+// log_vacuum_page — called by vacuum::vacuum_relation after marking dead slots.
+// ---------------------------------------------------------------------------
+
+/// WAL-log a VACUUM page operation (marking dead slots LP_DEAD).
+///
+/// `dead_offsets` must be non-empty.
+///
+/// # Safety
+/// Must be called while `buf` is held exclusively locked and inside a critical
+/// section.
+pub unsafe fn log_vacuum_page(
+    buf: pg_sys::Buffer,
+    dead_offsets: &[u16],
+) -> pg_sys::XLogRecPtr {
+    let hdr = XLogVacuumPage { n_dead: dead_offsets.len() as u16 };
+
+    pg_sys::XLogBeginInsert();
+    pg_sys::XLogRegisterBuffer(0, buf, pg_sys::REGBUF_STANDARD as u8);
+    pg_sys::XLogRegisterData(
+        &hdr as *const XLogVacuumPage as *const _,
+        size_of::<XLogVacuumPage>() as u32,
+    );
+    pg_sys::XLogRegisterData(
+        dead_offsets.as_ptr() as *const _,
+        (dead_offsets.len() * size_of::<u16>()) as u32,
+    );
+    pg_sys::XLogInsert(RMGR_ID, XLOG_PG_EDDY_VACUUM_PAGE)
 }
 
 // ---------------------------------------------------------------------------
@@ -235,9 +301,11 @@ unsafe extern "C-unwind" fn rmgr_redo(record: *mut pg_sys::XLogReaderState) {
 
     match info {
         XLOG_PG_EDDY_NODE_INSERT => unsafe { redo_node_insert(record) },
+        XLOG_PG_EDDY_NODE_DELETE => unsafe { redo_node_delete(record) },
         XLOG_PG_EDDY_EDGE_INSERT => unsafe { redo_edge_insert(record) },
         XLOG_PG_EDDY_EDGE_DELETE => unsafe { redo_edge_delete(record) },
-        XLOG_PG_EDDY_ADJ_UPDATE => unsafe { redo_adj_update(record) },
+        XLOG_PG_EDDY_ADJ_UPDATE  => unsafe { redo_adj_update(record) },
+        XLOG_PG_EDDY_VACUUM_PAGE => unsafe { redo_vacuum_page(record) },
         _ => {
             pgrx::error!("pg_eddy: unknown WAL record type 0x{:02x}", info);
         }
@@ -298,6 +366,84 @@ unsafe fn redo_node_insert(record: *mut pg_sys::XLogReaderState) {
         }
     }
 
+    if buf != 0 {
+        unsafe { pg_sys::UnlockReleaseBuffer(buf) };
+    }
+}
+
+/// Redo a node logical delete (xmax set).
+unsafe fn redo_node_delete(record: *mut pg_sys::XLogReaderState) {
+    let main_data_len = unsafe { xlog_rec_get_data_len(record) } as usize;
+    if main_data_len < size_of::<XLogNodeDelete>() {
+        pgrx::error!("pg_eddy redo: NODE_DELETE main data too short ({} bytes)", main_data_len);
+    }
+    let xlrec = unsafe {
+        let ptr = xlog_rec_get_data(record) as *const XLogNodeDelete;
+        ptr.read_unaligned()
+    };
+    let off = xlrec.offset_number;
+    let xmax = xlrec.xmax;
+
+    let mut buf: pg_sys::Buffer = 0;
+    let action = unsafe { pg_sys::XLogReadBufferForRedo(record, 0, &mut buf) };
+
+    if action == pg_sys::XLogRedoAction::BLK_NEEDS_REDO {
+        let page = unsafe { pg_sys::BufferGetPage(buf) };
+        let iid = unsafe { pg_sys::PageGetItemId(page, off) };
+        if unsafe { (*iid).lp_flags() } == pg_sys::LP_NORMAL {
+            let hdr = unsafe {
+                pg_sys::PageGetItem(page as *const _, iid) as *mut pg_sys::HeapTupleHeaderData
+            };
+            unsafe {
+                pg_sys::HeapTupleHeaderSetXmax(hdr, xmax);
+                (*hdr).t_infomask &= !(pg_sys::HEAP_XMAX_INVALID as u16);
+            }
+        }
+        let lsn = unsafe { xlog_rec_get_lsn(record) };
+        unsafe {
+            pg_sys::PageSetLSN(page, lsn);
+            pg_sys::MarkBufferDirty(buf);
+        }
+    }
+    if buf != 0 {
+        unsafe { pg_sys::UnlockReleaseBuffer(buf) };
+    }
+}
+
+/// Redo a vacuum page (mark dead slots LP_DEAD).
+unsafe fn redo_vacuum_page(record: *mut pg_sys::XLogReaderState) {
+    let main_data_len = unsafe { xlog_rec_get_data_len(record) } as usize;
+    if main_data_len < size_of::<XLogVacuumPage>() {
+        pgrx::error!("pg_eddy redo: VACUUM_PAGE main data too short ({} bytes)", main_data_len);
+    }
+    let data_ptr = unsafe { xlog_rec_get_data(record) as *const u8 };
+    let hdr = unsafe { (data_ptr as *const XLogVacuumPage).read_unaligned() };
+    let n_dead = hdr.n_dead as usize;
+
+    let offsets_ptr = unsafe { data_ptr.add(size_of::<XLogVacuumPage>()) as *const u16 };
+    let expected_len = size_of::<XLogVacuumPage>() + n_dead * size_of::<u16>();
+    if main_data_len < expected_len {
+        pgrx::error!("pg_eddy redo: VACUUM_PAGE main data too short for {} offsets", n_dead);
+    }
+
+    let mut buf: pg_sys::Buffer = 0;
+    let action = unsafe { pg_sys::XLogReadBufferForRedo(record, 0, &mut buf) };
+
+    if action == pg_sys::XLogRedoAction::BLK_NEEDS_REDO {
+        let page = unsafe { pg_sys::BufferGetPage(buf) };
+        for i in 0..n_dead {
+            let off = unsafe { offsets_ptr.add(i).read_unaligned() } as pg_sys::OffsetNumber;
+            let iid = unsafe { pg_sys::PageGetItemId(page, off) };
+            if unsafe { (*iid).lp_flags() } == pg_sys::LP_NORMAL {
+                unsafe { (*iid).set_lp_flags(pg_sys::LP_DEAD) };
+            }
+        }
+        let lsn = unsafe { xlog_rec_get_lsn(record) };
+        unsafe {
+            pg_sys::PageSetLSN(page, lsn);
+            pg_sys::MarkBufferDirty(buf);
+        }
+    }
     if buf != 0 {
         unsafe { pg_sys::UnlockReleaseBuffer(buf) };
     }
@@ -441,9 +587,11 @@ unsafe extern "C-unwind" fn rmgr_desc(
     let info = unsafe { xlog_rec_get_info(record) } & !(pg_sys::XLR_INFO_MASK as u8);
     let msg = match info {
         XLOG_PG_EDDY_NODE_INSERT => c"node_insert",
+        XLOG_PG_EDDY_NODE_DELETE => c"node_delete",
         XLOG_PG_EDDY_EDGE_INSERT => c"edge_insert",
         XLOG_PG_EDDY_EDGE_DELETE => c"edge_delete",
         XLOG_PG_EDDY_ADJ_UPDATE  => c"adj_update",
+        XLOG_PG_EDDY_VACUUM_PAGE => c"vacuum_page",
         _ => c"unknown",
     };
     unsafe { pg_sys::appendStringInfoString(buf, msg.as_ptr()) };
@@ -457,9 +605,11 @@ unsafe extern "C-unwind" fn rmgr_identify(info: u8) -> *const std::ffi::c_char {
     let info = info & !(pg_sys::XLR_INFO_MASK as u8);
     match info {
         XLOG_PG_EDDY_NODE_INSERT => c"NODE_INSERT".as_ptr(),
+        XLOG_PG_EDDY_NODE_DELETE => c"NODE_DELETE".as_ptr(),
         XLOG_PG_EDDY_EDGE_INSERT => c"EDGE_INSERT".as_ptr(),
         XLOG_PG_EDDY_EDGE_DELETE => c"EDGE_DELETE".as_ptr(),
         XLOG_PG_EDDY_ADJ_UPDATE  => c"ADJ_UPDATE".as_ptr(),
+        XLOG_PG_EDDY_VACUUM_PAGE => c"VACUUM_PAGE".as_ptr(),
         _ => c"UNKNOWN".as_ptr(),
     }
 }

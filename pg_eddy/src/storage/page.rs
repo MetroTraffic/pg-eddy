@@ -19,7 +19,8 @@ pub const XLOG_PG_EDDY_NODE_UPDATE_PROPS: u8 = 0x01;
 pub const XLOG_PG_EDDY_NODE_DELETE: u8 = 0x02;
 pub const XLOG_PG_EDDY_EDGE_INSERT: u8 = 0x10; // Phase 2
 pub const XLOG_PG_EDDY_EDGE_DELETE: u8 = 0x11; // Phase 2
-pub const XLOG_PG_EDDY_ADJ_UPDATE: u8 = 0x20; // Phase 2
+pub const XLOG_PG_EDDY_ADJ_UPDATE: u8 = 0x20;  // Phase 2
+pub const XLOG_PG_EDDY_VACUUM_PAGE: u8 = 0x30;  // Phase 3
 
 // ---------------------------------------------------------------------------
 // Page geometry

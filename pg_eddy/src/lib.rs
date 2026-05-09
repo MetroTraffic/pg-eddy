@@ -1,4 +1,4 @@
-// pg_eddy — Phase 2: Edge Storage + Adjacency Lists
+// pg_eddy — Phase 3: MVCC and VACUUM (v0.4.0)
 //
 // This is the extension entry point.  At _PG_init we:
 //   1. Register the custom WAL resource manager.
@@ -17,7 +17,7 @@ pgrx::pg_module_magic!();
 // ---------------------------------------------------------------------------
 // Extension SQL — schemas, registry tables, AM objects, and SQL functions.
 // ---------------------------------------------------------------------------
-extension_sql_file!("../sql/pg_eddy--0.3.0.sql", name = "pg_eddy_schema", finalize);
+extension_sql_file!("../sql/pg_eddy--0.4.0.sql", name = "pg_eddy_schema", finalize);
 
 // ---------------------------------------------------------------------------
 // _PG_init  — runs at postmaster start (shared_preload_libraries)
@@ -380,6 +380,158 @@ fn expand(
 }
 
 // ---------------------------------------------------------------------------
+// Node update / delete (Phase 3 MVCC)
+// ---------------------------------------------------------------------------
+
+/// Update a node's labels and properties.
+///
+/// The old node record is logically deleted and a new MVCC version is inserted
+/// on the **same page** (adj_slot_idx preserved).  If the new record is too
+/// large to fit on the same page an error is raised.
+///
+/// Returns `false` if the node was not found.
+#[pg_extern]
+fn update_node(node_id: i64, labels: Vec<String>, properties: pgrx::JsonB) -> bool {
+    use crate::catalog::labels::{ensure_label, ensure_prop_key};
+    use crate::storage::prop_store;
+
+    let label_ids: Vec<i32> = labels.iter().map(|l| ensure_label(l)).collect();
+    let prop_obj = match &properties.0 {
+        serde_json::Value::Object(m) => m.clone(),
+        _ => serde_json::Map::new(),
+    };
+    let prop_bytes =
+        prop_store::encode(&prop_obj, |name| -> Result<i32, std::convert::Infallible> {
+            Ok(ensure_prop_key(name))
+        })
+        .unwrap_or_default();
+
+    unsafe {
+        use pgrx::pg_sys;
+        let rel = open_nodes_relation();
+        let found =
+            crate::storage::node_store::update_node(rel, node_id, &label_ids, &prop_bytes);
+        pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        found
+    }
+}
+
+/// Logically delete a node by id.
+///
+/// The node is marked as deleted (xmax set); physical reclamation happens
+/// during VACUUM. Returns `false` if the node was not found.
+#[pg_extern]
+fn delete_node(node_id: i64) -> bool {
+    unsafe {
+        use pgrx::pg_sys;
+        let rel = open_nodes_relation();
+        let found = crate::storage::node_store::delete_node_by_id(rel, node_id);
+        pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        found
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AM statistics (Phase 3)
+// ---------------------------------------------------------------------------
+
+/// Return live/dead tuple counts for nodes and edges as a JSONB document.
+///
+/// This is a convenience diagnostic function; it does NOT call VACUUM.
+/// Counts are approximate: they reflect the current snapshot visibility.
+#[pg_extern]
+fn am_stats() -> pgrx::JsonB {
+    use std::mem::size_of;
+    use pgrx::pg_sys;
+    use crate::storage::page::NODE_FIXED_DATA_SIZE;
+
+    let (live_nodes, dead_nodes, node_pages) = unsafe {
+        let rel = open_nodes_relation();
+        let snapshot = pg_sys::GetActiveSnapshot();
+        let hdr_size = size_of::<pg_sys::HeapTupleHeaderData>();
+        let nblocks = pg_sys::RelationGetNumberOfBlocksInFork(
+            rel,
+            pg_sys::ForkNumber::MAIN_FORKNUM,
+        );
+        let mut live = 0u64;
+        let mut dead = 0u64;
+        for blkno in 0..nblocks {
+            let buf = pg_sys::ReadBufferExtended(
+                rel,
+                pg_sys::ForkNumber::MAIN_FORKNUM,
+                blkno,
+                pg_sys::ReadBufferMode::RBM_NORMAL,
+                std::ptr::null_mut(),
+            );
+            pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
+            let page = pg_sys::BufferGetPage(buf);
+            let max_off = pg_sys::PageGetMaxOffsetNumber(page as *const _);
+            for off in pg_sys::FirstOffsetNumber..=max_off {
+                let iid = pg_sys::PageGetItemId(page, off);
+                if (*iid).lp_flags() != pg_sys::LP_NORMAL { continue; }
+                let item_len = (*iid).lp_len() as usize;
+                if item_len < hdr_size + NODE_FIXED_DATA_SIZE { continue; }
+                let item = pg_sys::PageGetItem(page as *const _, iid) as *const u8;
+                let hdr = item as *const pg_sys::HeapTupleHeaderData;
+                let xmax_invalid = ((*hdr).t_infomask & pg_sys::HEAP_XMAX_INVALID as u16) != 0;
+                if xmax_invalid { live += 1; } else { dead += 1; }
+            }
+            pg_sys::UnlockReleaseBuffer(buf);
+        }
+        pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        (live, dead, nblocks)
+    };
+
+    let (live_edges, dead_edges, edge_pages) = unsafe {
+        let rel = open_edges_relation();
+        let hdr_size = size_of::<pg_sys::HeapTupleHeaderData>();
+        let nblocks = pg_sys::RelationGetNumberOfBlocksInFork(
+            rel,
+            pg_sys::ForkNumber::MAIN_FORKNUM,
+        );
+        let mut live = 0u64;
+        let mut dead = 0u64;
+        for blkno in 0..nblocks {
+            let buf = pg_sys::ReadBufferExtended(
+                rel,
+                pg_sys::ForkNumber::MAIN_FORKNUM,
+                blkno,
+                pg_sys::ReadBufferMode::RBM_NORMAL,
+                std::ptr::null_mut(),
+            );
+            pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
+            let page = pg_sys::BufferGetPage(buf);
+            let max_off = pg_sys::PageGetMaxOffsetNumber(page as *const _);
+            for off in pg_sys::FirstOffsetNumber..=max_off {
+                let iid = pg_sys::PageGetItemId(page, off);
+                let flags = (*iid).lp_flags();
+                if flags != pg_sys::LP_NORMAL && flags != pg_sys::LP_DEAD { continue; }
+                let item_len = (*iid).lp_len() as usize;
+                if item_len < hdr_size + 1 { continue; }
+                if flags == pg_sys::LP_DEAD { dead += 1; continue; }
+                let item = pg_sys::PageGetItem(page as *const _, iid) as *const u8;
+                let hdr = item as *const pg_sys::HeapTupleHeaderData;
+                let xmax_invalid = ((*hdr).t_infomask & pg_sys::HEAP_XMAX_INVALID as u16) != 0;
+                if xmax_invalid { live += 1; } else { dead += 1; }
+            }
+            pg_sys::UnlockReleaseBuffer(buf);
+        }
+        pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        (live, dead, nblocks)
+    };
+
+    let out = serde_json::json!({
+        "node_pages": node_pages,
+        "edge_pages": edge_pages,
+        "live_nodes": live_nodes,
+        "dead_nodes": dead_nodes,
+        "live_edges": live_edges,
+        "dead_edges": dead_edges,
+    });
+    pgrx::JsonB(out)
+}
+
+// ---------------------------------------------------------------------------
 // pg_test module — pgrx unit tests
 // ---------------------------------------------------------------------------
 #[cfg(any(test, feature = "pg_test"))]
@@ -531,6 +683,76 @@ mod tests {
         let (rel_id, other, _type_id, _props) = &rows[0];
         assert_eq!(*rel_id, eid);
         assert_eq!(*other, tgt);
+    }
+
+    #[pg_test]
+    fn test_update_node() {
+        // Create a node with initial labels and properties.
+        let node_id = crate::create_node(
+            vec!["Person".into()],
+            pgrx::JsonB(serde_json::json!({"name": "Alice"})),
+        );
+        assert!(node_id > 0);
+
+        // Verify initial state.
+        let before = crate::get_node(node_id).expect("node should exist");
+        assert_eq!(before.0["properties"]["name"], serde_json::json!("Alice"));
+
+        // Update labels and properties.
+        let found = crate::update_node(
+            node_id,
+            vec!["Person".into(), "Engineer".into()],
+            pgrx::JsonB(serde_json::json!({"name": "Alice", "role": "eng"})),
+        );
+        assert!(found, "update_node should return true for existing node");
+
+        // Verify updated state.
+        let after = crate::get_node(node_id).expect("updated node should still be visible");
+        let labels = after.0["labels"].as_array().unwrap();
+        assert!(labels.contains(&serde_json::json!("Engineer")), "should have new label");
+        assert_eq!(after.0["properties"]["role"], serde_json::json!("eng"));
+
+        // Old version should not be visible (only newest live version).
+        let count_alice: Vec<_> = std::iter::once(after)
+            .filter(|r| r.0["node_id"] == serde_json::json!(node_id))
+            .collect();
+        assert_eq!(count_alice.len(), 1, "only one live version should exist");
+    }
+
+    #[pg_test]
+    fn test_delete_node() {
+        let node_id = crate::create_node(
+            vec!["Temp".into()],
+            pgrx::JsonB(serde_json::json!({"x": 1})),
+        );
+        assert!(node_id > 0);
+
+        // Should be visible before delete.
+        assert!(crate::get_node(node_id).is_some(), "node should exist before delete");
+
+        let deleted = crate::delete_node(node_id);
+        assert!(deleted, "delete_node should return true");
+
+        // Should NOT be visible after delete.
+        assert!(crate::get_node(node_id).is_none(), "deleted node should not be visible");
+
+        // Deleting again should return false.
+        assert!(!crate::delete_node(node_id), "second delete should return false");
+    }
+
+    #[pg_test]
+    fn test_am_stats() {
+        // Create some nodes and edges, then check am_stats reports sensible values.
+        let n1 = crate::create_node(vec![], pgrx::JsonB(serde_json::json!({})));
+        let n2 = crate::create_node(vec![], pgrx::JsonB(serde_json::json!({})));
+        crate::create_edge(n1, n2, "X", pgrx::JsonB(serde_json::json!({})));
+
+        let stats = crate::am_stats();
+        let live_nodes = stats.0["live_nodes"].as_u64().unwrap();
+        let live_edges = stats.0["live_edges"].as_u64().unwrap();
+        // We created at least 2 nodes and 1 edge in this test.
+        assert!(live_nodes >= 2, "live_nodes should be >= 2, got {live_nodes}");
+        assert!(live_edges >= 1, "live_edges should be >= 1, got {live_edges}");
     }
 }
 

@@ -6,11 +6,78 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.4.0](#040--2026-05-09--mvcc-and-vacuum) — MVCC and VACUUM
 - [0.3.0](#030--2026-05-09--edge-storage--adjacency-lists) — Edge Storage + Adjacency Lists
 - [0.2.0](#020--2026-05-09--node-storage) — Node Storage
 - [0.1.0](#010--2026-05-09--am-skeleton) — AM Skeleton
 
 ---
+
+## [0.4.0] — 2026-05-09 — MVCC and VACUUM
+
+v0.4.0 implements Phase 3: correct MVCC semantics for nodes and a working
+VACUUM pass for both node and edge tables. 17/17 pgrx tests pass.
+
+### What's New
+
+**Node MVCC**
+
+- `pg_eddy.update_node(node_id, labels, properties)` — logically deletes the
+  old node record and inserts a new MVCC version on the same page, preserving
+  the adjacency-header slot index (`adj_slot_idx`).
+- `pg_eddy.delete_node(node_id)` — sets xmax on the node record; physical
+  reclamation happens during the next VACUUM pass.
+- `read_node_at_offset` now performs full xmin/xmax visibility checks, so
+  deleted or not-yet-committed node inserts are correctly filtered out of
+  scans and `get_node()` results.
+
+**adj_slot_idx fix**
+
+A bug in Phase 1 caused every node to be stored with `adj_slot_idx = 0`,
+meaning all nodes on a page incorrectly shared the same adjacency header
+slot. This is now fixed: after `PageAddItemExtended` the correct slot index
+(`off − 1`) is written back into the in-page record and used for all
+adjacency-header reads and writes.
+
+**VACUUM**
+
+- `VACUUM _pg_eddy.nodes` and `VACUUM _pg_eddy.edges` are now functional.
+  The `relation_vacuum` AM callback scans every page, finds slots whose
+  xmax has been committed before `GetOldestNonRemovableTransactionId`, marks
+  them `LP_DEAD`, and WAL-logs the change via the new
+  `XLOG_PG_EDDY_VACUUM_PAGE` (0x30) WAL record type.
+- Dead edge slots are **not** physically removed in v0.4.0; instead they are
+  kept with `LP_DEAD` flags so that adjacency-chain traversal can still read
+  the `next_out` / `next_in` pointers through them. Physical compaction
+  (`PageRepairFragmentation`) is planned for Phase 4.
+- `edge_store::follow_chain` now handles `LP_DEAD` slots: they are skipped
+  (not yielded to callers) but the chain pointer is still followed so the
+  remainder of the chain is reachable.
+
+**WAL**
+
+- New `XLOG_PG_EDDY_NODE_DELETE` (0x02) WAL record: sets xmax on the
+  in-page `HeapTupleHeaderData`.
+- New `XLOG_PG_EDDY_VACUUM_PAGE` (0x30) WAL record: a compact list of
+  offset numbers to mark `LP_DEAD` on redo.
+- Both records have corresponding redo functions, `rmgr_desc`, and
+  `rmgr_identify` entries.
+
+**am_stats()**
+
+`pg_eddy.am_stats()` returns a JSONB document with `live_nodes`, `dead_nodes`,
+`live_edges`, `dead_edges`, `node_pages`, and `edge_pages`, suitable for
+diagnosing fragmentation before running VACUUM.
+
+### Edge-store improvements
+
+The private `find_node_location` in `edge_store.rs` has been replaced by the
+public `node_store::find_node_location`, which returns the **stored**
+`adj_slot_idx` from the node record rather than computing it from the item
+offset. This is important for correctness after node updates create new items
+at different offsets while the adj slot stays the same.
+
+
 
 ## [0.3.0] — 2026-05-09 — Edge Storage + Adjacency Lists
 

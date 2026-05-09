@@ -259,11 +259,16 @@ unimplemented_callback!(stub_relation_copy_for_cluster(
     _tups_vacuumed: *mut f64,
     _tups_recently_dead: *mut f64
 ));
-unimplemented_callback!(stub_relation_vacuum(
-    _rel: pg_sys::Relation,
+
+/// VACUUM callback: scan the relation and mark dead tuples LP_DEAD.
+unsafe extern "C-unwind" fn stub_relation_vacuum(
+    rel: pg_sys::Relation,
     _params: *mut pg_sys::VacuumParams,
-    _bstrategy: pg_sys::BufferAccessStrategy
-));
+    _bstrategy: pg_sys::BufferAccessStrategy,
+) {
+    let _stats = unsafe { crate::storage::vacuum::vacuum_relation(rel) };
+    // Stats are currently discarded; Phase 4 will hook them into pg_stat_user_tables.
+}
 unimplemented_callback!(stub_scan_analyze_next_block(
     _scan: pg_sys::TableScanDesc,
     _stream: *mut pg_sys::ReadStream

@@ -24,8 +24,9 @@ use crate::storage::page::{
     OFF_EDGE_NEXT_IN_SLOT, OFF_EDGE_NEXT_OUT_PAGE, OFF_EDGE_NEXT_OUT_SLOT,
     OFF_EDGE_PROP_DATA, OFF_EDGE_PROP_INLINE_LEN, OFF_EDGE_PROP_OVERFLOW_PAGE,
     OFF_EDGE_REL_ID, OFF_EDGE_REL_TYPE_ID, OFF_EDGE_SOURCE_NODE_ID, OFF_EDGE_TARGET_NODE_ID,
-    OFF_NODE_ID, NODE_FIXED_DATA_SIZE, PROP_INLINE_MAX,
+    PROP_INLINE_MAX,
 };
+use crate::storage::node_store::find_node_location;
 use crate::storage::wal::{log_adj_update, log_edge_delete, log_edge_insert};
 
 // ---------------------------------------------------------------------------
@@ -104,18 +105,17 @@ pub unsafe fn insert_edge(
 
     let snapshot = pg_sys::GetActiveSnapshot();
 
-    // Find locations of source and target nodes (sequential scan, O(n) for Phase 2).
-    let (src_blk, src_off) = find_node_location(node_rel, src_node_id, snapshot)
+    // Find locations of source and target nodes using the public node_store helper.
+    let (src_blk, src_off, src_adj_idx) = find_node_location(node_rel, src_node_id, snapshot)
         .unwrap_or_else(|| {
             pgrx::error!("pg_eddy PE400: source node {} not found", src_node_id)
         });
-    let (tgt_blk, tgt_off) = find_node_location(node_rel, tgt_node_id, snapshot)
+    let (tgt_blk, tgt_off, tgt_adj_idx) = find_node_location(node_rel, tgt_node_id, snapshot)
         .unwrap_or_else(|| {
             pgrx::error!("pg_eddy PE400: target node {} not found", tgt_node_id)
         });
 
-    let src_adj_idx = (src_off - pg_sys::FirstOffsetNumber) as usize;
-    let tgt_adj_idx = (tgt_off - pg_sys::FirstOffsetNumber) as usize;
+    let _ = (src_off, tgt_off); // offsets not needed; we use stored adj indices
 
     let same_node_page = src_blk == tgt_blk;
 
@@ -465,12 +465,11 @@ pub unsafe fn adjacency_follow(
     rel_type_filter: Option<i32>,
     snapshot: pg_sys::Snapshot,
 ) -> Vec<EdgeRecord> {
-    // Locate the node to get its adjacency header.
-    let (node_blk, node_off) = match find_node_location(node_rel, node_id, snapshot) {
+    // Find the node using the public helper.
+    let (node_blk, _node_off, adj_idx) = match find_node_location(node_rel, node_id, snapshot) {
         Some(loc) => loc,
         None => return Vec::new(),
     };
-    let adj_idx = (node_off - pg_sys::FirstOffsetNumber) as usize;
 
     // Read the adjacency header (brief shared lock).
     let node_buf = pg_sys::ReadBufferExtended(
@@ -515,8 +514,8 @@ pub unsafe fn adjacency_follow(
 
 /// Walk one adjacency chain and collect visible edge records.
 ///
-/// We always read each slot (even invisible ones) to extract the next
-/// pointer; only visible edges are appended to `out`.
+/// We always read each slot (even invisible ones or LP_DEAD) to extract the
+/// next pointer; only visible LP_NORMAL edges are appended to `out`.
 unsafe fn follow_chain(
     edge_rel: pg_sys::Relation,
     mut head_pg: u32,
@@ -545,8 +544,17 @@ unsafe fn follow_chain(
         let flags = (*iid).lp_flags();
         let item_len = (*iid).lp_len() as usize;
 
-        if flags != pg_sys::LP_NORMAL || item_len < hdr_size + EDGE_FIXED_DATA_SIZE {
-            // Corrupted or reclaimed slot — stop traversal.
+        // LP_DEAD: VACUUM has marked this slot dead but kept data for chain following.
+        // We skip it (don't yield) but still follow the next pointer.
+        let is_lp_dead = flags == pg_sys::LP_DEAD;
+        let is_lp_normal = flags == pg_sys::LP_NORMAL;
+
+        if !is_lp_normal && !is_lp_dead {
+            // LP_UNUSED or other invalid — stop traversal (broken chain).
+            pg_sys::UnlockReleaseBuffer(buf);
+            break;
+        }
+        if item_len < hdr_size + EDGE_FIXED_DATA_SIZE {
             pg_sys::UnlockReleaseBuffer(buf);
             break;
         }
@@ -569,7 +577,7 @@ unsafe fn follow_chain(
         // Check visibility: skip logically-deleted edges.
         let hdr = item as *const pg_sys::HeapTupleHeaderData;
         let xmax_invalid = ((*hdr).t_infomask & pg_sys::HEAP_XMAX_INVALID as u16) != 0;
-        if xmax_invalid {
+        if xmax_invalid && is_lp_normal {
             // Edge is alive — decode and maybe yield it.
             if let Some(rec) = decode_edge_record(data, item_len - hdr_size, head_pg, off) {
                 let passes_filter = rel_type_filter.map_or(true, |t| t == rec.rel_type_id);
@@ -578,7 +586,7 @@ unsafe fn follow_chain(
                 }
             }
         }
-        // If xmax is set (edge deleted), we still follow the chain pointer.
+        // If xmax is set (edge deleted) or LP_DEAD, we still follow the chain pointer.
 
         pg_sys::UnlockReleaseBuffer(buf);
 
@@ -622,65 +630,6 @@ unsafe fn write_adj_header(page: pg_sys::Page, idx: usize, hdr: &NodeAdjHeader) 
     let special = pg_sys::PageGetSpecialPointer(page) as *mut u8;
     let offset = idx * ADJ_HEADER_BYTES;
     std::ptr::copy_nonoverlapping(hdr.as_bytes().as_ptr(), special.add(offset), ADJ_HEADER_BYTES);
-}
-
-/// Scan the node relation for a node with `node_id`.
-///
-/// Returns `(block_number, item_offset)` or `None`.
-///
-/// # Safety
-/// `rel` must be a valid, open node relation.
-unsafe fn find_node_location(
-    rel: pg_sys::Relation,
-    node_id: i64,
-    _snapshot: pg_sys::Snapshot,
-) -> Option<(pg_sys::BlockNumber, pg_sys::OffsetNumber)> {
-    let hdr_size = size_of::<pg_sys::HeapTupleHeaderData>();
-    let nblocks =
-        pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
-
-    for blkno in 0..nblocks {
-        let buf = pg_sys::ReadBufferExtended(
-            rel,
-            pg_sys::ForkNumber::MAIN_FORKNUM,
-            blkno,
-            pg_sys::ReadBufferMode::RBM_NORMAL,
-            std::ptr::null_mut(),
-        );
-        pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
-        let page = pg_sys::BufferGetPage(buf);
-        let max_off = pg_sys::PageGetMaxOffsetNumber(page as *const _);
-
-        let mut found: Option<(pg_sys::BlockNumber, pg_sys::OffsetNumber)> = None;
-        for off in pg_sys::FirstOffsetNumber..=max_off {
-            let iid = pg_sys::PageGetItemId(page, off);
-            if (*iid).lp_flags() != pg_sys::LP_NORMAL {
-                continue;
-            }
-            let item_len = (*iid).lp_len() as usize;
-            if item_len < hdr_size + NODE_FIXED_DATA_SIZE {
-                continue;
-            }
-            let item = pg_sys::PageGetItem(page as *const _, iid) as *const u8;
-            let raw = std::slice::from_raw_parts(item, item_len);
-            let data = &raw[hdr_size..];
-            let nid = i64::from_le_bytes(
-                data[OFF_NODE_ID..OFF_NODE_ID + 8].try_into().unwrap(),
-            );
-            // Phase 2: also skip logically-deleted nodes.
-            let hdr = item as *const pg_sys::HeapTupleHeaderData;
-            let xmax_invalid = ((*hdr).t_infomask & pg_sys::HEAP_XMAX_INVALID as u16) != 0;
-            if nid == node_id && xmax_invalid {
-                found = Some((blkno, off));
-                break;
-            }
-        }
-        pg_sys::UnlockReleaseBuffer(buf);
-        if found.is_some() {
-            return found;
-        }
-    }
-    None
 }
 
 /// Build the raw bytes for an edge item (including HeapTupleHeaderData).

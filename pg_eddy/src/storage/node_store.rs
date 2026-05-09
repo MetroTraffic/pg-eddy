@@ -21,7 +21,7 @@ use crate::storage::page::{
     OFF_LABEL_IDS, OFF_NODE_ID, OFF_PROP_INLINE_LEN, OFF_PROP_OVERFLOW_PAGE,
     PD_NODE_SPECIAL_SIZE, PROP_INLINE_MAX,
 };
-use crate::storage::wal::log_node_insert;
+use crate::storage::wal::{log_node_delete, log_node_insert};
 
 // ---------------------------------------------------------------------------
 // Public node record
@@ -31,6 +31,7 @@ use crate::storage::wal::log_node_insert;
 #[derive(Debug, Clone)]
 pub struct NodeRecord {
     pub node_id: i64,
+    pub adj_slot_idx: u16,
     pub label_ids: Vec<i32>,
     pub prop_bytes: Vec<u8>,
 }
@@ -69,7 +70,7 @@ pub unsafe fn insert_node(
         );
     }
 
-    let item_bytes = build_node_item_bytes(node_id, label_ids, prop_bytes);
+    let item_bytes = build_node_item_bytes(node_id, 0 /*adj_slot_idx placeholder*/, label_ids, prop_bytes);
 
     // Find a page with enough free space, or extend.
     let buf = find_or_extend_page(rel, item_bytes.len());
@@ -95,6 +96,21 @@ pub unsafe fn insert_node(
         // Roll back critical section before panic
         unsafe { pg_sys::CritSectionCount -= 1; }
         pgrx::error!("pg_eddy: PageAddItemExtended failed on block {blkno}");
+    }
+
+    // Fix adj_slot_idx in the in-page copy to the actual slot index (off - 1).
+    // This is permanent: it does not change when properties are updated.
+    let adj_slot_idx = (off - pg_sys::FirstOffsetNumber) as u16;
+    unsafe {
+        let iid = pg_sys::PageGetItemId(page, off);
+        let item_in_page = pg_sys::PageGetItem(page as *const _, iid) as *mut u8;
+        let hdr_size = size_of::<pg_sys::HeapTupleHeaderData>();
+        let data_ptr = item_in_page.add(hdr_size);
+        std::ptr::copy_nonoverlapping(
+            adj_slot_idx.to_le_bytes().as_ptr(),
+            data_ptr.add(OFF_ADJ_SLOT),
+            2,
+        );
     }
 
     // Set the self-pointer (t_ctid) in the in-page copy of the header.
@@ -300,7 +316,16 @@ pub unsafe fn init_node_page(page: pg_sys::Page) {
 // ---------------------------------------------------------------------------
 
 /// Build the raw bytes for a node item.
-unsafe fn build_node_item_bytes(node_id: i64, label_ids: &[i32], prop_bytes: &[u8]) -> Vec<u8> {
+///
+/// `adj_slot_idx` — the permanent adjacency-header slot index (0-based); pass
+/// 0 as a placeholder in `insert_node` and overwrite in the in-page copy
+/// after `PageAddItemExtended` returns the actual offset.
+unsafe fn build_node_item_bytes(
+    node_id: i64,
+    adj_slot_idx: u16,
+    label_ids: &[i32],
+    prop_bytes: &[u8],
+) -> Vec<u8> {
     let hdr_size = size_of::<pg_sys::HeapTupleHeaderData>();
     let total = hdr_size + NODE_FIXED_DATA_SIZE + label_ids.len() * 4 + prop_bytes.len();
     let mut buf = vec![0u8; total];
@@ -328,8 +353,8 @@ unsafe fn build_node_item_bytes(node_id: i64, label_ids: &[i32], prop_bytes: &[u
     let data = &mut buf[hdr_size..];
     // node_id (8)
     data[OFF_NODE_ID..OFF_NODE_ID + 8].copy_from_slice(&node_id.to_le_bytes());
-    // adj_slot_idx (2) — 0 for Phase 1 (no edges)
-    data[OFF_ADJ_SLOT..OFF_ADJ_SLOT + 2].copy_from_slice(&0u16.to_le_bytes());
+    // adj_slot_idx (2)
+    data[OFF_ADJ_SLOT..OFF_ADJ_SLOT + 2].copy_from_slice(&adj_slot_idx.to_le_bytes());
     // label_count (1)
     data[OFF_LABEL_COUNT] = label_ids.len() as u8;
     // prop_inline_len (2)
@@ -399,8 +424,8 @@ unsafe fn find_or_extend_page(rel: pg_sys::Relation, item_size: usize) -> pg_sys
 
 /// Read and decode a node item at `off` in `page`.
 ///
-/// Phase 1: skips full MVCC visibility check — returns all LP_NORMAL items.
-/// Full MVCC (HeapTupleSatisfiesVisibility) will be added in Phase 3.
+/// Phase 3: checks xmin visibility and xmax (logical delete) for correct
+/// MVCC semantics.
 unsafe fn read_node_at_offset(
     page: pg_sys::Page,
     _buf: pg_sys::Buffer,
@@ -408,7 +433,7 @@ unsafe fn read_node_at_offset(
     off: pg_sys::OffsetNumber,
 ) -> Option<NodeRecord> {
     let iid = unsafe { pg_sys::PageGetItemId(page, off) };
-    // Skip empty/dead item pointers (LP_NORMAL = 1).
+    // Only read LP_NORMAL items.
     let flags = unsafe { (*iid).lp_flags() };
     if flags != pg_sys::LP_NORMAL {
         return None;
@@ -416,15 +441,41 @@ unsafe fn read_node_at_offset(
     let item_len = unsafe { (*iid).lp_len() } as usize;
     let item = unsafe { pg_sys::PageGetItem(page as *const _, iid) as *const u8 };
 
+    // MVCC xmin check: exclude tuples from aborted or in-progress transactions.
+    let hdr = item as *const pg_sys::HeapTupleHeaderData;
+    let infomask = unsafe { (*hdr).t_infomask };
+    let xmin_committed = (infomask & pg_sys::HEAP_XMIN_COMMITTED as u16) != 0;
+    let xmin_invalid_flag = (infomask & pg_sys::HEAP_XMIN_INVALID as u16) != 0;
+    let xmin_visible = if xmin_committed {
+        true
+    } else if xmin_invalid_flag {
+        false
+    } else {
+        let xmin = unsafe { (*hdr).t_choice.t_heap.t_xmin };
+        xmin != pg_sys::InvalidTransactionId
+            && (unsafe { pg_sys::TransactionIdIsCurrentTransactionId(xmin) }
+                || unsafe { pg_sys::TransactionIdDidCommit(xmin) })
+    };
+    if !xmin_visible {
+        return None;
+    }
+
+    // MVCC xmax check: exclude logically deleted tuples.
+    let xmax_invalid = (infomask & pg_sys::HEAP_XMAX_INVALID as u16) != 0;
+    if !xmax_invalid {
+        return None; // logically deleted
+    }
+
     // Decode the data portion.
     let hdr_size = size_of::<pg_sys::HeapTupleHeaderData>();
     if item_len < hdr_size + NODE_FIXED_DATA_SIZE {
         return None; // Malformed
     }
-    let raw = std::slice::from_raw_parts(item, item_len);
+    let raw = unsafe { std::slice::from_raw_parts(item, item_len) };
     let data = &raw[hdr_size..];
 
     let node_id = i64::from_le_bytes(data[OFF_NODE_ID..OFF_NODE_ID + 8].try_into().ok()?);
+    let adj_slot_idx = u16::from_le_bytes(data[OFF_ADJ_SLOT..OFF_ADJ_SLOT + 2].try_into().ok()?);
     let label_count = data[OFF_LABEL_COUNT] as usize;
     let prop_len = u16::from_le_bytes(
         data[OFF_PROP_INLINE_LEN..OFF_PROP_INLINE_LEN + 2].try_into().ok()?,
@@ -441,7 +492,7 @@ unsafe fn read_node_at_offset(
     }
     let prop_bytes = data[labels_end..labels_end + prop_len].to_vec();
 
-    Some(NodeRecord { node_id, label_ids, prop_bytes })
+    Some(NodeRecord { node_id, adj_slot_idx, label_ids, prop_bytes })
 }
 
 /// Return the number of free bytes available for new items on `page`.
@@ -452,3 +503,225 @@ unsafe fn page_free_space(page: pg_sys::Page) -> usize {
     let lower = unsafe { (*phdr).pd_lower as usize };
     if upper >= lower { upper - lower } else { 0 }
 }
+
+// ---------------------------------------------------------------------------
+// Public: find_node_location
+// ---------------------------------------------------------------------------
+
+/// Locate a live node by id in the node relation.
+///
+/// Returns `(block_number, item_offset, adj_slot_idx)` where `adj_slot_idx`
+/// is the **stored** (permanent) index into the pd_special adjacency header
+/// array on that page. This is the canonical location — used by edge_store
+/// to read and write adjacency headers.
+///
+/// # Safety
+/// `rel` must be a valid, open node relation.
+pub unsafe fn find_node_location(
+    rel: pg_sys::Relation,
+    node_id: i64,
+    _snapshot: pg_sys::Snapshot,
+) -> Option<(pg_sys::BlockNumber, pg_sys::OffsetNumber, usize)> {
+    let hdr_size = size_of::<pg_sys::HeapTupleHeaderData>();
+    let nblocks =
+        pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
+
+    for blkno in 0..nblocks {
+        let buf = pg_sys::ReadBufferExtended(
+            rel,
+            pg_sys::ForkNumber::MAIN_FORKNUM,
+            blkno,
+            pg_sys::ReadBufferMode::RBM_NORMAL,
+            std::ptr::null_mut(),
+        );
+        pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
+        let page = pg_sys::BufferGetPage(buf);
+        let max_off = pg_sys::PageGetMaxOffsetNumber(page as *const _);
+
+        let mut found: Option<(pg_sys::BlockNumber, pg_sys::OffsetNumber, usize)> = None;
+        for off in pg_sys::FirstOffsetNumber..=max_off {
+            let iid = pg_sys::PageGetItemId(page, off);
+            if (*iid).lp_flags() != pg_sys::LP_NORMAL {
+                continue;
+            }
+            let item_len = (*iid).lp_len() as usize;
+            if item_len < hdr_size + NODE_FIXED_DATA_SIZE {
+                continue;
+            }
+            let item = pg_sys::PageGetItem(page as *const _, iid) as *const u8;
+            let raw = std::slice::from_raw_parts(item, item_len);
+            let data = &raw[hdr_size..];
+            let nid = i64::from_le_bytes(data[OFF_NODE_ID..OFF_NODE_ID + 8].try_into().unwrap());
+            // Skip logically deleted nodes.
+            let hdr = item as *const pg_sys::HeapTupleHeaderData;
+            let xmax_invalid = ((*hdr).t_infomask & pg_sys::HEAP_XMAX_INVALID as u16) != 0;
+            if nid == node_id && xmax_invalid {
+                let adj_slot_idx = u16::from_le_bytes(
+                    data[OFF_ADJ_SLOT..OFF_ADJ_SLOT + 2].try_into().unwrap(),
+                ) as usize;
+                found = Some((blkno, off, adj_slot_idx));
+                break;
+            }
+        }
+        pg_sys::UnlockReleaseBuffer(buf);
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Node delete (logical)
+// ---------------------------------------------------------------------------
+
+/// Logically delete a node by setting its xmax.
+///
+/// The node remains in place; physical reclamation happens during VACUUM.
+/// Adjacency headers are NOT cleared here (VACUUM does that after all
+/// incident edges are also dead-to-all).
+///
+/// Returns `true` if the node was found and deleted, `false` if not found.
+///
+/// # Safety
+/// Caller must ensure `rel` is valid and open.
+pub unsafe fn delete_node_by_id(rel: pg_sys::Relation, node_id: i64) -> bool {
+    let snapshot = pg_sys::GetActiveSnapshot();
+    let (blkno, off, _adj) = match find_node_location(rel, node_id, snapshot) {
+        Some(loc) => loc,
+        None => return false,
+    };
+
+    let buf = pg_sys::ReadBufferExtended(
+        rel,
+        pg_sys::ForkNumber::MAIN_FORKNUM,
+        blkno,
+        pg_sys::ReadBufferMode::RBM_NORMAL,
+        std::ptr::null_mut(),
+    );
+    pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
+    let page = pg_sys::BufferGetPage(buf);
+
+    pg_sys::CritSectionCount += 1;
+    let iid = pg_sys::PageGetItemId(page, off);
+    let hdr = pg_sys::PageGetItem(page as *const _, iid) as *mut pg_sys::HeapTupleHeaderData;
+    let xmax = pg_sys::GetCurrentTransactionId();
+    pg_sys::HeapTupleHeaderSetXmax(hdr, xmax);
+    (*hdr).t_infomask &= !(pg_sys::HEAP_XMAX_INVALID as u16);
+
+    let lsn = log_node_delete(buf, page, off, xmax);
+    pg_sys::PageSetLSN(page, lsn);
+    pg_sys::MarkBufferDirty(buf);
+    pg_sys::CritSectionCount -= 1;
+
+    pg_sys::UnlockReleaseBuffer(buf);
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Node update (new MVCC version on same page)
+// ---------------------------------------------------------------------------
+
+/// Update a node's labels and/or properties, creating a new MVCC version.
+///
+/// The old record is logically deleted (xmax set) and a new record is
+/// inserted on the SAME page to preserve the adj_slot_idx (which is
+/// page-relative).  If the new record is too large to fit on the same page,
+/// an error is raised (Phase 3 limitation; Phase 4 will add cross-page
+/// update support).
+///
+/// Adjacency headers (Region 1) are untouched.
+///
+/// Returns `false` if the node was not found.
+///
+/// # Safety
+/// Caller must ensure `rel` is valid and open.
+pub unsafe fn update_node(
+    rel: pg_sys::Relation,
+    node_id: i64,
+    new_label_ids: &[i32],
+    new_prop_bytes: &[u8],
+) -> bool {
+    if new_label_ids.len() > MAX_LABELS_PER_NODE {
+        pgrx::error!("pg_eddy PE101: node has {} labels, max is {}", new_label_ids.len(), MAX_LABELS_PER_NODE);
+    }
+    if new_prop_bytes.len() > PROP_INLINE_MAX {
+        pgrx::error!(
+            "pg_eddy PE200: property data ({} B) exceeds inline limit ({} B)",
+            new_prop_bytes.len(), PROP_INLINE_MAX
+        );
+    }
+
+    let snapshot = pg_sys::GetActiveSnapshot();
+    let (blkno, old_off, adj_slot_idx) = match find_node_location(rel, node_id, snapshot) {
+        Some(loc) => loc,
+        None => return false,
+    };
+
+    // Build new item with the stored adj_slot_idx so it stays page-relative.
+    let new_item = build_node_item_bytes(node_id, adj_slot_idx as u16, new_label_ids, new_prop_bytes);
+
+    let buf = pg_sys::ReadBufferExtended(
+        rel,
+        pg_sys::ForkNumber::MAIN_FORKNUM,
+        blkno,
+        pg_sys::ReadBufferMode::RBM_NORMAL,
+        std::ptr::null_mut(),
+    );
+    pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
+    let page = pg_sys::BufferGetPage(buf);
+
+    // Check that the new item fits on this page.
+    let free = page_free_space(page);
+    if free < new_item.len() + size_of::<pg_sys::ItemIdData>() {
+        pg_sys::UnlockReleaseBuffer(buf);
+        pgrx::error!(
+            "pg_eddy PE201: updated node properties too large to fit on same page (need {} B free, have {}); \
+             shrink properties or wait for Phase 4 cross-page update support",
+            new_item.len() + size_of::<pg_sys::ItemIdData>(),
+            free,
+        );
+    }
+
+    pg_sys::CritSectionCount += 1;
+
+    // 1. Logically delete the old record.
+    let old_iid = pg_sys::PageGetItemId(page, old_off);
+    let old_hdr = pg_sys::PageGetItem(page as *const _, old_iid) as *mut pg_sys::HeapTupleHeaderData;
+    let xmax = pg_sys::GetCurrentTransactionId();
+    pg_sys::HeapTupleHeaderSetXmax(old_hdr, xmax);
+    (*old_hdr).t_infomask &= !(pg_sys::HEAP_XMAX_INVALID as u16);
+
+    // 2. Insert new record on the same page.
+    let new_off = pg_sys::PageAddItemExtended(
+        page,
+        new_item.as_ptr() as pg_sys::Item,
+        new_item.len() as pg_sys::Size,
+        pg_sys::InvalidOffsetNumber,
+        0,
+    );
+    if new_off == pg_sys::InvalidOffsetNumber {
+        pg_sys::CritSectionCount -= 1;
+        pg_sys::UnlockReleaseBuffer(buf);
+        pgrx::error!("pg_eddy: PageAddItemExtended failed for node update on block {blkno}");
+    }
+
+    // Fix t_ctid in new record.
+    {
+        let new_iid = pg_sys::PageGetItemId(page, new_off);
+        let new_hdr = pg_sys::PageGetItem(page as *const _, new_iid) as *mut pg_sys::HeapTupleHeaderData;
+        pg_sys::ItemPointerSet(&mut (*new_hdr).t_ctid, blkno, new_off);
+    }
+
+    // WAL-log: delete old, insert new.
+    let lsn_del = log_node_delete(buf, page, old_off, xmax);
+    let lsn_ins = log_node_insert(buf, page, new_off, &new_item);
+    let lsn = if lsn_ins > lsn_del { lsn_ins } else { lsn_del };
+    pg_sys::PageSetLSN(page, lsn);
+    pg_sys::MarkBufferDirty(buf);
+    pg_sys::CritSectionCount -= 1;
+
+    pg_sys::UnlockReleaseBuffer(buf);
+    true
+}
+
