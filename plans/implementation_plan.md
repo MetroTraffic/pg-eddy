@@ -1570,84 +1570,274 @@ TCK groups; TCK pass rate ≥ 80%.
 > rate. Property indexes and Schema DDL move to v0.16.0.
 
 **Storage bugs** (P0 — causes 70% of all TCK failures):
-- [ ] Fix `clear()` to properly reset AM relation storage — the
-      `RelationTruncate(rel, 0)` call truncates the file but subsequent
-      CREATE scenarios hit `could not read blocks 1..1` and
-      `PageAddItemExtended failed on block 1` errors. Root cause: either the
-      buffer manager retains stale references, or the adjacency header region
-      on block 0 is not properly initialized after truncation. Investigate
-      and fix.
-- [ ] Fix missing MAXALIGN in `update_node` free-space check: the check uses
-      `new_item.len() + sizeof(ItemIdData)` but `PageAddItemExtended` requires
-      `MAXALIGN(new_item.len()) + sizeof(ItemIdData)`. Use
-      `(new_item.len() + 7) & !7` (matches `find_or_extend_page`).
-- [ ] Cross-page node update: when an updated node record doesn't fit on
-      its current page, delete-and-reinsert on a new page. Currently this
-      raises PE201 ("PageAddItemExtended failed for node update"). The fix
-      is bounded — PROP_INLINE_MAX=48 and MAX_LABELS=32 cap record size, so
-      this only fires on very full pages where old+new records must coexist.
+- [x] Fix `clear()` to properly reset AM relation storage — acquire
+      `AccessExclusiveLock` before `RelationTruncate(rel, 0)` to prevent
+      autovacuum racing on cached `nblocks`. Eliminated all
+      `could not read blocks` and `PageAddItemExtended failed` errors.
+- [x] Fix missing MAXALIGN in `update_node` free-space check: now uses
+      `(new_item.len() + 7) & !7` to match `PageAddItemExtended` alignment.
+- [x] Cross-page node update: logically delete old record and re-insert via
+      `find_or_extend_page` when the updated record doesn't fit in-place.
 
 **Error validation** (22% of failures — expected errors not raised):
-- [ ] Boolean operators on non-booleans: `1 AND true`, `'x' OR false`,
-      `NOT 1` must raise `TypeError` (76 scenarios: Boolean1/2/3/4)
-- [ ] Undefined variables in ORDER BY: `WITH n ORDER BY m` must raise
-      `SyntaxError` (40 scenarios: WithOrderBy1/2/3)
-- [ ] Invalid argument types for `range()`: raise `ArgumentError` (19 scenarios)
-- [ ] Property access on non-graph-elements: `1.prop` must raise `TypeError`
-      (14 scenarios: Graph6)
+- [x] Boolean operators on non-booleans: `1 AND true`, `'x' OR false`,
+      `NOT 1` now raise `TypeError` (76 scenarios: Boolean1/2/3/4)
+- [x] Undefined variables in ORDER BY: `WITH n ORDER BY m` now raises
+      `SyntaxError` via pre-validation on first row before sorting
+- [x] Invalid argument types for `range()`: now raises `TypeError`
+- [x] Property access on non-graph-elements: `1.prop` now raises `TypeError`
 - [ ] Node variable bound to a value: `WITH 1 AS n MATCH (n)` must raise
-      `SyntaxError` (6 scenarios: Match1)
+      `SyntaxError` — **not yet implemented** (6 scenarios: Match1)
 - [ ] Aggregation in ORDER BY after non-aggregating WITH: raise `SyntaxError`
-      (25 scenarios: WithOrderBy2)
+      — **not yet implemented** (25 scenarios: WithOrderBy2)
 
-**Target**: TCK ≥ 75% after this milestone (up from 42.0% in v0.14.0).
+**Actual result**: 1781/3880 (45.9%); +153 scenarios vs v0.14.0 (42.0%).
+Storage errors completely eliminated. Two error-validation items deferred to
+v0.16.0 (require semantic analysis phase).
 
 **Exit criteria**: `could not read blocks` and `PageAddItemExtended` errors
-no longer appear in TCK output; boolean type-checking raises TypeError;
-undefined ORDER BY variables raise SyntaxError; TCK pass rate ≥ 75%.
+no longer appear in TCK output ✓; boolean type-checking raises TypeError ✓;
+undefined ORDER BY variables raise SyntaxError ✓; TCK pass rate ≥ 75%
+(missed — actual 45.9%; storage fix unblocked previously-hidden feature gaps).
 
 ---
 
-**v0.16.0 — Property Indexes + Schema DDL** *(combined)*:
+### Phase 8 — TCK Gap Closure and Full Cypher Compliance (v0.16.0–v0.22.0)
+
+> **Context after v0.15.0**: 1781/3880 (45.9%) pass, 960 failing, 1141
+> skipped. The skip list is the bigger priority: 939 of 1141 skips come from
+> a single missing feature (map literal expressions in RETURN/WITH). The 960
+> failures split into identifiable feature groups. Releases below each target
+> one cohesive group to keep scope manageable and TCK progress visible.
+
+---
+
+**v0.16.0 — Map Literal Expressions**:
+
+> **Why first**: Map literal syntax `{key: expr, ...}` in RETURN/WITH/SET
+> unblocks 939 currently-skipped TCK scenarios — 82% of all skips — in a
+> single feature. It also enables map equality comparison and map property
+> access on map values (16 additional scenarios). Zero implementation risk to
+> existing storage.
+
+- [ ] Parser: `{key: expr, ...}` as an `Expr::Map(Vec<(String, Expr)>)` AST
+      node — already partially parsed for inline node properties; promote to
+      a general expression
+- [ ] Executor: `eval_expr` for `Expr::Map` → `Value::Map(HashMap<String,Value>)`
+- [ ] Map as RETURN/WITH column value — serialise as JSON object in result rows
+- [ ] Map property access: `expr.key` where `expr` evaluates to `Value::Map`
+      returns the keyed value (already needed for `Expr::Property`)
+- [ ] Map equality: `{a:1} = {a:1}` — structural equality in `value_eq()`
+- [ ] Map in SET: `SET n = {name: 'Alice', age: 30}` — replace all properties
+- [ ] Map in CREATE/MERGE inline properties: `CREATE (:N {name: 'Alice'})` —
+      already works for literals; ensure map-expression result also works
+- [ ] TCK harness: remove `unsupported: map literal in RETURN expression` and
+      `unsupported: map literal in WITH expression` skip guards
+
+**Target**: TCK ≥ 64% (939 skips run; many pass outright; some may expose
+further gaps that become the next release's failures).
+
+**Exit criteria**: no TCK scenarios skipped for map literal reasons;
+`{key: expr}` works in RETURN, WITH, SET n =, and nested positions.
+
+---
+
+**v0.17.0 — Error Validation + Named Paths**:
+
+> **Two orthogonal groups bundled because both are mid-sized and purely
+> executor/planner work with no storage impact.**
+
+**Error validation carry-overs from v0.15.0** (31 scenarios):
+- [ ] `WITH 1 AS n MATCH (n)` — node variable bound to a non-node value must
+      raise `SyntaxError` before pattern matching (6 scenarios: Match1)
+- [ ] Aggregation in ORDER BY after non-aggregating WITH: detect during
+      planning / execution and raise `SyntaxError` (25 scenarios: WithOrderBy2)
+
+**Duplicate-variable SyntaxError** (~130 scenarios: Match1/2, Create1, Match9):
+- [ ] Detect reuse of the same variable for a node and relationship in the
+      same MATCH pattern: `MATCH (a)-[a]->(b)` must raise `SyntaxError`
+- [ ] Detect same variable bound in a preceding MATCH used again as a
+      bind target: `MATCH (a) MATCH (a)-[r]->(b)` where `a` is re-bound
+- [ ] Detect variable-length relationship reuse: `CREATE (a)-[a*]->(b)`
+
+**Named paths** (94 scenarios: Match6):
+- [ ] Parser: `p = pattern` in MATCH clause → store path variable `p`
+- [ ] AST: `MatchPattern { path_var: Option<String>, ... }`
+- [ ] Executor: on match, collect the alternating node/rel sequence into
+      `Value::Path(Vec<PathSegment>)` bound to the path variable
+- [ ] `nodes(p)` → `Value::List` of node values
+- [ ] `relationships(p)` / `rels(p)` → `Value::List` of relationship values
+- [ ] `length(p)` → number of relationships in path
+- [ ] `shortestPath((a)-[*]->(b))` → shortest path search (BFS over adjacency)
+- [ ] `allShortestPaths(...)` → all BFS-shortest paths
+
+**Target**: TCK ≥ 71% (+~261 scenarios).
+
+**Exit criteria**: no failing tests in Match1 duplicate-variable scenarios;
+Match6 named-path scenarios pass; `shortestPath` returns correct result.
+
+---
+
+**v0.18.0 — Quantifiers, Pattern Predicates, List Operations, UNION**:
+
+**Quantifiers** (~50 scenarios: Quantifier9/11/12):
+- [ ] `ANY(x IN list WHERE predicate)` → true if any element satisfies predicate
+- [ ] `NONE(x IN list WHERE predicate)` → true if no element satisfies
+- [ ] `ALL(x IN list WHERE predicate)` → true if all elements satisfy
+- [ ] `SINGLE(x IN list WHERE predicate)` → true if exactly one element satisfies
+- [ ] Quantifiers over relationship lists in path expressions
+
+**Pattern predicates and comprehension** (~33 scenarios: Pattern1/2):
+- [ ] `(a)-->(b)` as a boolean expression in WHERE (pattern predicate)
+- [ ] `[(a)-->(b) | b.name]` pattern comprehension → list of values
+- [ ] `[(a)-[r]->(b) WHERE predicate | expr]` with filter
+
+**List operations** (~28 scenarios: List1/5):
+- [ ] List slice: `list[1..3]`, `list[..2]`, `list[1..]`
+- [ ] Negative indices: `list[-1]` → last element
+- [ ] `x IN list` edge cases: null semantics, empty list, nested lists
+
+**COUNT {} subquery** (~7 scenarios: CountingSubgraphMatches1):
+- [ ] `COUNT { MATCH (a)-->(b) }` as an expression in RETURN/WHERE
+
+**UNION / UNION ALL** (~12 skipped):
+- [ ] `MATCH ... RETURN ... UNION MATCH ... RETURN ...` — combine result sets
+- [ ] `UNION ALL` — no deduplication
+- [ ] Column name matching validation
+
+**Target**: TCK ≥ 74% (+~130 scenarios).
+
+**Exit criteria**: Quantifier9/11/12 pass; Pattern1/2 pass; List1/5 pass;
+UNION works for basic cases.
+
+---
+
+**v0.19.0 — Temporal Completion, CALL, and Sort Correctness**:
+
+**Temporal gaps** (~133 scenarios: Temporal10/4/2/8/5):
+- [ ] `Temporal4` — storing temporal values as node/relationship properties
+      and reading them back with correct type (currently stored as strings,
+      not typed temporal values)
+- [ ] `Temporal2` — remaining ISO 8601 parsing edge cases: week-date format
+      `YYYY-Www-D`, ordinal date `YYYY-DDD`, truncated forms
+- [ ] `Temporal10` — `duration.between()` for all temporal type pairs
+      (currently only some pairs implemented); signed duration semantics
+- [ ] `Temporal8` — duration arithmetic: `date + duration`, `datetime - duration`,
+      duration addition/subtraction
+- [ ] `Temporal5` — component access on computed temporal values (not just
+      parsed literals)
+
+**CALL procedure** (~49 skipped):
+- [ ] `CALL db.labels()` YIELD `label` — return all label names from catalog
+- [ ] `CALL db.relationshipTypes()` YIELD `relationshipType`
+- [ ] `CALL db.propertyKeys()` YIELD `propertyKey`
+- [ ] `CALL dbms.components()` YIELD `name, versions, edition`
+- [ ] Procedure registry infrastructure for future user-defined procedures
+
+**Sort correctness** (~60 skipped/failing):
+- [ ] Temporal value ordering in ORDER BY: dates, times, datetimes, durations
+      (50 skipped: `temporal type sorting not supported`)
+- [ ] Cross-type sort order per openCypher spec: Null < Bool < Int/Float <
+      Str < List < Map < Node < Relationship < Path (10 skipped)
+- [ ] NaN comparison semantics: `NaN <> NaN` is true; NaN sorts last (4 skipped)
+
+**Target**: TCK ≥ 81% (+~242 scenarios).
+
+**Exit criteria**: Temporal4 storage round-trip works; CALL db.labels()
+returns results; ORDER BY on temporal values produces correct order.
+
+---
+
+**v0.20.0 — Match Engine Completeness + Write Persistence**:
+
+**Match engine gaps** (~82 scenarios):
+- [ ] `Match7` — OPTIONAL MATCH: null propagation when no match found for
+      right side of outer join; `OPTIONAL MATCH (a)-[r]->(b)` with predicate
+- [ ] `Match3` — fixed-length multi-hop: `(a)-[r1]->(b)-[r2]->(c)` with
+      relationship variable binding across hops
+- [ ] `MatchWhere6` — filtering OPTIONAL MATCH results with WHERE on
+      optionally-null variables
+- [ ] `Graph5` — label expressions in patterns: `(n:A|B)`, `(n:!A)`,
+      `(n:A&B)` (GQL-style label predicates)
+- [ ] `Match9` — deprecated syntax acceptance (some scenarios need graceful
+      handling of legacy patterns)
+
+**Write persistence** (~26 scenarios: Delete6/Set6/Remove3):
+- [ ] `Delete6` — side effects of DELETE persist across WITH boundaries:
+      `MATCH (n) DELETE n WITH count(*) AS c RETURN c` should see 0 nodes
+- [ ] `Set6` — SET side effects visible in subsequent clauses of same query
+- [ ] `Remove3` — REMOVE side effects (label removal, property removal)
+      visible in subsequent clauses
+
+**CREATE/MERGE completeness** (~13 scenarios: Create4/5, Merge5):
+- [ ] Multi-hop CREATE patterns: `CREATE (a)-[:R]->(b)-[:R]->(c)` in one clause
+- [ ] `CREATE` with path variable: `CREATE p = (a)-[:R]->(b)`
+- [ ] `Merge5` — MERGE on relationships where end node must also be matched
+      or created; MERGE with ON CREATE / ON MATCH across relationship patterns
+
+**Skip/limit and comparison edge cases** (~41 scenarios):
+- [ ] `ReturnSkipLimit1/2` — SKIP/LIMIT with expressions; `SKIP 0`; fractional
+      coercion to integer
+- [ ] `Comparison1/2/3` — full equality edge cases (NaN, null, mixed numeric);
+      half-bounded and full-bounded range with null operands
+- [ ] `Unwind1` — UNWIND of null (should produce no rows), UNWIND of nested
+      lists
+
+**Target**: TCK ≥ 85% (+~162 scenarios).
+
+**Exit criteria**: OPTIONAL MATCH produces correct null rows; multi-hop CREATE
+works; Delete6/Set6/Remove3 persistence tests pass.
+
+---
+
+**v0.21.0 — Property Indexes + Schema DDL**:
+
+> Moved from the original v0.16.0 position. No TCK scenarios are gated on
+> this (SchemaAcceptance group is tiny), but IS-1 node-lookup benchmark
+> requires a property index for competitive performance.
+
 - [ ] `pg_eddy.create_node_index(label TEXT, property_key TEXT)` — per-property
-      B-tree index; integrated with query planner so `WHERE n.prop = $val`
-      uses the index instead of full scan
+      B-tree index stored in a PostgreSQL index relation; integrated with
+      query planner so `WHERE n.prop = $val` uses the index instead of full scan
 - [ ] `pg_eddy.create_unique_constraint(label TEXT, property_key TEXT)` —
-      uniqueness enforcement at write time
-- [ ] `CREATE CONSTRAINT ON (n:Label) ASSERT n.prop IS UNIQUE`
-- [ ] `CREATE CONSTRAINT ON (n:Label) ASSERT EXISTS(n.prop)`
-- [ ] `CREATE INDEX ON :Label(prop)` / `DROP INDEX`
-- [ ] `SHOW CONSTRAINTS`, `SHOW INDEXES`
-- [ ] Target: `SchemaAcceptance`; TCK ~85%
+      uniqueness enforcement at write time via index lookup
+- [ ] Cypher DDL: `CREATE INDEX ON :Label(prop)` / `DROP INDEX ON :Label(prop)`
+- [ ] Cypher DDL: `CREATE CONSTRAINT ON (n:Label) ASSERT n.prop IS UNIQUE`
+- [ ] Cypher DDL: `CREATE CONSTRAINT ON (n:Label) ASSERT EXISTS(n.prop)`
+- [ ] `SHOW CONSTRAINTS` / `SHOW INDEXES` — query catalog tables
+- [ ] Planner: rewrite `WHERE n.prop = $val` into an index scan when a
+      matching index exists; cost-based fallback to full scan
 
-**Exit criteria**: IS-1 node lookup within 2× of AGE (property index used);
-schema DDL Cypher commands work; ~85% TCK pass.
+**Target**: `SchemaAcceptance` TCK group passes; IS-1 node lookup within 2×
+of AGE (property index used); TCK ~86%.
+
+**Exit criteria**: IS-1 benchmark shows ≤2× AGE latency; `CREATE INDEX`
+and `CREATE CONSTRAINT` round-trip through `SHOW INDEXES`/`SHOW CONSTRAINTS`.
 
 ---
 
-### Phase 8 — Performance Hardening and 100% TCK Compliance (v0.17.0–v0.19.0)
+**v0.22.0 — Query Optimisation**:
 
-**v0.17.0 — Query optimisation + remaining correctness**:
 - [ ] Cost model for AM scan operators: adjacency-follow O(degree) vs B-tree
       O(log N + degree) using `pg_class.reltuples` for label selectivity
-- [ ] Join order enumeration for multi-hop MATCH patterns
+- [ ] Join order enumeration for multi-hop MATCH patterns (left-deep DP)
 - [ ] Predicate pushdown into the AM scan (WHERE on indexed properties as scan
       predicates, not post-filters)
-- [ ] `pg_eddy.cypher_explain(analyze := TRUE)` with per-operator timings
-- [ ] Pattern expressions in RETURN / WHERE (deferred from v0.13.0)
-- [ ] Remaining wrong-result fixes
-- [ ] Target: TCK ~95%
+- [ ] `pg_eddy.cypher_explain(query TEXT, analyze BOOL DEFAULT FALSE)` with
+      per-operator row counts and wall-clock timings
+- [ ] Non-ASCII identifiers: Unicode letter/digit characters in node labels,
+      relationship types, and property keys (6 skipped scenarios)
+- [ ] Remaining wrong-result fixes surfaced by v0.16–v0.21 work
 
-**v0.18.0 — TCK gap closure**:
-- [ ] Remaining temporal type edge cases: timezone-aware datetime operations,
-      `LOAD CSV FROM 'path' AS row` (local filesystem only)
-- [ ] All remaining TCK group failures fixed; target: 100% pass rate
-      (document any spec deviations with upstream references)
-- [ ] `null_semantics.sql` regression suite covers all `NullAcceptance`
-      scenarios
-- [ ] Parallel label scan via PostgreSQL parallel worker infrastructure
+**Target**: TCK ≥ 90%; IS-3 1-hop expand remains ≥1.8× faster than AGE.
 
-**v0.19.0 — Production readiness**:
+**Exit criteria**: `cypher_explain` returns plan; predicate pushdown measurably
+reduces scan rows on indexed queries; no regressions on LDBC IS-1/IS-3.
+
+---
+
+**v0.23.0 — Production Readiness**:
+
 - [ ] LDBC SNB IS-1 through IS-7 and IC-1 through IC-14 benchmarked in full
       (extending the v0.12.x IS-1/IS-3 baseline to the complete suite);
       published baselines with hardware spec, dataset size, and raw output;
@@ -1664,13 +1854,13 @@ schema DDL Cypher commands work; ~85% TCK pass.
       security guide, troubleshooting
 - [ ] Docker image + CNPG CloudNativePG extension image published
 - [ ] `justfile` release workflow: tag, build, publish to ghcr.io
+- [ ] Remaining permanently-blocked scenarios documented: 19 "named graph"
+      setup scenarios (multi-graph fixtures not supported by single-database
+      AM), any spec deviations noted with upstream CIP references
 
-**Exit criteria** (v1.0 readiness): 100% TCK pass (goal; document any
-remaining spec deviations); LDBC SNB full suite published baselines (IS-1
-through IS-7, IC-1 through IC-14); AGE comparison passes 2× gate on IS-3
-(first confirmed at v0.12.x; IS-1 competitive after property indexes in
-v0.16.0); pg_dump round-trip verified;
-`pg_eddy.health_check()` returns OK; Docker + CNPG images published.
+**Exit criteria** (v1.0 readiness): ≥95% TCK pass (document any remaining
+spec deviations); LDBC SNB full suite published baselines; pg_dump round-trip
+verified; `pg_eddy.health_check()` returns OK; Docker + CNPG images published.
 
 ---
 
@@ -2199,12 +2389,12 @@ Each item notes its origin phase and its current planned target.
 
 | Item | Origin | Target | Notes |
 |---|---|---|---|
-| Property indexes (`create_node_index`) | v0.5.3 | v0.16.0 | Per-property B-tree index; design alongside query planner for predicate pushdown. |
-| Unique constraints | v0.5.3 | v0.16.0 | `CREATE CONSTRAINT ... ASSERT n.prop IS UNIQUE` |
-| Existence constraints | v0.5.3 | v0.16.0 | `CREATE CONSTRAINT ... ASSERT EXISTS(n.prop)` |
-| CSV import/export | v0.5.3 | v0.18.0+ | `load_csv_nodes`, `load_csv_edges` with `fast := TRUE` option; `export_cypher_script()` |
-| `pg_dump`/`pg_restore` round-trip | v0.5.3 | v0.18.0 | Test on 1M+ node graph; must be lossless. |
-| Performance CI gate | v0.5.3 | v0.19.0 | Automated per-PR: label-scan <5ms on 1M nodes; 1-hop expand <1ms on 10M edges. |
+| Property indexes (`create_node_index`) | v0.5.3 | v0.21.0 | Per-property B-tree index; design alongside query planner for predicate pushdown. |
+| Unique constraints | v0.5.3 | v0.21.0 | `CREATE CONSTRAINT ... ASSERT n.prop IS UNIQUE` |
+| Existence constraints | v0.5.3 | v0.21.0 | `CREATE CONSTRAINT ... ASSERT EXISTS(n.prop)` |
+| CSV import/export | v0.5.3 | v0.22.0+ | `load_csv_nodes`, `load_csv_edges` with `fast := TRUE` option; `export_cypher_script()` |
+| `pg_dump`/`pg_restore` round-trip | v0.5.3 | v0.23.0 | Test on 1M+ node graph; must be lossless. |
+| Performance CI gate | v0.5.3 | v0.23.0 | Automated per-PR: label-scan <5ms on 1M nodes; 1-hop expand <1ms on 10M edges. |
 
 ### Testing
 
