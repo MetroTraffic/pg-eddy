@@ -312,7 +312,13 @@ fn exec_label_scan(
                 let mut matches = true;
                 for (key, expr) in inline_props {
                     let prop_val = val.get_property(key);
-                    let expected = eval_expr(expr, &HashMap::new(), params)?;
+                    // Use params as the row context so upstream variables
+                    // (e.g., from UNWIND) are visible in inline property filters.
+                    let mut scan_row = Row::new();
+                    for (k, v) in params {
+                        scan_row.insert(k.clone(), json_to_value(v));
+                    }
+                    let expected = eval_expr(expr, &scan_row, params)?;
                     if !values_equal(&prop_val, &expected) {
                         matches = false;
                         break;
@@ -585,10 +591,16 @@ fn exec_cross_product(
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<Vec<Row>, ExecError> {
     let left_rows = execute(left, params)?;
-    let right_rows = execute(right, params)?;
     let mut result = Vec::new();
 
     for lr in &left_rows {
+        // Merge left-row variables into params so the right side can reference
+        // them in inline property filters (e.g., UNWIND ... MATCH (n {id: r.x})).
+        let mut merged = params.clone();
+        for (k, v) in lr {
+            merged.insert(k.clone(), v.to_json());
+        }
+        let right_rows = execute(right, &merged)?;
         for rr in &right_rows {
             let mut row = lr.clone();
             row.extend(rr.clone());
@@ -2891,6 +2903,51 @@ pub fn rows_to_jsonb(rows: Vec<Row>) -> Vec<pgrx::JsonB> {
 // v0.12.0: Write clause executors
 // ===========================================================================
 
+/// Accumulates catalog index writes so they can be flushed as bulk INSERTs
+/// instead of one SPI round-trip per row.  All values are plain integers so
+/// the format! path is safe from SQL injection.
+#[derive(Default)]
+struct CatalogWriteBuffer {
+    label_index:   Vec<(i32, i64)>,        // (label_id, node_id)
+    edge_type_src: Vec<(i32, i64, i64)>,   // (type_id, src_node_id, edge_id)
+    edge_type_dst: Vec<(i32, i64, i64)>,   // (type_id, dst_node_id, edge_id)
+}
+
+impl CatalogWriteBuffer {
+    fn flush(self) {
+        if !self.label_index.is_empty() {
+            let vals: String = self.label_index.iter()
+                .map(|(l, n)| format!("({},{})", l, n))
+                .collect::<Vec<_>>()
+                .join(",");
+            pgrx::Spi::run(&format!(
+                "INSERT INTO _pg_eddy.label_index(label_id, node_id) VALUES {}",
+                vals
+            )).unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index bulk insert: {e}"));
+        }
+        if !self.edge_type_src.is_empty() {
+            let vals: String = self.edge_type_src.iter()
+                .map(|(t, s, e)| format!("({},{},{})", t, s, e))
+                .collect::<Vec<_>>()
+                .join(",");
+            pgrx::Spi::run(&format!(
+                "INSERT INTO _pg_eddy.edge_type_src(type_id, src_node_id, edge_id) VALUES {}",
+                vals
+            )).unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_src bulk insert: {e}"));
+        }
+        if !self.edge_type_dst.is_empty() {
+            let vals: String = self.edge_type_dst.iter()
+                .map(|(t, d, e)| format!("({},{},{})", t, d, e))
+                .collect::<Vec<_>>()
+                .join(",");
+            pgrx::Spi::run(&format!(
+                "INSERT INTO _pg_eddy.edge_type_dst(type_id, dst_node_id, edge_id) VALUES {}",
+                vals
+            )).unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_dst bulk insert: {e}"));
+        }
+    }
+}
+
 /// Execute CREATE patterns, creating nodes and relationships.
 /// For each input row, create all pattern nodes/rels and pass through the row
 /// (augmented with any new variables introduced by CREATE).
@@ -2901,11 +2958,11 @@ fn exec_create_pattern(
 ) -> Result<Vec<Row>, ExecError> {
     let input_rows = execute(input, params)?;
     let mut result = Vec::new();
+    let mut buf = CatalogWriteBuffer::default();
     for row in input_rows {
         let mut new_row = row.clone();
-        // Execute each pattern in sequence, materialising new nodes and rels.
         for pattern in patterns {
-            create_pattern_in_row(pattern, &mut new_row, params)?;
+            create_pattern_in_row(pattern, &mut new_row, params, &mut buf)?;
         }
         result.push(new_row);
     }
@@ -2913,18 +2970,21 @@ fn exec_create_pattern(
     if result.is_empty() && matches!(input, LogicalPlan::SingleRow) {
         let mut new_row = Row::new();
         for pattern in patterns {
-            create_pattern_in_row(pattern, &mut new_row, params)?;
+            create_pattern_in_row(pattern, &mut new_row, params, &mut buf)?;
         }
         result.push(new_row);
     }
+    buf.flush();
     Ok(result)
 }
 
 /// Create a single pattern (sequence of nodes/rels) updating `row` with new vars.
+/// Catalog index writes are appended to `buf` for bulk flushing by the caller.
 fn create_pattern_in_row(
     pattern: &Pattern,
     row: &mut Row,
     params: &HashMap<String, serde_json::Value>,
+    buf: &mut CatalogWriteBuffer,
 ) -> Result<(), ExecError> {
     use crate::catalog::labels::{ensure_label, ensure_prop_key, ensure_rel_type, next_node_id, next_edge_id};
     use crate::storage::{prop_store, node_store, edge_store};
@@ -2964,12 +3024,9 @@ fn create_pattern_in_row(
                     node_store::insert_node(rel, node_id, &label_ids, &prop_bytes);
                     pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                 }
-                // Maintain label_index.
+                // Batch label_index writes.
                 for lid in &label_ids {
-                    pgrx::Spi::run_with_args(
-                        "INSERT INTO _pg_eddy.label_index(label_id, node_id) VALUES ($1, $2)",
-                        &[pgrx::datum::DatumWithOid::from(*lid), pgrx::datum::DatumWithOid::from(node_id)],
-                    ).unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index insert: {e}"));
+                    buf.label_index.push((*lid, node_id));
                 }
 
                 let node_val = Value::Node { node_id, labels: labels.clone(), properties: prop_map };
@@ -3020,10 +3077,7 @@ fn create_pattern_in_row(
                                     pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                                 }
                                 for lid in &label_ids {
-                                    pgrx::Spi::run_with_args(
-                                        "INSERT INTO _pg_eddy.label_index(label_id, node_id) VALUES ($1, $2)",
-                                        &[pgrx::datum::DatumWithOid::from(*lid), pgrx::datum::DatumWithOid::from(nid)],
-                                    ).unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index insert: {e}"));
+                                    buf.label_index.push((*lid, nid));
                                 }
                                 let node_val = Value::Node { node_id: nid, labels, properties: prop_map };
                                 if let Some(v) = var {
@@ -3052,10 +3106,7 @@ fn create_pattern_in_row(
                                 pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                             }
                             for lid in &label_ids {
-                                pgrx::Spi::run_with_args(
-                                    "INSERT INTO _pg_eddy.label_index(label_id, node_id) VALUES ($1, $2)",
-                                    &[pgrx::datum::DatumWithOid::from(*lid), pgrx::datum::DatumWithOid::from(nid)],
-                                ).unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index insert: {e}"));
+                                buf.label_index.push((*lid, nid));
                             }
                             last_node_id = Some(nid);
                             nid
@@ -3089,14 +3140,8 @@ fn create_pattern_in_row(
                     pgrx::pg_sys::table_close(edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                     pgrx::pg_sys::table_close(node_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                 }
-                pgrx::Spi::run_with_args(
-                    "INSERT INTO _pg_eddy.edge_type_src(type_id, src_node_id, edge_id) VALUES ($1, $2, $3)",
-                    &[pgrx::datum::DatumWithOid::from(type_id), pgrx::datum::DatumWithOid::from(actual_src), pgrx::datum::DatumWithOid::from(edge_id)],
-                ).unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_src insert: {e}"));
-                pgrx::Spi::run_with_args(
-                    "INSERT INTO _pg_eddy.edge_type_dst(type_id, dst_node_id, edge_id) VALUES ($1, $2, $3)",
-                    &[pgrx::datum::DatumWithOid::from(type_id), pgrx::datum::DatumWithOid::from(actual_dst), pgrx::datum::DatumWithOid::from(edge_id)],
-                ).unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_dst insert: {e}"));
+                buf.edge_type_src.push((type_id, actual_src, edge_id));
+                buf.edge_type_dst.push((type_id, actual_dst, edge_id));
 
                 if let Some(rv) = &r.variable {
                     let edge_val = Value::Edge { edge_id, rel_type, source: actual_src, target: actual_dst, properties: prop_map };
@@ -3468,7 +3513,9 @@ fn exec_merge_pattern(
         if matches.is_empty() {
             // Pattern not found — CREATE it.
             let mut new_row = outer_row.clone();
-            create_pattern_in_row(pattern, &mut new_row, params)?;
+            let mut buf = CatalogWriteBuffer::default();
+            create_pattern_in_row(pattern, &mut new_row, params, &mut buf)?;
+            buf.flush();
             // Apply ON CREATE SET.
             if !on_create.is_empty() {
                 // Run set with the new_row as context params.

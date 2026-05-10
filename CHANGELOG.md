@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.12.1](#0121--2026-05-10--batch-catalog-writes-and-ldbc-is-1is-3-benchmark) — Batch Catalog Writes and LDBC IS-1/IS-3 Benchmark
 - [0.12.0](#0120--2026-05-10--cypher-write-language-create-merge-set-remove-delete) — Cypher Write Language: CREATE, MERGE, SET, REMOVE, DELETE
 - [0.11.0](#0110--2026-05-10--subqueries-exists-call--and-call-procedure-yield) — Subqueries: EXISTS {}, CALL {}, and CALL procedure YIELD
 - [0.10.0](#0100--2026-05-10--variable-length-paths-named-paths-and-path-functions) — Variable-Length Paths, Named Paths, and Path Functions
@@ -19,6 +20,50 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 - [0.3.0](#030--2026-05-09--edge-storage--adjacency-lists) — Edge Storage + Adjacency Lists
 - [0.2.0](#020--2026-05-09--node-storage) — Node Storage
 - [0.1.0](#010--2026-05-09--am-skeleton) — AM Skeleton
+
+---
+
+## [0.12.1] — 2026-05-10 — Batch Catalog Writes and LDBC IS-1/IS-3 Benchmark
+
+v0.12.1 delivers two improvements: a **performance fix** for Cypher `CREATE`
+throughput and a **validated benchmark** comparing pg_eddy to Apache AGE on
+LDBC-style workloads.
+
+### Performance: Batch Catalog Writes (`CatalogWriteBuffer`)
+
+In v0.12.0, each node/edge created by a Cypher `UNWIND+CREATE` batch issued
+3 SPI INSERT calls to catalog index tables (`_pg_eddy.label_index`,
+`edge_type_src`, `edge_type_dst`). For a batch of N rows, this was 3N round-
+trips inside a single SPI context.
+
+v0.12.1 introduces `CatalogWriteBuffer`: all catalog writes in a single
+`CREATE` or `MERGE` call are buffered in Rust `Vec`s and flushed at the end
+as a single bulk `INSERT ... VALUES (...),...` per table — 3 SPI calls total
+regardless of batch size.
+
+### Bug Fix: UNWIND Variable Scoping in MATCH
+
+`exec_cross_product` previously executed the right-hand plan (e.g., a
+`LabelScan`) once, independently of the left-hand rows. This meant UNWIND
+variables were not visible when evaluating inline property filters on the
+downstream MATCH — `MATCH (n:Person {id: r.src})` after `UNWIND $rels AS r`
+would fail with "unbound variable: r". Fixed by evaluating the right-hand
+plan once per left row, with left-row variables merged into the params context.
+
+### Benchmark: LDBC IS-1 / IS-3 vs Apache AGE
+
+| Benchmark | pg_eddy | AGE | Ratio |
+|---|---|---|---|
+| Node insert (nodes/s, UNWIND+CREATE) | 4 422 | 7 155 | 0.62× |
+| Edge load (edges/s) | 9 300 (SQL API) | 594 (UNWIND+MATCH) | N/A (diff API) |
+| IS-1: node lookup (ms/query) | 90.84 ms | 12.37 ms | 7.34× slower |
+| IS-3: 1-hop expand (ms/query) | **92.67 ms** | 169.41 ms | **1.83× faster** |
+
+pg_eddy's adjacency-chain traversal (IS-3) is **1.83× faster** than AGE.
+IS-1 is slower because pg_eddy has no property index yet (v0.13.x milestone).
+
+Scale: 1 000 nodes / 5 000 edges, dev container (Debian 11, PG 18.3).
+Full results in [`benchmarks/README.md`](benchmarks/README.md).
 
 ---
 
