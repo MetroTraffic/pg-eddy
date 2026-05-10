@@ -19,6 +19,7 @@ pub enum Token {
     Skip,     // reserved for v0.7.0
     And,
     Or,
+    Xor,
     Not,
     In,
     Is,
@@ -74,6 +75,7 @@ pub enum Token {
     Star,       // *
     Slash,      // /
     Percent,    // %
+    Caret,      // ^
 
     // End of input
     Eof,
@@ -334,6 +336,7 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
                 "SKIP" => Token::Skip,
                 "AND" => Token::And,
                 "OR" => Token::Or,
+                "XOR" => Token::Xor,
                 "NOT" => Token::Not,
                 "IN" => Token::In,
                 "IS" => Token::Is,
@@ -371,6 +374,7 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
             b'+' => { tokens.push(SpannedToken { token: Token::Plus, offset: start }); pos += 1; }
             b'*' => { tokens.push(SpannedToken { token: Token::Star, offset: start }); pos += 1; }
             b'%' => { tokens.push(SpannedToken { token: Token::Percent, offset: start }); pos += 1; }
+            b'^' => { tokens.push(SpannedToken { token: Token::Caret, offset: start }); pos += 1; }
             b'-' => { tokens.push(SpannedToken { token: Token::Dash, offset: start }); pos += 1; }
             b'/' => { tokens.push(SpannedToken { token: Token::Slash, offset: start }); pos += 1; }
             b'.' => {

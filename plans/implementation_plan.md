@@ -26,8 +26,13 @@ See [`plans/ivm_plan.md`](ivm_plan.md) for the IVM design and roadmap.
 - **Graph-first storage**: the custom AM places adjacency information adjacent
   to node data on disk, enabling O(degree) neighbour iteration without index
   lookups for the common case
-- **OpenCypher conformance**: the query engine is spec-first; every supported
-  feature is validated against the official openCypher TCK
+- **OpenCypher conformance**: the query engine is **grammar-first, not
+  TCK-first**. Each milestone is defined as "implement Cypher clause / operator
+  X completely per the openCypher EBNF grammar". The TCK is then run to
+  *measure* how much of the spec was correctly implemented — it is a
+  conformance audit, not a development driver. Fixing specific `not ok` TCK
+  lines by adding ad-hoc special cases in the parser or executor is explicitly
+  forbidden (see §10.3 for the guard rules)
 - **PostgreSQL-native**: leverage MVCC, WAL, parallel query, AIO (PG18), and
   the full extension ecosystem; never duplicate what PostgreSQL already does
   well
@@ -72,7 +77,9 @@ byte-offset arithmetic. The structural per-hop cost is real:
 
 **Success at v1.0**:
 - 100% openCypher TCK pass rate (goal); deviations documented with upstream
-  references
+  references. The TCK is the *verification* of completeness, not the
+  implementation guide — every feature must work generally, not only for the
+  specific patterns that appear in TCK scenarios
 - Adjacency-follow measurably faster than AGE on LDBC SNB multi-hop queries;
   published baselines with hardware, dataset size, and raw output
 - `pg_dump`/restore round-trip lossless on 10M+ node graphs
@@ -1561,6 +1568,39 @@ files (Gherkin scenarios), executes each scenario against pg_eddy via
 - Newly failing scenarios cause the build to fail
 - Initially only a whitelist of known-passing features is required; the
   whitelist grows as features are implemented
+
+**Critical anti-pattern — TCK-driven point solutions**: experience in similar
+projects shows that chasing individual `not ok` TCK lines leads to a pile of
+special cases: hardcoded expression patterns, parser branches that only handle
+the exact syntax that appears in a failing scenario, and executor hacks that
+pass a test without implementing the general feature. The result is a growing
+pass rate that does not reflect real-world query support.
+
+**The rule**: the TCK pass rate is an *output* of implementing the grammar
+correctly, never an *input* that drives what to implement next. Concretely:
+
+1. **Implement per clause, not per test**: each milestone targets a Cypher
+   clause or operator group (e.g. `WITH`, `OPTIONAL MATCH`, `UNWIND`). When
+   the clause is implemented completely against the grammar, run the TCK to
+   see what it unlocks. Do not start by looking at which tests fail.
+
+2. **Grammar is the spec**: if the openCypher EBNF grammar allows a construct,
+   the implementation must handle it — not just the subset that appears in
+   TCK scenarios. After implementing a feature, write at least two hand-crafted
+   queries that exercise it in ways not present in the TCK.
+
+3. **Skip list discipline**: the `@UNSUPPORTED_QUERY_PATTERNS` list in
+   `tests/tck/run_tck.pl` must only contain Cypher *clauses* or *function
+   names* that are entirely unimplemented (`CREATE`, `MERGE`, `shortestPath`,
+   etc.). It must never contain regex patterns matching specific query shapes
+   or property names. A growing skip list with ad-hoc patterns is a sign that
+   TCK-driven development has crept in.
+
+4. **Generality test**: when a new group of TCK scenarios passes, add one
+   pgrx `#[pg_test]` that exercises the same feature with a different query
+   shape (different labels, different property names, different pattern
+   topology). If it fails, the implementation is a point solution, not a
+   general feature.
 
 ### 10.4 Fuzz Testing
 

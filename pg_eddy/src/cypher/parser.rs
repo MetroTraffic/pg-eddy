@@ -78,6 +78,12 @@ impl Parser {
         }
     }
 
+    /// Look ahead `offset` positions beyond the current position.
+    fn peek_at(&self, offset: usize) -> &Token {
+        let idx = (self.pos + offset).min(self.tokens.len() - 1);
+        &self.tokens[idx].token
+    }
+
     /// Parse a full query pipeline: (MATCH | OPTIONAL MATCH | UNWIND | WITH)* RETURN ...
     fn parse_query(&mut self) -> Result<Query, ParseError> {
         let mut clauses: Vec<QueryClause> = Vec::new();
@@ -460,11 +466,21 @@ impl Parser {
     }
 
     fn parse_or(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.parse_and()?;
+        let mut left = self.parse_xor()?;
         while *self.peek() == Token::Or {
             self.advance();
-            let right = self.parse_and()?;
+            let right = self.parse_xor()?;
             left = Expr::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_xor(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_and()?;
+        while *self.peek() == Token::Xor {
+            self.advance();
+            let right = self.parse_and()?;
+            left = Expr::Xor(Box::new(left), Box::new(right));
         }
         Ok(left)
     }
@@ -490,7 +506,7 @@ impl Parser {
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
-        let left = self.parse_addition()?;
+        let left = self.parse_inlist()?;
 
         // String predicates: STARTS WITH, ENDS WITH, CONTAINS
         if let Token::Ident(s) = self.peek().clone() {
@@ -499,35 +515,28 @@ impl Parser {
                 "STARTS" => {
                     self.advance();
                     self.expect(&Token::With)?;
-                    let right = self.parse_addition()?;
+                    let right = self.parse_inlist()?;
                     return Ok(Expr::StartsWith(Box::new(left), Box::new(right)));
                 }
                 "ENDS" => {
                     self.advance();
                     self.expect(&Token::With)?;
-                    let right = self.parse_addition()?;
+                    let right = self.parse_inlist()?;
                     return Ok(Expr::EndsWith(Box::new(left), Box::new(right)));
                 }
                 "CONTAINS" => {
                     self.advance();
-                    let right = self.parse_addition()?;
+                    let right = self.parse_inlist()?;
                     return Ok(Expr::Contains(Box::new(left), Box::new(right)));
                 }
                 _ => {}
             }
         }
 
-        // IN list membership
-        if *self.peek() == Token::In {
-            self.advance();
-            let list_expr = self.parse_primary()?;
-            return Ok(Expr::InList(Box::new(left), Box::new(list_expr)));
-        }
-
         // =~ regex match
         if *self.peek() == Token::RegexMatch {
             self.advance();
-            let right = self.parse_addition()?;
+            let right = self.parse_inlist()?;
             return Ok(Expr::Regex(Box::new(left), Box::new(right)));
         }
 
@@ -538,26 +547,43 @@ impl Parser {
             Token::RArrow => Some(CmpOp::Gt),
             Token::Le => Some(CmpOp::Le),
             Token::Ge => Some(CmpOp::Ge),
-            Token::Is => {
-                self.advance();
-                if *self.peek() == Token::Not {
-                    self.advance();
-                    self.expect(&Token::Null)?;
-                    return Ok(Expr::IsNotNull(Box::new(left)));
-                }
-                self.expect(&Token::Null)?;
-                return Ok(Expr::IsNull(Box::new(left)));
-            }
             _ => None,
         };
 
         if let Some(op) = op {
             self.advance();
-            let right = self.parse_addition()?;
+            let right = self.parse_inlist()?;
             Ok(Expr::Compare(Box::new(left), op, Box::new(right)))
         } else {
             Ok(left)
         }
+    }
+
+    /// Parse IN list membership (higher precedence than comparison operators).
+    fn parse_inlist(&mut self) -> Result<Expr, ParseError> {
+        let left = self.parse_is_null()?;
+        if *self.peek() == Token::In {
+            self.advance();
+            let list_expr = self.parse_is_null()?;
+            return Ok(Expr::InList(Box::new(left), Box::new(list_expr)));
+        }
+        Ok(left)
+    }
+
+    /// Parse IS NULL / IS NOT NULL (higher precedence than IN and comparison).
+    fn parse_is_null(&mut self) -> Result<Expr, ParseError> {
+        let expr = self.parse_addition()?;
+        if *self.peek() == Token::Is {
+            self.advance();
+            if *self.peek() == Token::Not {
+                self.advance();
+                self.expect(&Token::Null)?;
+                return Ok(Expr::IsNotNull(Box::new(expr)));
+            }
+            self.expect(&Token::Null)?;
+            return Ok(Expr::IsNull(Box::new(expr)));
+        }
+        Ok(expr)
     }
 
     fn parse_addition(&mut self) -> Result<Expr, ParseError> {
@@ -581,26 +607,38 @@ impl Parser {
     }
 
     fn parse_multiplication(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.parse_unary()?;
+        let mut left = self.parse_power()?;
         loop {
             match self.peek() {
                 Token::Star => {
                     self.advance();
-                    let right = self.parse_unary()?;
+                    let right = self.parse_power()?;
                     left = Expr::Arith(Box::new(left), ArithOp::Mul, Box::new(right));
                 }
                 Token::Slash => {
                     self.advance();
-                    let right = self.parse_unary()?;
+                    let right = self.parse_power()?;
                     left = Expr::Arith(Box::new(left), ArithOp::Div, Box::new(right));
                 }
                 Token::Percent => {
                     self.advance();
-                    let right = self.parse_unary()?;
+                    let right = self.parse_power()?;
                     left = Expr::Arith(Box::new(left), ArithOp::Mod, Box::new(right));
                 }
                 _ => break,
             }
+        }
+        Ok(left)
+    }
+
+    /// Parse exponentiation (right-associative): `a ^ b ^ c` = `a ^ (b ^ c)`.
+    fn parse_power(&mut self) -> Result<Expr, ParseError> {
+        // Left-associative (openCypher TCK specifies left-to-right for ^)
+        let mut left = self.parse_unary()?;
+        while *self.peek() == Token::Caret {
+            self.advance();
+            let right = self.parse_unary()?;
+            left = Expr::Arith(Box::new(left), ArithOp::Pow, Box::new(right));
         }
         Ok(left)
     }
@@ -652,18 +690,46 @@ impl Parser {
                 inner
             }
             Token::LBracket => {
-                // List literal: [expr, expr, ...]
+                // List comprehension: [var IN list WHERE? pred? | proj?]
+                // vs list literal: [expr, expr, ...]
+                // Detect by: Ident followed by Token::In at peek_at(1).
                 self.advance();
-                let mut elems = Vec::new();
-                if *self.peek() != Token::RBracket {
-                    elems.push(self.parse_expr()?);
-                    while *self.peek() == Token::Comma {
+                if matches!(self.peek(), Token::Ident(_)) && *self.peek_at(1) == Token::In {
+                    let var = self.eat_ident()?;
+                    self.advance(); // consume IN
+                    let list_expr = self.parse_expr()?;
+                    let predicate = if *self.peek() == Token::Where {
                         self.advance();
-                        elems.push(self.parse_expr()?);
+                        Some(Box::new(self.parse_expr()?))
+                    } else {
+                        None
+                    };
+                    let projection = if *self.peek() == Token::Pipe {
+                        self.advance();
+                        Some(Box::new(self.parse_expr()?))
+                    } else {
+                        None
+                    };
+                    self.expect(&Token::RBracket)?;
+                    Expr::ListComprehension {
+                        variable: var,
+                        list_expr: Box::new(list_expr),
+                        predicate,
+                        projection,
                     }
+                } else {
+                    // List literal: [expr, expr, ...]
+                    let mut elems = Vec::new();
+                    if *self.peek() != Token::RBracket {
+                        elems.push(self.parse_expr()?);
+                        while *self.peek() == Token::Comma {
+                            self.advance();
+                            elems.push(self.parse_expr()?);
+                        }
+                    }
+                    self.expect(&Token::RBracket)?;
+                    Expr::List(elems)
                 }
-                self.expect(&Token::RBracket)?;
-                Expr::List(elems)
             }
             Token::Case => {
                 self.advance();
@@ -674,22 +740,108 @@ impl Parser {
                 // Check for function call: name(...)
                 if *self.peek() == Token::LParen {
                     self.advance(); // (
-                    let mut args = Vec::new();
-                    if *self.peek() != Token::RParen {
-                        // Special case: COUNT(*)
-                        if *self.peek() == Token::Star {
-                            args.push(Expr::Star);
+                    let lc = name.to_ascii_lowercase();
+
+                    // List predicate functions: any/all/none/single — special syntax
+                    // any(x IN list WHERE pred)
+                    let list_pred_kind = match lc.as_str() {
+                        "any"    => Some(ListPredicateKind::Any),
+                        "all"    => Some(ListPredicateKind::All),
+                        "none"   => Some(ListPredicateKind::None_),
+                        "single" => Some(ListPredicateKind::Single),
+                        _ => None,
+                    };
+                    if let Some(kind) = list_pred_kind {
+                        let var = self.eat_ident()?;
+                        self.expect(&Token::In)?;
+                        let list_expr = self.parse_expr()?;
+                        let predicate = if *self.peek() == Token::Where {
                             self.advance();
+                            self.parse_expr()?
                         } else {
+                            Expr::BoolLit(true)
+                        };
+                        self.expect(&Token::RParen)?;
+                        return Ok(self.parse_property_chain(Expr::ListPredicate {
+                            kind,
+                            variable: var,
+                            list_expr: Box::new(list_expr),
+                            predicate: Box::new(predicate),
+                        })?);
+                    }
+
+                    // filter(x IN list WHERE pred) — list comprehension without projection
+                    if lc == "filter" && matches!(self.peek(), Token::Ident(_))
+                        && *self.peek_at(1) == Token::In
+                    {
+                        let var = self.eat_ident()?;
+                        self.expect(&Token::In)?;
+                        let list_expr = self.parse_expr()?;
+                        let predicate = if *self.peek() == Token::Where {
+                            self.advance();
+                            Some(Box::new(self.parse_expr()?))
+                        } else {
+                            None
+                        };
+                        self.expect(&Token::RParen)?;
+                        return Ok(self.parse_property_chain(Expr::ListComprehension {
+                            variable: var,
+                            list_expr: Box::new(list_expr),
+                            predicate,
+                            projection: None,
+                        })?);
+                    }
+
+                    // extract(x IN list | expr) — deprecated list comprehension
+                    if lc == "extract" && matches!(self.peek(), Token::Ident(_))
+                        && *self.peek_at(1) == Token::In
+                    {
+                        let var = self.eat_ident()?;
+                        self.expect(&Token::In)?;
+                        let list_expr = self.parse_expr()?;
+                        let projection = if *self.peek() == Token::Pipe {
+                            self.advance();
+                            Some(Box::new(self.parse_expr()?))
+                        } else {
+                            None
+                        };
+                        self.expect(&Token::RParen)?;
+                        return Ok(self.parse_property_chain(Expr::ListComprehension {
+                            variable: var,
+                            list_expr: Box::new(list_expr),
+                            predicate: None,
+                            projection,
+                        })?);
+                    }
+
+                    // Aggregate functions: handle DISTINCT prefix
+                    let is_agg = is_aggregate_fn_name(&lc);
+                    let (fn_name, args) = if *self.peek() == Token::RParen {
+                        (name.clone(), vec![])
+                    } else if is_agg && *self.peek() == Token::Distinct {
+                        self.advance(); // consume DISTINCT
+                        let mut args = vec![];
+                        if *self.peek() != Token::RParen {
                             args.push(self.parse_expr()?);
                             while *self.peek() == Token::Comma {
                                 self.advance();
                                 args.push(self.parse_expr()?);
                             }
                         }
-                    }
+                        (format!("{lc}_distinct"), args)
+                    } else if *self.peek() == Token::Star {
+                        self.advance();
+                        (name.clone(), vec![Expr::Star])
+                    } else {
+                        let mut args = vec![self.parse_expr()?];
+                        while *self.peek() == Token::Comma {
+                            self.advance();
+                            args.push(self.parse_expr()?);
+                        }
+                        (name.clone(), args)
+                    };
                     self.expect(&Token::RParen)?;
-                    Expr::FunctionCall(name, args)
+                    Expr::FunctionCall(fn_name, args)
                 } else {
                     Expr::Variable(name)
                 }
@@ -745,31 +897,71 @@ impl Parser {
     }
 
     fn parse_property_chain(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
-        while *self.peek() == Token::Dot {
-            self.advance();
-            let prop = self.eat_ident()?;
-
-            // Check for method-style function call: expr.prop(args)
-            if *self.peek() == Token::LParen {
-                // Not supported in v0.6.0 but let's allow it to produce a
-                // clear error later rather than a confusing parse error.
+        loop {
+            if *self.peek() == Token::Dot {
                 self.advance();
-                let mut args = vec![expr.clone()];
-                if *self.peek() != Token::RParen {
-                    args.push(self.parse_expr()?);
-                    while *self.peek() == Token::Comma {
-                        self.advance();
+                let prop = self.eat_ident()?;
+
+                // Check for method-style function call: expr.prop(args)
+                if *self.peek() == Token::LParen {
+                    self.advance();
+                    let mut args = vec![expr.clone()];
+                    if *self.peek() != Token::RParen {
                         args.push(self.parse_expr()?);
+                        while *self.peek() == Token::Comma {
+                            self.advance();
+                            args.push(self.parse_expr()?);
+                        }
+                    }
+                    self.expect(&Token::RParen)?;
+                    expr = Expr::FunctionCall(prop, args);
+                } else {
+                    expr = Expr::Property(Box::new(expr), prop);
+                }
+            } else if *self.peek() == Token::LBracket {
+                self.advance(); // consume [
+                if *self.peek() == Token::DotDot {
+                    // [..to]
+                    self.advance();
+                    let to = if *self.peek() != Token::RBracket {
+                        Some(Box::new(self.parse_expr()?))
+                    } else {
+                        None
+                    };
+                    self.expect(&Token::RBracket)?;
+                    expr = Expr::ListSlice { list_expr: Box::new(expr), from: None, to };
+                } else {
+                    let inner = self.parse_expr()?;
+                    if *self.peek() == Token::DotDot {
+                        // [from..to] or [from..]
+                        self.advance();
+                        let to = if *self.peek() != Token::RBracket {
+                            Some(Box::new(self.parse_expr()?))
+                        } else {
+                            None
+                        };
+                        self.expect(&Token::RBracket)?;
+                        expr = Expr::ListSlice { list_expr: Box::new(expr), from: Some(Box::new(inner)), to };
+                    } else {
+                        self.expect(&Token::RBracket)?;
+                        expr = Expr::Subscript(Box::new(expr), Box::new(inner));
                     }
                 }
-                self.expect(&Token::RParen)?;
-                expr = Expr::FunctionCall(prop, args);
             } else {
-                expr = Expr::Property(Box::new(expr), prop);
+                break;
             }
         }
         Ok(expr)
     }
+}
+
+/// Returns true if the given (lowercase) function name is an aggregate.
+fn is_aggregate_fn_name(name: &str) -> bool {
+    matches!(
+        name,
+        "count" | "sum" | "avg" | "min" | "max" | "collect"
+            | "stdev" | "stdevp" | "percentilecont" | "percentiledisc"
+    )
 }
 
 /// Parse a Cypher query string into an AST.

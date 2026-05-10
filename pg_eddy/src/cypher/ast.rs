@@ -128,6 +128,8 @@ pub enum Expr {
     And(Box<Expr>, Box<Expr>),
     /// Boolean OR
     Or(Box<Expr>, Box<Expr>),
+    /// Boolean XOR
+    Xor(Box<Expr>, Box<Expr>),
     /// Boolean NOT
     Not(Box<Expr>),
     /// IS NULL
@@ -165,6 +167,37 @@ pub enum Expr {
         branches: Vec<(Expr, Expr)>,
         else_: Option<Box<Expr>>,
     },
+    /// List comprehension: [var IN list WHERE? pred? | proj?]
+    ListComprehension {
+        variable: String,
+        list_expr: Box<Expr>,
+        predicate: Option<Box<Expr>>,
+        projection: Option<Box<Expr>>,
+    },
+    /// List predicate: any/all/none/single(var IN list WHERE pred)
+    ListPredicate {
+        kind: ListPredicateKind,
+        variable: String,
+        list_expr: Box<Expr>,
+        predicate: Box<Expr>,
+    },
+    /// List element access: list[index]
+    Subscript(Box<Expr>, Box<Expr>),
+    /// List slice: list[from..to]
+    ListSlice {
+        list_expr: Box<Expr>,
+        from: Option<Box<Expr>>,
+        to: Option<Box<Expr>>,
+    },
+}
+
+/// Kind of list predicate function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListPredicateKind {
+    Any,
+    All,
+    None_,
+    Single,
 }
 
 /// Comparison operators.
@@ -186,6 +219,7 @@ pub enum ArithOp {
     Mul,
     Div,
     Mod,
+    Pow,
 }
 
 impl std::fmt::Display for CmpOp {
@@ -209,6 +243,7 @@ impl std::fmt::Display for ArithOp {
             ArithOp::Mul => write!(f, "*"),
             ArithOp::Div => write!(f, "/"),
             ArithOp::Mod => write!(f, "%"),
+            ArithOp::Pow => write!(f, "^"),
         }
     }
 }

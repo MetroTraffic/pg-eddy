@@ -141,8 +141,8 @@ pub fn execute(
         LogicalPlan::SingleRow => {
             Ok(vec![HashMap::new()])
         }
-        LogicalPlan::LabelScan { variable, label, inline_props } => {
-            exec_label_scan(variable, label.as_deref(), inline_props, params)
+        LogicalPlan::LabelScan { variable, label, inline_props, optional } => {
+            exec_label_scan(variable, label.as_deref(), inline_props, *optional, params)
         }
         LogicalPlan::Expand {
             input, src_var, rel_var, dst_var,
@@ -175,6 +175,7 @@ fn exec_label_scan(
     variable: &str,
     label: Option<&str>,
     inline_props: &[(String, Expr)],
+    optional: bool,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<Vec<Row>, ExecError> {
     use crate::catalog::labels::{label_name, label_id_by_name, prop_key_name};
@@ -184,7 +185,15 @@ fn exec_label_scan(
     let node_ids: Vec<i64> = if let Some(lname) = label {
         let lid = label_id_by_name(lname);
         match lid {
-            None => return Ok(Vec::new()),
+            None => {
+                // Label doesn't exist at all.
+                if optional {
+                    let mut null_row = Row::new();
+                    null_row.insert(variable.to_string(), Value::Null);
+                    return Ok(vec![null_row]);
+                }
+                return Ok(Vec::new());
+            }
             Some(lid) => {
                 Spi::connect(|client| {
                     client
@@ -267,10 +276,15 @@ fn exec_label_scan(
         }
     }
 
+    // If optional and no rows matched, return one null-filled row.
+    if optional && rows.is_empty() {
+        let mut null_row = Row::new();
+        null_row.insert(variable.to_string(), Value::Null);
+        return Ok(vec![null_row]);
+    }
+
     Ok(rows)
 }
-
-/// Expand from bound nodes along relationships.
 #[allow(clippy::too_many_arguments)]
 fn exec_expand(
     input: &LogicalPlan,
@@ -471,6 +485,15 @@ fn exec_expand(
         }
     }
 
+    // OPTIONAL MATCH with no source rows at all → one null row
+    if optional && result.is_empty() {
+        let mut null_row = Row::new();
+        null_row.insert(src_var.to_string(), Value::Null);
+        null_row.insert(dst_var.to_string(), Value::Null);
+        if let Some(rv) = rel_var { null_row.insert(rv.to_string(), Value::Null); }
+        result.push(null_row);
+    }
+
     Ok(result)
 }
 
@@ -552,6 +575,11 @@ fn exec_project(
 ) -> Result<Vec<Row>, ExecError> {
     let rows = execute(input, params)?;
 
+    // If any return item contains an aggregate function, use grouping.
+    if items.iter().any(|i| expr_has_aggregate(&i.expr)) {
+        return exec_project_aggregate(rows, items, distinct, order_by, skip, limit, params);
+    }
+
     // Build (projected_row, input_row) pairs; keep input rows for ORDER BY alias resolution.
     let mut projected: Vec<(Row, Row)> = Vec::with_capacity(rows.len());
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -572,7 +600,6 @@ fn exec_project(
     if !order_by.is_empty() {
         projected.sort_by(|(proj_a, in_a), (proj_b, in_b)| {
             for item in order_by {
-                // Try projected (alias) first, then input (pattern variable)
                 let av = eval_expr(&item.expr, proj_a, params)
                     .or_else(|_| eval_expr(&item.expr, in_a, params))
                     .unwrap_or(Value::Null);
@@ -615,6 +642,693 @@ fn exec_project(
     Ok(projected.into_iter().map(|(out_row, _)| out_row).collect())
 }
 
+/// Aggregating version of exec_project: groups rows by non-aggregate key items,
+/// computes aggregates per group, then applies ORDER BY / DISTINCT / SKIP / LIMIT.
+fn exec_project_aggregate(
+    rows: Vec<Row>,
+    items: &[ReturnItem],
+    distinct: bool,
+    order_by: &[crate::cypher::ast::OrderItem],
+    skip: &Option<Expr>,
+    limit: &Option<Expr>,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<Row>, ExecError> {
+    // Semantic check: AmbiguousAggregationExpression.
+    //
+    // Collect grouping key expressions (non-aggregate RETURN/WITH items).
+    // Also include aliases as Variable("alias") so ORDER BY can reference them.
+    let mut key_exprs: Vec<Expr> = Vec::new();
+    for item in items {
+        if !expr_has_aggregate(&item.expr) {
+            key_exprs.push(item.expr.clone());
+            if let Some(alias) = &item.alias {
+                key_exprs.push(Expr::Variable(alias.clone()));
+            }
+        }
+    }
+
+    // For each aggregate-containing expression (RETURN items and ORDER BY items),
+    // every "free" variable/property reference (not nested inside an aggregate call)
+    // must appear as an exact key expression.
+    for item in items {
+        if expr_has_aggregate(&item.expr) {
+            let mut free_refs: Vec<Expr> = Vec::new();
+            collect_free_var_refs(&item.expr, &mut free_refs);
+            for fref in &free_refs {
+                if !key_exprs.iter().any(|k| expr_structural_eq(k, fref)) {
+                    return Err(ExecError {
+                        message: "SyntaxError: AmbiguousAggregationExpression: expression \
+                                   mixes aggregate function calls and non-aggregated \
+                                   variable references"
+                            .into(),
+                    });
+                }
+            }
+        }
+    }
+    for ob in order_by {
+        if expr_has_aggregate(&ob.expr) {
+            let mut free_refs: Vec<Expr> = Vec::new();
+            collect_free_var_refs(&ob.expr, &mut free_refs);
+            for fref in &free_refs {
+                if !key_exprs.iter().any(|k| expr_structural_eq(k, fref)) {
+                    return Err(ExecError {
+                        message: "SyntaxError: AmbiguousAggregationExpression in ORDER BY: \
+                                   expression mixes aggregate and non-aggregated \
+                                   variable references"
+                            .into(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Separate key items (no aggregate) from aggregate items.
+    let has_key = items.iter().any(|i| !expr_has_aggregate(&i.expr));
+
+    // Groups: ordered by first seen fingerprint.
+    // Each entry: (fingerprint, key_row, group_rows)
+    let mut group_order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, (Row, Vec<Row>)> =
+        std::collections::HashMap::new();
+
+    for row in &rows {
+        // Build key row from non-aggregate items.
+        let mut key_row = Row::new();
+        let mut key_parts: Vec<String> = Vec::new();
+        for (idx, item) in items.iter().enumerate() {
+            if !expr_has_aggregate(&item.expr) {
+                let val = eval_expr(&item.expr, row, params).unwrap_or(Value::Null);
+                let col = item.alias.clone()
+                    .unwrap_or_else(|| expr_default_name(&item.expr, idx));
+                key_parts.push(format!("{}={}", col,
+                    serde_json::to_string(&val.to_json()).unwrap_or_default()));
+                key_row.insert(col, val);
+            }
+        }
+        let fp = key_parts.join("\x00");
+        if !groups.contains_key(&fp) {
+            group_order.push(fp.clone());
+            groups.insert(fp.clone(), (key_row, Vec::new()));
+        }
+        groups.get_mut(&fp).unwrap().1.push(row.clone());
+    }
+
+    // If no rows and no grouping keys (e.g. RETURN count(*) on empty graph),
+    // produce one empty group so COUNT returns 0.
+    if groups.is_empty() && !has_key {
+        group_order.push(String::new());
+        groups.insert(String::new(), (Row::new(), Vec::new()));
+    }
+
+    let mut projected: Vec<(Row, Row)> = Vec::new();
+    for fp in &group_order {
+        let (key_row, group_rows) = groups.get(fp).unwrap();
+        let mut out_row = Row::new();
+        for (idx, item) in items.iter().enumerate() {
+            let val = eval_with_agg(&item.expr, group_rows, key_row, params)?;
+            let col = item.alias.clone()
+                .unwrap_or_else(|| expr_default_name(&item.expr, idx));
+            out_row.insert(col, val);
+        }
+        projected.push((out_row, key_row.clone()));
+    }
+
+    // ORDER BY
+    if !order_by.is_empty() {
+        projected.sort_by(|(proj_a, in_a), (proj_b, in_b)| {
+            for item in order_by {
+                let av = eval_expr(&item.expr, proj_a, params)
+                    .or_else(|_| eval_expr(&item.expr, in_a, params))
+                    .unwrap_or(Value::Null);
+                let bv = eval_expr(&item.expr, proj_b, params)
+                    .or_else(|_| eval_expr(&item.expr, in_b, params))
+                    .unwrap_or(Value::Null);
+                let cmp = value_ordering(&av, &bv);
+                if cmp != std::cmp::Ordering::Equal {
+                    return if item.ascending { cmp } else { cmp.reverse() };
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+
+    // DISTINCT
+    if distinct {
+        let mut seen = std::collections::HashSet::new();
+        projected.retain(|(out_row, _)| seen.insert(row_fingerprint(out_row)));
+    }
+
+    // SKIP
+    if let Some(skip_expr) = skip {
+        let n = eval_const_usize(skip_expr, params);
+        if n >= projected.len() { projected.clear(); } else { projected.drain(0..n); }
+    }
+
+    // LIMIT
+    if let Some(limit_expr) = limit {
+        projected.truncate(eval_const_usize(limit_expr, params));
+    }
+
+    Ok(projected.into_iter().map(|(out_row, _)| out_row).collect())
+}
+
+/// Returns true if the expression contains any aggregate function call.
+fn expr_has_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall(name, args) => {
+            is_aggregate_name(name) || args.iter().any(expr_has_aggregate)
+        }
+        Expr::Arith(l, _, r) | Expr::Compare(l, _, r) | Expr::And(l, r) | Expr::Or(l, r)
+        | Expr::Xor(l, r)
+        | Expr::StartsWith(l, r) | Expr::EndsWith(l, r) | Expr::Contains(l, r)
+        | Expr::Regex(l, r) | Expr::InList(l, r) => {
+            expr_has_aggregate(l) || expr_has_aggregate(r)
+        }
+        Expr::Not(e) | Expr::Neg(e) | Expr::IsNull(e) | Expr::IsNotNull(e)
+        | Expr::Property(e, _) => expr_has_aggregate(e),
+        Expr::Subscript(l, r) => expr_has_aggregate(l) || expr_has_aggregate(r),
+        Expr::ListSlice { list_expr, from, to, .. } => {
+            expr_has_aggregate(list_expr)
+                || from.as_deref().map_or(false, expr_has_aggregate)
+                || to.as_deref().map_or(false, expr_has_aggregate)
+        }
+        Expr::List(exprs) => exprs.iter().any(expr_has_aggregate),
+        Expr::CaseSearched { branches, else_ } => {
+            branches.iter().any(|(c, t)| expr_has_aggregate(c) || expr_has_aggregate(t))
+                || else_.as_deref().map_or(false, expr_has_aggregate)
+        }
+        Expr::CaseSimple { test, branches, else_ } => {
+            expr_has_aggregate(test)
+                || branches.iter().any(|(w, t)| expr_has_aggregate(w) || expr_has_aggregate(t))
+                || else_.as_deref().map_or(false, expr_has_aggregate)
+        }
+        Expr::ListComprehension { list_expr, predicate, projection, .. } => {
+            expr_has_aggregate(list_expr)
+                || predicate.as_deref().map_or(false, expr_has_aggregate)
+                || projection.as_deref().map_or(false, expr_has_aggregate)
+        }
+        Expr::ListPredicate { list_expr, predicate, .. } => {
+            expr_has_aggregate(list_expr) || expr_has_aggregate(predicate)
+        }
+        _ => false,
+    }
+}
+
+/// Returns true if the function name is an aggregate.
+fn is_aggregate_name(name: &str) -> bool {
+    let lc = name.to_ascii_lowercase();
+    matches!(
+        lc.as_str(),
+        "count" | "count_distinct"
+            | "sum" | "sum_distinct"
+            | "avg" | "avg_distinct"
+            | "min" | "max"
+            | "collect" | "collect_distinct"
+            | "stdev" | "stdevp"
+            | "percentilecont" | "percentiledisc"
+    )
+}
+
+/// Evaluate an expression that may contain aggregates over a group of rows.
+/// Non-aggregate sub-expressions are evaluated on `fallback_row`.
+fn eval_with_agg(
+    expr: &Expr,
+    group_rows: &[Row],
+    fallback_row: &Row,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Value, ExecError> {
+    if !expr_has_aggregate(expr) {
+        // Use first group row if available (they all have the same key values).
+        let row = group_rows.first().unwrap_or(fallback_row);
+        return eval_expr(expr, row, params);
+    }
+    match expr {
+        Expr::FunctionCall(name, args) if is_aggregate_name(name) => {
+            eval_aggregate_call(name, args, group_rows, params)
+        }
+        Expr::FunctionCall(name, args) => {
+            // Non-aggregate function: evaluate each arg (which may contain aggregates) then call function
+            let vals: Vec<Value> = args.iter()
+                .map(|a| eval_with_agg(a, group_rows, fallback_row, params))
+                .collect::<Result<_, _>>()?;
+            // Build a synthetic row that maps positional argument slots to values
+            // and call eval_function directly.
+            eval_function_with_vals(name, &vals)
+        }
+        Expr::Arith(l, op, r) => {
+            let lv = eval_with_agg(l, group_rows, fallback_row, params)?;
+            let rv = eval_with_agg(r, group_rows, fallback_row, params)?;
+            eval_arith(&lv, op, &rv)
+        }
+        Expr::Compare(l, op, r) => {
+            let lv = eval_with_agg(l, group_rows, fallback_row, params)?;
+            let rv = eval_with_agg(r, group_rows, fallback_row, params)?;
+            match compare_values(&lv, op, &rv) {
+                None => Ok(Value::Null),
+                Some(b) => Ok(Value::Bool(b)),
+            }
+        }
+        Expr::And(l, r) => {
+            let lv = eval_with_agg(l, group_rows, fallback_row, params)?;
+            match truthy3(&lv) {
+                Some(false) => Ok(Value::Bool(false)),
+                Some(true) => {
+                    let rv = eval_with_agg(r, group_rows, fallback_row, params)?;
+                    Ok(match truthy3(&rv) { Some(b) => Value::Bool(b), None => Value::Null })
+                }
+                None => {
+                    let rv = eval_with_agg(r, group_rows, fallback_row, params)?;
+                    Ok(match truthy3(&rv) { Some(false) => Value::Bool(false), _ => Value::Null })
+                }
+            }
+        }
+        Expr::Or(l, r) => {
+            let lv = eval_with_agg(l, group_rows, fallback_row, params)?;
+            match truthy3(&lv) {
+                Some(true) => Ok(Value::Bool(true)),
+                Some(false) => {
+                    let rv = eval_with_agg(r, group_rows, fallback_row, params)?;
+                    Ok(match truthy3(&rv) { Some(b) => Value::Bool(b), None => Value::Null })
+                }
+                None => {
+                    let rv = eval_with_agg(r, group_rows, fallback_row, params)?;
+                    Ok(match truthy3(&rv) { Some(true) => Value::Bool(true), _ => Value::Null })
+                }
+            }
+        }
+        Expr::Xor(l, r) => {
+            let lv = eval_with_agg(l, group_rows, fallback_row, params)?;
+            let rv = eval_with_agg(r, group_rows, fallback_row, params)?;
+            Ok(match (truthy3(&lv), truthy3(&rv)) {
+                (Some(a), Some(b)) => Value::Bool(a ^ b),
+                _ => Value::Null,
+            })
+        }
+        Expr::Not(e) => {
+            let v = eval_with_agg(e, group_rows, fallback_row, params)?;
+            Ok(match truthy3(&v) { Some(b) => Value::Bool(!b), None => Value::Null })
+        }
+        Expr::IsNull(e) => {
+            let v = eval_with_agg(e, group_rows, fallback_row, params)?;
+            Ok(Value::Bool(matches!(v, Value::Null)))
+        }
+        Expr::IsNotNull(e) => {
+            let v = eval_with_agg(e, group_rows, fallback_row, params)?;
+            Ok(Value::Bool(!matches!(v, Value::Null)))
+        }
+        Expr::Neg(e) => {
+            let v = eval_with_agg(e, group_rows, fallback_row, params)?;
+            match v {
+                Value::Int(i) => Ok(Value::Int(-i)),
+                Value::Float(f) => Ok(Value::Float(-f)),
+                _ => Ok(Value::Null),
+            }
+        }
+        Expr::CaseSearched { branches, else_ } => {
+            for (cond, then) in branches {
+                let cv = eval_with_agg(cond, group_rows, fallback_row, params)?;
+                if matches!(truthy3(&cv), Some(true)) {
+                    return eval_with_agg(then, group_rows, fallback_row, params);
+                }
+            }
+            match else_ {
+                Some(e) => eval_with_agg(e, group_rows, fallback_row, params),
+                None => Ok(Value::Null),
+            }
+        }
+        Expr::ListComprehension { variable, list_expr, predicate, projection } => {
+            // Evaluate the list source with potential aggregation
+            let list_val = eval_with_agg(list_expr, group_rows, fallback_row, params)?;
+            let items = match &list_val {
+                Value::Json(serde_json::Value::Array(arr)) => arr.clone(),
+                Value::Null => return Ok(Value::Json(serde_json::Value::Array(vec![]))),
+                _ => return Ok(Value::Null),
+            };
+            let base_row = group_rows.first().unwrap_or(fallback_row);
+            let mut result = Vec::new();
+            for item in &items {
+                let item_val = json_to_value(item);
+                let mut iter_row = base_row.clone();
+                iter_row.insert(variable.clone(), item_val);
+                if let Some(pred) = predicate {
+                    let pv = eval_expr(pred, &iter_row, params).unwrap_or(Value::Null);
+                    if !matches!(truthy3(&pv), Some(true)) {
+                        continue;
+                    }
+                }
+                let proj_val = if let Some(proj) = projection {
+                    eval_expr(proj, &iter_row, params)?
+                } else {
+                    iter_row.get(variable.as_str()).cloned().unwrap_or(Value::Null)
+                };
+                result.push(proj_val.to_json());
+            }
+            Ok(Value::Json(serde_json::Value::Array(result)))
+        }
+        // For other compound expressions fall back to evaluating on first row
+        other => {
+            let row = group_rows.first().unwrap_or(fallback_row);
+            eval_expr(other, row, params)
+        }
+    }
+}
+
+/// Call a non-aggregate function given already-evaluated argument values.
+fn eval_function_with_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
+    // Build a synthetic row mapping placeholder keys to the pre-evaluated values,
+    // then call eval_function with Variable args pointing to those keys.
+    let mut synthetic_row = Row::new();
+    let mut synthetic_args: Vec<Expr> = Vec::with_capacity(vals.len());
+    for (i, val) in vals.iter().enumerate() {
+        let key = format!("__fn_arg_{i}");
+        synthetic_row.insert(key.clone(), val.clone());
+        synthetic_args.push(Expr::Variable(key));
+    }
+    let empty_params = HashMap::new();
+    eval_function(name, &synthetic_args, &synthetic_row, &empty_params)
+}
+
+/// Evaluate an aggregate function call over a group of rows.
+fn eval_aggregate_call(
+    name: &str,
+    args: &[Expr],
+    group_rows: &[Row],
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Value, ExecError> {
+    let lc = name.to_ascii_lowercase();
+    let distinct = lc.ends_with("_distinct");
+    let base = if distinct { &lc[..lc.len() - 9] } else { lc.as_str() };
+
+    match base {
+        "count" => {
+            if args.len() == 1 && matches!(args[0], Expr::Star) {
+                return Ok(Value::Int(group_rows.len() as i64));
+            }
+            if args.is_empty() {
+                return Ok(Value::Int(group_rows.len() as i64));
+            }
+            let vals: Vec<Value> = group_rows.iter()
+                .filter_map(|row| eval_expr(&args[0], row, params).ok())
+                .filter(|v| !matches!(v, Value::Null))
+                .collect();
+            if distinct {
+                let mut seen = std::collections::HashSet::new();
+                let count = vals.iter()
+                    .filter(|v| seen.insert(value_fingerprint(v)))
+                    .count();
+                Ok(Value::Int(count as i64))
+            } else {
+                Ok(Value::Int(vals.len() as i64))
+            }
+        }
+        "sum" => {
+            if args.is_empty() {
+                return Err(ExecError { message: "sum() requires an argument".into() });
+            }
+            let mut sum_i = 0i64;
+            let mut sum_f = 0.0f64;
+            let mut is_float = false;
+            for row in group_rows {
+                match eval_expr(&args[0], row, params).unwrap_or(Value::Null) {
+                    Value::Int(i) => sum_i += i,
+                    Value::Float(f) => { sum_f += f; is_float = true; }
+                    Value::Null => {}
+                    _ => {}
+                }
+            }
+            if is_float {
+                Ok(Value::Float(sum_f + sum_i as f64))
+            } else {
+                Ok(Value::Int(sum_i))
+            }
+        }
+        "avg" => {
+            if args.is_empty() {
+                return Err(ExecError { message: "avg() requires an argument".into() });
+            }
+            let mut sum = 0.0f64;
+            let mut count = 0usize;
+            for row in group_rows {
+                match eval_expr(&args[0], row, params).unwrap_or(Value::Null) {
+                    Value::Int(i) => { sum += i as f64; count += 1; }
+                    Value::Float(f) => { sum += f; count += 1; }
+                    Value::Null => {}
+                    _ => {}
+                }
+            }
+            if count == 0 {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Float(sum / count as f64))
+            }
+        }
+        "min" => {
+            if args.is_empty() {
+                return Err(ExecError { message: "min() requires an argument".into() });
+            }
+            let mut result: Option<Value> = None;
+            for row in group_rows {
+                let v = eval_expr(&args[0], row, params).unwrap_or(Value::Null);
+                if matches!(v, Value::Null) { continue; }
+                result = Some(match result {
+                    None => v,
+                    Some(cur) => if value_ordering(&v, &cur) == std::cmp::Ordering::Less { v } else { cur },
+                });
+            }
+            Ok(result.unwrap_or(Value::Null))
+        }
+        "max" => {
+            if args.is_empty() {
+                return Err(ExecError { message: "max() requires an argument".into() });
+            }
+            let mut result: Option<Value> = None;
+            for row in group_rows {
+                let v = eval_expr(&args[0], row, params).unwrap_or(Value::Null);
+                if matches!(v, Value::Null) { continue; }
+                result = Some(match result {
+                    None => v,
+                    Some(cur) => if value_ordering(&v, &cur) == std::cmp::Ordering::Greater { v } else { cur },
+                });
+            }
+            Ok(result.unwrap_or(Value::Null))
+        }
+        "collect" => {
+            if args.is_empty() {
+                return Err(ExecError { message: "collect() requires an argument".into() });
+            }
+            let mut vals: Vec<serde_json::Value> = Vec::new();
+            for row in group_rows {
+                let v = eval_expr(&args[0], row, params).unwrap_or(Value::Null);
+                if !matches!(v, Value::Null) {
+                    if distinct {
+                        let j = v.to_json();
+                        let fp = serde_json::to_string(&j).unwrap_or_default();
+                        if !vals.iter().any(|x| serde_json::to_string(x).unwrap_or_default() == fp) {
+                            vals.push(j);
+                        }
+                    } else {
+                        vals.push(v.to_json());
+                    }
+                }
+            }
+            Ok(Value::Json(serde_json::Value::Array(vals)))
+        }
+        "stdev" => {
+            // Sample standard deviation (Bessel's correction)
+            eval_stdev(args, group_rows, params, true)
+        }
+        "stdevp" => {
+            // Population standard deviation
+            eval_stdev(args, group_rows, params, false)
+        }
+        "percentilecont" => {
+            eval_percentile(args, group_rows, params, true)
+        }
+        "percentiledisc" => {
+            eval_percentile(args, group_rows, params, false)
+        }
+        _ => Err(ExecError { message: format!("unknown aggregate: {name}") }),
+    }
+}
+
+fn eval_stdev(
+    args: &[Expr],
+    group_rows: &[Row],
+    params: &HashMap<String, serde_json::Value>,
+    sample: bool,
+) -> Result<Value, ExecError> {
+    if args.is_empty() {
+        return Err(ExecError { message: "stdev() requires an argument".into() });
+    }
+    let vals: Vec<f64> = group_rows.iter()
+        .filter_map(|row| eval_expr(&args[0], row, params).ok())
+        .filter_map(|v| match v { Value::Int(i) => Some(i as f64), Value::Float(f) => Some(f), _ => None })
+        .collect();
+    let n = vals.len();
+    if n == 0 || (sample && n == 1) { return Ok(Value::Float(0.0)); }
+    let mean = vals.iter().sum::<f64>() / n as f64;
+    let variance = vals.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
+        / if sample { (n - 1) as f64 } else { n as f64 };
+    Ok(Value::Float(variance.sqrt()))
+}
+
+fn eval_percentile(
+    args: &[Expr],
+    group_rows: &[Row],
+    params: &HashMap<String, serde_json::Value>,
+    interpolate: bool,
+) -> Result<Value, ExecError> {
+    if args.len() < 2 {
+        return Err(ExecError { message: "percentile functions require 2 arguments".into() });
+    }
+    let pct_val = eval_expr(&args[1], &Row::new(), params).unwrap_or(Value::Null);
+    let pct = match pct_val {
+        Value::Float(f) => f,
+        Value::Int(i) => i as f64,
+        _ => return Ok(Value::Null),
+    };
+    if pct < 0.0 || pct > 1.0 {
+        return Err(ExecError { message: "percentile must be between 0.0 and 1.0".into() });
+    }
+    let mut vals: Vec<f64> = group_rows.iter()
+        .filter_map(|row| eval_expr(&args[0], row, params).ok())
+        .filter_map(|v| match v { Value::Int(i) => Some(i as f64), Value::Float(f) => Some(f), _ => None })
+        .collect();
+    if vals.is_empty() { return Ok(Value::Null); }
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = vals.len();
+    if interpolate {
+        let idx = pct * (n - 1) as f64;
+        let lo = idx.floor() as usize;
+        let hi = (lo + 1).min(n - 1);
+        let frac = idx - lo as f64;
+        Ok(Value::Float(vals[lo] * (1.0 - frac) + vals[hi] * frac))
+    } else {
+        let idx = (pct * n as f64).ceil() as usize;
+        let idx = idx.saturating_sub(1).min(n - 1);
+        Ok(Value::Float(vals[idx]))
+    }
+}
+
+/// Produce a stable string fingerprint for a Value (used in DISTINCT deduplication).
+fn value_fingerprint(v: &Value) -> String {
+    serde_json::to_string(&v.to_json()).unwrap_or_default()
+}
+
+/// Returns true if the expression contains a Variable or Property reference that is
+/// NOT nested inside an aggregate function call.  Used to detect AmbiguousAggregationExpression.
+fn expr_has_direct_var_ref(expr: &Expr) -> bool {
+    match expr {
+        Expr::Variable(_) => true,
+        Expr::Property(base, _) => expr_has_direct_var_ref(base),
+        Expr::FunctionCall(name, args) => {
+            if is_aggregate_name(name) {
+                false // refs inside aggregates are correctly aggregated
+            } else {
+                args.iter().any(expr_has_direct_var_ref)
+            }
+        }
+        Expr::Arith(l, _, r) | Expr::Compare(l, _, r) | Expr::And(l, r) | Expr::Or(l, r)
+        | Expr::Xor(l, r)
+        | Expr::StartsWith(l, r) | Expr::EndsWith(l, r) | Expr::Contains(l, r)
+        | Expr::Regex(l, r) | Expr::InList(l, r) => {
+            expr_has_direct_var_ref(l) || expr_has_direct_var_ref(r)
+        }
+        Expr::Not(e) | Expr::Neg(e) | Expr::IsNull(e) | Expr::IsNotNull(e)
+        | Expr::Property(e, _) => expr_has_direct_var_ref(e),
+        Expr::Subscript(l, r) => expr_has_direct_var_ref(l) || expr_has_direct_var_ref(r),
+        Expr::ListSlice { list_expr, from, to, .. } => {
+            expr_has_direct_var_ref(list_expr)
+                || from.as_deref().map_or(false, expr_has_direct_var_ref)
+                || to.as_deref().map_or(false, expr_has_direct_var_ref)
+        }
+        Expr::List(es) => es.iter().any(expr_has_direct_var_ref),
+        Expr::CaseSearched { branches, else_ } => {
+            branches.iter().any(|(c, t)| expr_has_direct_var_ref(c) || expr_has_direct_var_ref(t))
+                || else_.as_deref().map_or(false, expr_has_direct_var_ref)
+        }
+        Expr::CaseSimple { test, branches, else_ } => {
+            expr_has_direct_var_ref(test)
+                || branches.iter().any(|(w, t)| expr_has_direct_var_ref(w) || expr_has_direct_var_ref(t))
+                || else_.as_deref().map_or(false, expr_has_direct_var_ref)
+        }
+        Expr::ListComprehension { list_expr, predicate, projection, .. } => {
+            expr_has_direct_var_ref(list_expr)
+                || predicate.as_deref().map_or(false, expr_has_direct_var_ref)
+                || projection.as_deref().map_or(false, expr_has_direct_var_ref)
+        }
+        Expr::ListPredicate { list_expr, predicate, .. } => {
+            expr_has_direct_var_ref(list_expr) || expr_has_direct_var_ref(predicate)
+        }
+        // Literals, Star, Parameter, NullLit don't reference variables
+        _ => false,
+    }
+}
+
+/// Collect all Variable/Property leaf expressions that are NOT nested inside an
+/// aggregate function call.  These are the "free variable references" that must
+/// be covered by a grouping-key expression.
+fn collect_free_var_refs(expr: &Expr, acc: &mut Vec<Expr>) {
+    match expr {
+        Expr::Variable(_) => acc.push(expr.clone()),
+        Expr::Property(base, _) => {
+            // Treat the whole `node.prop` as a single unit when the base is a Variable.
+            if matches!(**base, Expr::Variable(_)) {
+                acc.push(expr.clone());
+            } else {
+                collect_free_var_refs(base, acc);
+            }
+        }
+        Expr::FunctionCall(name, args) => {
+            if is_aggregate_name(name) {
+                // Do NOT recurse into aggregate call arguments.
+            } else {
+                for a in args {
+                    collect_free_var_refs(a, acc);
+                }
+            }
+        }
+        Expr::Arith(l, _, r) | Expr::Compare(l, _, r) | Expr::And(l, r) | Expr::Or(l, r)
+        | Expr::Xor(l, r)
+        | Expr::StartsWith(l, r) | Expr::EndsWith(l, r) | Expr::Contains(l, r)
+        | Expr::Regex(l, r) | Expr::InList(l, r) => {
+            collect_free_var_refs(l, acc);
+            collect_free_var_refs(r, acc);
+        }
+        Expr::Not(e) | Expr::Neg(e) | Expr::IsNull(e) | Expr::IsNotNull(e) => {
+            collect_free_var_refs(e, acc);
+        }
+        Expr::Subscript(l, r) => { collect_free_var_refs(l, acc); collect_free_var_refs(r, acc); }
+        Expr::List(es) => {
+            for e in es { collect_free_var_refs(e, acc); }
+        }
+        Expr::CaseSearched { branches, else_ } => {
+            for (c, t) in branches { collect_free_var_refs(c, acc); collect_free_var_refs(t, acc); }
+            if let Some(e) = else_ { collect_free_var_refs(e, acc); }
+        }
+        Expr::CaseSimple { test, branches, else_ } => {
+            collect_free_var_refs(test, acc);
+            for (w, t) in branches { collect_free_var_refs(w, acc); collect_free_var_refs(t, acc); }
+            if let Some(e) = else_ { collect_free_var_refs(e, acc); }
+        }
+        // Literals, Param, Star, list comprehensions/predicates — no plain var refs
+        _ => {}
+    }
+}
+
+/// Structural equality for Variable and Property expressions (case-insensitive names).
+/// Used to check whether a free variable reference is covered by a grouping key.
+fn expr_structural_eq(a: &Expr, b: &Expr) -> bool {
+    match (a, b) {
+        (Expr::Variable(x), Expr::Variable(y)) => x.to_lowercase() == y.to_lowercase(),
+        (Expr::Property(ba, fa), Expr::Property(bb, fb)) => {
+            fa.to_lowercase() == fb.to_lowercase() && expr_structural_eq(ba, bb)
+        }
+        _ => false,
+    }
+}
+
 /// Evaluate an expression against a row of bindings.
 pub fn eval_expr(
     expr: &Expr,
@@ -647,7 +1361,10 @@ pub fn eval_expr(
         Expr::Compare(left, op, right) => {
             let l = eval_expr(left, row, params)?;
             let r = eval_expr(right, row, params)?;
-            Ok(Value::Bool(compare_values(&l, op, &r)))
+            match compare_values(&l, op, &r) {
+                None => Ok(Value::Null),
+                Some(b) => Ok(Value::Bool(b)),
+            }
         }
         Expr::And(left, right) => {
             // openCypher 3-valued logic: null AND false = false; null AND true = null
@@ -830,6 +1547,137 @@ pub fn eval_expr(
                 None => Ok(Value::Null),
             }
         }
+        Expr::ListComprehension { variable, list_expr, predicate, projection } => {
+            let list_val = eval_expr(list_expr, row, params)?;
+            let arr = match list_val {
+                Value::Json(serde_json::Value::Array(a)) => a,
+                Value::Null => return Ok(Value::Json(serde_json::Value::Array(vec![]))),
+                _ => return Ok(Value::Json(serde_json::Value::Array(vec![]))),
+            };
+            let mut result = Vec::new();
+            for item in arr {
+                let mut inner_row = row.clone();
+                inner_row.insert(variable.clone(), json_to_value(&item));
+                // Apply WHERE predicate if present.
+                if let Some(pred) = predicate {
+                    let pv = eval_expr(pred, &inner_row, params)?;
+                    if !matches!(truthy3(&pv), Some(true)) {
+                        continue;
+                    }
+                }
+                // Apply projection if present, else return element.
+                let out = if let Some(proj) = projection {
+                    eval_expr(proj, &inner_row, params)?
+                } else {
+                    json_to_value(&item)
+                };
+                result.push(out.to_json());
+            }
+            Ok(Value::Json(serde_json::Value::Array(result)))
+        }
+        Expr::ListPredicate { kind, variable, list_expr, predicate } => {
+            use crate::cypher::ast::ListPredicateKind;
+            let list_val = eval_expr(list_expr, row, params)?;
+            let arr = match list_val {
+                Value::Json(serde_json::Value::Array(a)) => a,
+                Value::Null => return Ok(Value::Null),
+                _ => return Ok(Value::Bool(false)),
+            };
+            let mut true_count = 0usize;
+            let mut has_null = false;
+            for item in &arr {
+                let mut inner_row = row.clone();
+                inner_row.insert(variable.clone(), json_to_value(item));
+                let pv = eval_expr(predicate, &inner_row, params)?;
+                match truthy3(&pv) {
+                    Some(true) => true_count += 1,
+                    None => has_null = true,
+                    Some(false) => {}
+                }
+            }
+            let total = arr.len();
+            match kind {
+                ListPredicateKind::Any => {
+                    if true_count > 0 { Ok(Value::Bool(true)) }
+                    else if has_null { Ok(Value::Null) }
+                    else { Ok(Value::Bool(false)) }
+                }
+                ListPredicateKind::All => {
+                    if true_count == total { Ok(Value::Bool(true)) }
+                    else if has_null && true_count + 1 == total { Ok(Value::Null) }
+                    else { Ok(Value::Bool(false)) }
+                }
+                ListPredicateKind::None_ => {
+                    if true_count == 0 && !has_null { Ok(Value::Bool(true)) }
+                    else if true_count > 0 { Ok(Value::Bool(false)) }
+                    else { Ok(Value::Null) }
+                }
+                ListPredicateKind::Single => {
+                    if true_count == 1 && !has_null { Ok(Value::Bool(true)) }
+                    else if true_count > 1 { Ok(Value::Bool(false)) }
+                    else if true_count == 0 && !has_null { Ok(Value::Bool(false)) }
+                    else { Ok(Value::Null) }
+                }
+            }
+        }
+        Expr::Xor(left, right) => {
+            let l = eval_expr(left, row, params)?;
+            let r = eval_expr(right, row, params)?;
+            Ok(match (truthy3(&l), truthy3(&r)) {
+                (Some(a), Some(b)) => Value::Bool(a ^ b),
+                _ => Value::Null,
+            })
+        }
+        Expr::Subscript(list_expr, index_expr) => {
+            let list_val = eval_expr(list_expr, row, params)?;
+            let idx_val = eval_expr(index_expr, row, params)?;
+            let arr = match &list_val {
+                Value::Json(serde_json::Value::Array(a)) => a,
+                Value::Null => return Ok(Value::Null),
+                _ => return Ok(Value::Null),
+            };
+            let idx = match idx_val {
+                Value::Int(i) => i,
+                Value::Float(f) => f as i64,
+                _ => return Ok(Value::Null),
+            };
+            let len = arr.len() as i64;
+            let actual = if idx < 0 { len + idx } else { idx };
+            if actual < 0 || actual >= len {
+                Ok(Value::Null)
+            } else {
+                Ok(json_to_value(&arr[actual as usize]))
+            }
+        }
+        Expr::ListSlice { list_expr, from, to } => {
+            let list_val = eval_expr(list_expr, row, params)?;
+            let arr = match list_val {
+                Value::Json(serde_json::Value::Array(a)) => a,
+                Value::Null => return Ok(Value::Json(serde_json::Value::Array(vec![]))),
+                _ => return Ok(Value::Json(serde_json::Value::Array(vec![]))),
+            };
+            let len = arr.len() as i64;
+            let start = if let Some(f) = from {
+                match eval_expr(f, row, params)? {
+                    Value::Int(i) => if i < 0 { (len + i).max(0) } else { i.min(len) },
+                    Value::Float(f) => { let i = f as i64; if i < 0 { (len + i).max(0) } else { i.min(len) } }
+                    _ => 0,
+                }
+            } else { 0 };
+            let end = if let Some(t) = to {
+                match eval_expr(t, row, params)? {
+                    Value::Int(i) => if i < 0 { (len + i).max(0) } else { i.min(len) },
+                    Value::Float(f) => { let i = f as i64; if i < 0 { (len + i).max(0) } else { i.min(len) } }
+                    _ => len,
+                }
+            } else { len };
+            let sliced: Vec<serde_json::Value> = arr
+                .into_iter()
+                .skip(start as usize)
+                .take((end - start).max(0) as usize)
+                .collect();
+            Ok(Value::Json(serde_json::Value::Array(sliced)))
+        }
     }
 }
 
@@ -853,25 +1701,109 @@ fn truthy3(v: &Value) -> Option<bool> {
     }
 }
 
-fn compare_values(left: &Value, op: &CmpOp, right: &Value) -> bool {
-    // NULL comparisons always return false (except IS NULL/IS NOT NULL).
+fn compare_values(left: &Value, op: &CmpOp, right: &Value) -> Option<bool> {
+    // Null comparisons always return null.
     if matches!(left, Value::Null) || matches!(right, Value::Null) {
-        return false;
+        return None;
     }
-
     match (left, right) {
-        (Value::Int(a), Value::Int(b)) => int_cmp(*a, op, *b),
-        (Value::Float(a), Value::Float(b)) => float_cmp(*a, op, *b),
-        (Value::Int(a), Value::Float(b)) => float_cmp(*a as f64, op, *b),
-        (Value::Float(a), Value::Int(b)) => float_cmp(*a, op, *b as f64),
-        (Value::Str(a), Value::Str(b)) => str_cmp(a, op, b),
-        (Value::Bool(a), Value::Bool(b)) => match op {
-            CmpOp::Eq => a == b,
-            CmpOp::Neq => a != b,
-            _ => false,
+        (Value::Int(a), Value::Int(b)) => Some(int_cmp(*a, op, *b)),
+        (Value::Float(a), Value::Float(b)) => Some(float_cmp(*a, op, *b)),
+        (Value::Int(a), Value::Float(b)) => Some(float_cmp(*a as f64, op, *b)),
+        (Value::Float(a), Value::Int(b)) => Some(float_cmp(*a, op, *b as f64)),
+        (Value::Str(a), Value::Str(b)) => Some(str_cmp(a, op, b)),
+        // Boolean ordering: false < true (treated as 0/1)
+        (Value::Bool(a), Value::Bool(b)) => {
+            let av = if *a { 1i32 } else { 0 };
+            let bv = if *b { 1i32 } else { 0 };
+            Some(match op {
+                CmpOp::Eq => av == bv,
+                CmpOp::Neq => av != bv,
+                CmpOp::Lt => av < bv,
+                CmpOp::Gt => av > bv,
+                CmpOp::Le => av <= bv,
+                CmpOp::Ge => av >= bv,
+            })
+        }
+        (Value::Node { node_id: a, .. }, Value::Node { node_id: b, .. }) => Some(int_cmp(*a, op, *b)),
+        // List comparison (lexicographic)
+        (Value::Json(serde_json::Value::Array(a)), Value::Json(serde_json::Value::Array(b))) => {
+            compare_lists(a, b, op)
+        }
+        // Type mismatch: = and <> are defined (different types are not equal),
+        // ordering operators return null.
+        _ => match op {
+            CmpOp::Eq => Some(false),
+            CmpOp::Neq => Some(true),
+            _ => None,
         },
-        (Value::Node { node_id: a, .. }, Value::Node { node_id: b, .. }) => int_cmp(*a, op, *b),
-        _ => false,
+    }
+}
+
+/// Lexicographic list comparison returning Option<bool> (None = null).
+fn compare_lists(a: &[serde_json::Value], b: &[serde_json::Value], op: &CmpOp) -> Option<bool> {
+    match op {
+        CmpOp::Eq | CmpOp::Neq => {
+            // Different lengths → definitively not equal
+            if a.len() != b.len() {
+                return Some(matches!(op, CmpOp::Neq));
+            }
+            // Same length: compare element by element recursively
+            let mut has_null = false;
+            for (ai, bi) in a.iter().zip(b.iter()) {
+                let av = json_to_value(ai);
+                let bv = json_to_value(bi);
+                match compare_values(&av, &CmpOp::Eq, &bv) {
+                    None => { has_null = true; }
+                    Some(false) => return Some(matches!(op, CmpOp::Neq)), // definitely ≠
+                    Some(true) => {}  // equal, continue
+                }
+            }
+            if has_null { None } else { Some(matches!(op, CmpOp::Eq)) }
+        }
+        _ => {
+            // Ordering comparison: lexicographic using elem_ordering
+            let min_len = a.len().min(b.len());
+            let mut has_null = false;
+            for i in 0..min_len {
+                let av = json_to_value(&a[i]);
+                let bv = json_to_value(&b[i]);
+                match elem_ordering(&av, &bv) {
+                    None => { has_null = true; }
+                    Some(std::cmp::Ordering::Equal) => {}
+                    Some(std::cmp::Ordering::Less) => {
+                        return Some(matches!(op, CmpOp::Lt | CmpOp::Le | CmpOp::Neq));
+                    }
+                    Some(std::cmp::Ordering::Greater) => {
+                        return Some(matches!(op, CmpOp::Gt | CmpOp::Ge | CmpOp::Neq));
+                    }
+                }
+            }
+            // All compared elements equal (or null-indeterminate)
+            match a.len().cmp(&b.len()) {
+                std::cmp::Ordering::Greater => Some(matches!(op, CmpOp::Gt | CmpOp::Ge | CmpOp::Neq)),
+                std::cmp::Ordering::Less    => Some(matches!(op, CmpOp::Lt | CmpOp::Le | CmpOp::Neq)),
+                std::cmp::Ordering::Equal   => if has_null { None } else {
+                    Some(matches!(op, CmpOp::Eq | CmpOp::Le | CmpOp::Ge))
+                },
+            }
+        }
+    }
+}
+
+/// Element-level ordering for list comparison. None = null/incomparable.
+fn elem_ordering(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => None,
+        (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
+        (Value::Int(x), Value::Float(y)) => (*x as f64).partial_cmp(y),
+        (Value::Float(x), Value::Int(y)) => x.partial_cmp(&(*y as f64)),
+        (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
+        (Value::Bool(x), Value::Bool(y)) => {
+            Some((if *x { 1i32 } else { 0 }).cmp(&(if *y { 1i32 } else { 0 })))
+        }
+        _ => None,
     }
 }
 
@@ -920,12 +1852,34 @@ fn eval_arith(left: &Value, op: &ArithOp, right: &Value) -> Result<Value, ExecEr
             ArithOp::Mod => {
                 if *b == 0 { Ok(Value::Null) } else { Ok(Value::Int(a % b)) }
             }
+            ArithOp::Pow => Ok(Value::Float((*a as f64).powf(*b as f64))),
         },
         (Value::Float(a), Value::Float(b)) => float_arith(*a, op, *b),
         (Value::Int(a), Value::Float(b)) => float_arith(*a as f64, op, *b),
         (Value::Float(a), Value::Int(b)) => float_arith(*a, op, *b as f64),
         (Value::Str(a), Value::Str(b)) if matches!(op, ArithOp::Add) => {
             Ok(Value::Str(format!("{a}{b}")))
+        }
+        // List concatenation: list + list
+        (Value::Json(serde_json::Value::Array(a)), Value::Json(serde_json::Value::Array(b)))
+            if matches!(op, ArithOp::Add) => {
+            let mut result = a.clone();
+            result.extend(b.iter().cloned());
+            Ok(Value::Json(serde_json::Value::Array(result)))
+        }
+        // List append: list + scalar
+        (Value::Json(serde_json::Value::Array(a)), _)
+            if matches!(op, ArithOp::Add) => {
+            let mut result = a.clone();
+            result.push(right.to_json());
+            Ok(Value::Json(serde_json::Value::Array(result)))
+        }
+        // List prepend: scalar + list
+        (_, Value::Json(serde_json::Value::Array(b)))
+            if matches!(op, ArithOp::Add) => {
+            let mut result = vec![left.to_json()];
+            result.extend(b.iter().cloned());
+            Ok(Value::Json(serde_json::Value::Array(result)))
         }
         _ => Ok(Value::Null),
     }
@@ -942,6 +1896,7 @@ fn float_arith(a: f64, op: &ArithOp, b: f64) -> Result<Value, ExecError> {
         ArithOp::Mod => {
             if b == 0.0 { Ok(Value::Null) } else { Ok(Value::Float(a % b)) }
         }
+        ArithOp::Pow => Ok(Value::Float(a.powf(b))),
     }
 }
 
@@ -1339,6 +2294,49 @@ fn eval_function(
             if !args.is_empty() { return Err(ExecError { message: "e() takes no arguments".into() }); }
             Ok(Value::Float(std::f64::consts::E))
         }
+        // --- Remaining string functions ---
+        "left" => {
+            if args.len() != 2 { return Err(ExecError { message: "left() takes exactly 2 arguments".into() }); }
+            let s = eval_expr(&args[0], row, params)?;
+            let n = eval_expr(&args[1], row, params)?;
+            match (s, n) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Str(s), Value::Int(n)) => {
+                    let n = n.max(0) as usize;
+                    Ok(Value::Str(s.chars().take(n).collect()))
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+        "right" => {
+            if args.len() != 2 { return Err(ExecError { message: "right() takes exactly 2 arguments".into() }); }
+            let s = eval_expr(&args[0], row, params)?;
+            let n = eval_expr(&args[1], row, params)?;
+            match (s, n) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Str(s), Value::Int(n)) => {
+                    let n = n.max(0) as usize;
+                    let chars: Vec<char> = s.chars().collect();
+                    let start = chars.len().saturating_sub(n);
+                    Ok(Value::Str(chars[start..].iter().collect()))
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+        // --- Remaining math functions ---
+        "toradians" => math1f(args, row, params, |x| x.to_radians()),
+        "todegrees" => math1f(args, row, params, |x| x.to_degrees()),
+        "rand" => {
+            if !args.is_empty() { return Err(ExecError { message: "rand() takes no arguments".into() }); }
+            let f = Spi::get_one::<f64>("SELECT random()").unwrap_or(Some(0.0)).unwrap_or(0.0);
+            Ok(Value::Float(f))
+        }
+        "randomuuid" => {
+            if !args.is_empty() { return Err(ExecError { message: "randomUUID() takes no arguments".into() }); }
+            let s = Spi::get_one::<String>("SELECT gen_random_uuid()::text")
+                .unwrap_or(Some(String::new())).unwrap_or_default();
+            Ok(Value::Str(s))
+        }
         _ => Err(ExecError {
             message: format!("unknown function: {name}()"),
         }),
@@ -1393,7 +2391,40 @@ fn math1f(
 }
 
 fn values_equal(a: &Value, b: &Value) -> bool {
-    compare_values(a, &CmpOp::Eq, b)
+    match (a, b) {
+        // JSON array equality: element-wise
+        (Value::Json(serde_json::Value::Array(aa)), Value::Json(serde_json::Value::Array(bb))) => {
+            if aa.len() != bb.len() { return false; }
+            aa.iter().zip(bb.iter()).all(|(x, y)| {
+                let xv = json_to_value(x);
+                let yv = json_to_value(y);
+                values_equal(&xv, &yv)
+            })
+        }
+        _ => matches!(compare_values(a, &CmpOp::Eq, b), Some(true)),
+    }
+}
+
+fn cmp_op_str(op: &CmpOp) -> &'static str {
+    match op {
+        CmpOp::Eq  => "=",
+        CmpOp::Neq => "<>",
+        CmpOp::Lt  => "<",
+        CmpOp::Gt  => ">",
+        CmpOp::Le  => "<=",
+        CmpOp::Ge  => ">=",
+    }
+}
+
+fn arith_op_str(op: &ArithOp) -> &'static str {
+    match op {
+        ArithOp::Add => "+",
+        ArithOp::Sub => "-",
+        ArithOp::Mul => "*",
+        ArithOp::Div => "/",
+        ArithOp::Mod => "%",
+        ArithOp::Pow => "^",
+    }
 }
 
 fn expr_default_name(expr: &Expr, idx: usize) -> String {
@@ -1402,8 +2433,54 @@ fn expr_default_name(expr: &Expr, idx: usize) -> String {
         Expr::Property(base, prop) => {
             format!("{}.{prop}", expr_default_name(base, idx))
         }
-        Expr::FunctionCall(name, _) => name.clone(),
+        Expr::FunctionCall(name, args) => {
+            // count_distinct(x) → "count(DISTINCT x)"
+            if let Some(base) = name.strip_suffix("_distinct") {
+                let arg_names: Vec<String> = args.iter()
+                    .enumerate()
+                    .map(|(i, a)| expr_default_name(a, i))
+                    .collect();
+                return format!("{base}(DISTINCT {})", arg_names.join(", "));
+            }
+            let arg_names: Vec<String> = args.iter()
+                .enumerate()
+                .map(|(i, a)| expr_default_name(a, i))
+                .collect();
+            format!("{name}({})", arg_names.join(", "))
+        }
         Expr::Star => "*".into(),
+        Expr::NullLit => "null".into(),
+        Expr::IntLit(v) => v.to_string(),
+        Expr::FloatLit(v) => format!("{v}"),
+        Expr::BoolLit(b) => b.to_string(),
+        Expr::StringLit(s) => format!("'{s}'"),
+        Expr::Parameter(name) => format!("${name}"),
+        Expr::IsNull(e) => format!("{} IS NULL", expr_default_name(e, idx)),
+        Expr::IsNotNull(e) => format!("{} IS NOT NULL", expr_default_name(e, idx)),
+        Expr::Not(e) => format!("NOT ({})", expr_default_name(e, idx)),
+        Expr::Neg(e) => format!("-({})", expr_default_name(e, idx)),
+        Expr::Compare(l, op, r) => format!(
+            "{} {} {}",
+            expr_default_name(l, idx),
+            cmp_op_str(op),
+            expr_default_name(r, idx),
+        ),
+        Expr::Arith(l, op, r) => format!(
+            "{} {} {}",
+            expr_default_name(l, idx),
+            arith_op_str(op),
+            expr_default_name(r, idx),
+        ),
+        Expr::And(l, r) => format!(
+            "{} AND {}",
+            expr_default_name(l, idx),
+            expr_default_name(r, idx),
+        ),
+        Expr::Or(l, r) => format!(
+            "{} OR {}",
+            expr_default_name(l, idx),
+            expr_default_name(r, idx),
+        ),
         _ => format!("_col{idx}"),
     }
 }
@@ -1418,19 +2495,47 @@ fn row_fingerprint(row: &Row) -> String {
 
 /// Compare two Values for ordering (used by ORDER BY).
 /// NULL sorts last (greater than any non-null).
+/// Cross-type ordering (openCypher): null > list > number > string > boolean
 fn value_ordering(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering::{Equal, Greater, Less};
     match (a, b) {
-        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
-        (Value::Null, _) => std::cmp::Ordering::Greater,
-        (_, Value::Null) => std::cmp::Ordering::Less,
+        (Value::Null, Value::Null) => Equal,
+        (Value::Null, _) => Greater,
+        (_, Value::Null) => Less,
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
-        (Value::Int(x), Value::Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
-        (Value::Float(x), Value::Int(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Equal),
+        (Value::Int(x), Value::Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(Equal),
+        (Value::Float(x), Value::Int(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Equal),
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        _ => std::cmp::Ordering::Equal,
+        // List ordering: lexicographic, with null elements sorting highest within a list.
+        (Value::Json(serde_json::Value::Array(xa)), Value::Json(serde_json::Value::Array(ya))) => {
+            list_ordering(xa, ya)
+        }
+        // Cross-type: lists > numbers > strings > booleans (matching Neo4j/openCypher TCK)
+        (Value::Json(serde_json::Value::Array(_)), _) => Greater,
+        (_, Value::Json(serde_json::Value::Array(_))) => Less,
+        (Value::Int(_) | Value::Float(_), Value::Str(_) | Value::Bool(_)) => Greater,
+        (Value::Str(_) | Value::Bool(_), Value::Int(_) | Value::Float(_)) => Less,
+        (Value::Str(_), Value::Bool(_)) => Greater,
+        (Value::Bool(_), Value::Str(_)) => Less,
+        _ => Equal,
     }
+}
+
+/// Lexicographic ordering of two JSON arrays (for ORDER BY).
+/// Nulls within a list sort as Greater than any value (i.e., highest).
+fn list_ordering(a: &[serde_json::Value], b: &[serde_json::Value]) -> std::cmp::Ordering {
+    let min_len = a.len().min(b.len());
+    for i in 0..min_len {
+        let av = json_to_value(&a[i]);
+        let bv = json_to_value(&b[i]);
+        let cmp = value_ordering(&av, &bv);
+        if cmp != std::cmp::Ordering::Equal {
+            return cmp;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 /// Evaluate a SKIP/LIMIT expression to a usize (params available, no row context needed).
@@ -1445,15 +2550,10 @@ fn eval_const_usize(expr: &Expr, params: &HashMap<String, serde_json::Value>) ->
 /// Convert result rows to JSONB output format.
 pub fn rows_to_jsonb(rows: Vec<Row>) -> Vec<pgrx::JsonB> {
     rows.into_iter().map(|row| {
-        if row.len() == 1 {
-            let (_, val) = row.into_iter().next().unwrap();
-            pgrx::JsonB(val.to_json())
-        } else {
-            let mut m = serde_json::Map::new();
-            for (k, v) in &row {
-                m.insert(k.clone(), v.to_json());
-            }
-            pgrx::JsonB(serde_json::Value::Object(m))
+        let mut m = serde_json::Map::new();
+        for (k, v) in &row {
+            m.insert(k.clone(), v.to_json());
         }
+        pgrx::JsonB(serde_json::Value::Object(m))
     }).collect()
 }

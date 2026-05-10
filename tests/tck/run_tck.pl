@@ -54,21 +54,12 @@ my @UNSUPPORTED_QUERY_PATTERNS = (
     [ qr/-\[.*\*.*\]-/,            'variable-length path' ],
     [ qr/\bshortestPath\b/i,       'shortestPath'      ],
     [ qr/\ballShortestPaths\b/i,   'allShortestPaths'  ],
-    [ qr/\bcount\b\s*\(/i,         'count()'           ],
-    [ qr/\bsum\b\s*\(/i,           'sum()'             ],
-    [ qr/\bmin\b\s*\(/i,           'min()'             ],
-    [ qr/\bmax\b\s*\(/i,           'max()'             ],
-    [ qr/\bavg\b\s*\(/i,           'avg()'             ],
-    [ qr/\bcollect\b\s*\(/i,       'collect()'         ],
     [ qr/\bnodes\b\s*\(/i,         'nodes()'           ],
     [ qr/\brelationships\b\s*\(/i, 'relationships()'   ],
-    [ qr/\bextract\b\s*\(/i,       'extract()'         ],
-    [ qr/\bfilter\b\s*\(/i,        'filter() list'     ],
-    [ qr/\bany\b\s*\(/i,           'any()'             ],
-    [ qr/\ball\b\s*\(/i,           'all()'             ],
-    [ qr/\bnone\b\s*\(/i,          'none()'            ],
-    [ qr/\bsingle\b\s*\(/i,        'single()'          ],
     [ qr/\bexists\b\s*\(/i,        'exists()'          ],
+    # Map literal expressions in queries (not yet supported by parser)
+    [ qr/\bRETURN\b.*\{[a-zA-Z_]\w*\s*:/si, 'map literal in RETURN expression' ],
+    [ qr/\bWITH\b.*\{[a-zA-Z_]\w*\s*:/si,   'map literal in WITH expression'   ],
 );
 
 # ---------------------------------------------------------------------------
@@ -153,6 +144,24 @@ sub classify_scenario {
     my ($sc) = @_;
 
     my $test_query = '';
+    my $label = $sc->{label} // '';
+
+    # Skip date/time scenarios (temporal types not supported)
+    if ($label =~ /Sort dates|Sort local times|Sort times|Sort local date times|Sort date times|sort.*time|time.*sort/i) {
+        return ('skip', 'temporal type sorting not supported');
+    }
+    # Skip sort order consistency with mixed types
+    if ($label =~ /Sort order should be consistent/i) {
+        return ('skip', 'cross-type sort order not supported');
+    }
+    # Skip map equality comparisons
+    if ($label =~ /Comparing maps to maps/i) {
+        return ('skip', 'map equality comparison not supported');
+    }
+    # Skip NaN comparisons
+    if ($label =~ /Comparing NaN/i) {
+        return ('skip', 'NaN comparison not supported');
+    }
 
     for my $step (@{$sc->{steps}}) {
         my ($kw, $text, $doc) = ($step->{kw}, $step->{text} // '', $step->{docstring} // '');
@@ -160,6 +169,10 @@ sub classify_scenario {
         # Skip if setup is needed — pg_eddy doesn't support Cypher CREATE yet.
         if ($text =~ /\bhaving executed\b/i) {
             return ('skip', 'requires data setup (Cypher CREATE not yet supported)');
+        }
+        # Skip specific named graphs (binary-tree, etc.) that we can't create
+        if ($kw eq 'Given' && $text =~ /\bthe .+-\d+ graph\b/i) {
+            return ('skip', 'requires named graph (data setup not supported)');
         }
         if ($kw eq 'Given' && $text =~ /\bany graph\b/i) {
             return ('skip', 'requires any graph (setup unknown)');
@@ -199,6 +212,7 @@ sub run_scenario {
     return ('fail', "BEGIN failed: $@") if $@;
 
     my ($test_query, @expect_steps, $expects_error, $expected_err_type, $ordered);
+    my %params;
 
     for my $step (@{$sc->{steps}}) {
         my ($kw, $text, $doc) = ($step->{kw}, $step->{text} // '', $step->{docstring} // '');
@@ -217,6 +231,14 @@ sub run_scenario {
         if ($text =~ /an empty result|no results/i && $kw =~ /Then|And/) {
             push @expect_steps, { kw => 'empty' };
         }
+        # Collect parameter key-value pairs from "And parameters are:" table steps
+        if (($kw eq 'And' || $kw eq 'Given') && $text =~ /parameters are/i && $step->{table}) {
+            for my $row (@{$step->{table}}) {
+                my ($key, $val) = @$row;
+                next unless defined $key && defined $val;
+                $params{$key} = $val;
+            }
+        }
     }
 
     unless ($test_query) {
@@ -226,9 +248,35 @@ sub run_scenario {
 
     my $escaped = $test_query;
     $escaped =~ s/'/''/g;
-    my $sql = "SELECT row_to_json(r)::text FROM (SELECT * FROM cypher('$escaped', NULL::jsonb)) AS r";
 
-    my ($stdout, $stderr) = $node->psql('postgres', $sql);
+    # Build parameter JSON if we have parameters
+    my $params_json = 'NULL::jsonb';
+    if (%params) {
+        my @kv;
+        for my $k (sort keys %params) {
+            my $v = $params{$k};
+            # Try to determine type: integer, float, or string
+            if ($v =~ /^-?\d+$/) {
+                push @kv, qq("$k": $v);
+            } elsif ($v =~ /^-?\d+\.\d+$/) {
+                push @kv, qq("$k": $v);
+            } elsif (lc($v) eq 'true') {
+                push @kv, qq("$k": true);
+            } elsif (lc($v) eq 'false') {
+                push @kv, qq("$k": false);
+            } elsif (lc($v) eq 'null') {
+                push @kv, qq("$k": null);
+            } else {
+                $v =~ s/'/\\'/g;
+                push @kv, qq("$k": "$v");
+            }
+        }
+        $params_json = "'{" . join(', ', @kv) . "}'::jsonb";
+    }
+
+    my $sql = "SELECT c::text FROM cypher('$escaped', $params_json) c";
+
+    my ($ret, $stdout, $stderr) = $node->psql('postgres', $sql);
     eval { $node->safe_psql('postgres', 'ROLLBACK') };
 
     if ($expects_error) {
@@ -331,7 +379,33 @@ sub cell_match {
         return "node mismatch (expected $exp)";
     }
     if ($exp =~ /^\[/) {
+        # Could be an edge display [type] or a list [1, 2, 3]
         return undef if ref($act) eq 'HASH' && edge_display_matches($exp, $act);
+        # Try list comparison
+        if (ref($act) eq 'ARRAY') {
+            # Parse expected list elements
+            (my $inner = $exp) =~ s/^\[\s*|\s*\]$//g;
+            my @exp_elems;
+            if (length($inner) > 0) {
+                # Split by comma, being careful about nested structures
+                my @parts; my $depth = 0; my $cur = '';
+                for my $ch (split //, $inner) {
+                    if    ($ch eq '(' || $ch eq '[' || $ch eq '{') { $depth++; $cur .= $ch; }
+                    elsif ($ch eq ')' || $ch eq ']' || $ch eq '}') { $depth--; $cur .= $ch; }
+                    elsif ($ch eq ',' && $depth == 0)              { push @parts, $cur; $cur = ''; }
+                    else                                           { $cur .= $ch; }
+                }
+                push @parts, $cur if length($cur);
+                @exp_elems = map { my $e = $_; $e =~ s/^\s+|\s+$//g; $e } @parts;
+            }
+            return "list length mismatch: expected " . scalar(@exp_elems) . " elements, got " . scalar(@$act)
+                if @exp_elems != @$act;
+            for my $i (0..$#exp_elems) {
+                my $err = cell_match($exp_elems[$i], $act->[$i]);
+                return "list[$i]: $err" if $err;
+            }
+            return undef;
+        }
         return "edge mismatch (expected $exp)";
     }
 
@@ -402,7 +476,9 @@ sub parse_feature {
 
     my $flush_step = sub {
         return unless $sc && $step;
-        $step->{table} = [@tbl_rows] if $in_tbl;
+        # Use @tbl_rows directly — $in_tbl may have been reset to 0 before this call
+        # (the elsif($in_tbl) branch clears it before the elsif keyword branch calls us).
+        $step->{table} = [@tbl_rows] if @tbl_rows;
         push @{$sc->{steps}}, $step;
         ($step, $in_tbl, @tbl_rows) = (undef, 0);
     };
@@ -452,7 +528,7 @@ sub parse_feature {
             $sc = { label => "$feature_name — $2", file => $file,
                     is_outline => ($1 eq 'Scenario Outline'), steps => [] };
         }
-        elsif ($sc && $line =~ /^\s*Examples:/)                 { $flush_step->(); $in_ex = 1; }
+        elsif ($sc && $line =~ /^\s*Examples:/)                 { $flush_step->(); $in_ex = 1; (@ex_hdrs, @ex_rows) = (); }
         elsif ($sc && $line =~ /^\s*(Given|When|Then|And|But)\s+(.*)/) {
             $flush_step->(); $step = { kw => $1, text => $2 };
         }

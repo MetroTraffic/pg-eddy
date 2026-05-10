@@ -73,9 +73,9 @@ Before releasing a new version:
 2. **Update CHANGELOG.md** — Document all changes, fixes, and features for the
    release.
 3. **Run tests** — Execute `cargo pgrx test pg18` to ensure all tests pass.
-4. **Run clippy** — Execute `cargo clippy --features pg18` to check for linting
-   issues.
+4. **Run clippy** — ⚠️ **REQUIRED GATE** — Execute `cargo clippy --features pg18`
+   and ensure there are zero warnings. Do not proceed to tagging if clippy fails.
 5. **Update TCK badge** — If TCK pass rate changed, update `README.md` badge as
    noted in the Testing section above.
 6. **Create git tag** — Tag the release with `git tag vX.Y.Z` and push to
-   repository.
+   repository. (Only after all gates above pass.)

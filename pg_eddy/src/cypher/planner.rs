@@ -16,6 +16,7 @@ pub enum LogicalPlan {
         variable: String,
         label: Option<String>,
         inline_props: Vec<(String, Expr)>,
+        optional: bool,
     },
     /// Expand from a bound node variable along relationships.
     Expand {
@@ -190,6 +191,7 @@ fn plan_pattern_onto(
             variable: first_var.clone(),
             label,
             inline_props: first_node.properties.clone(),
+            optional,
         };
         new_node_vars.push(first_var.clone());
         match current {
@@ -267,6 +269,7 @@ fn collect_node_variables(patterns: &[Pattern]) -> Vec<String> {
 
 /// Build an isomorphism filter: for N node variables, emit
 /// `a <> b AND a <> c AND b <> c` using id() comparisons.
+/// Null-safe: if either variable is NULL (from OPTIONAL MATCH), the pair passes.
 fn build_isomorphism_filter(node_vars: &[String]) -> Option<Expr> {
     if node_vars.len() < 2 {
         return None;
@@ -283,7 +286,16 @@ fn build_isomorphism_filter(node_vars: &[String]) -> Option<Expr> {
                 "id".into(),
                 vec![Expr::Variable(node_vars[j].clone())],
             );
-            pairs.push(Expr::Compare(Box::new(left), CmpOp::Neq, Box::new(right)));
+            let neq = Expr::Compare(Box::new(left), CmpOp::Neq, Box::new(right));
+            // Wrap with null guards so that null nodes (from OPTIONAL MATCH) pass through.
+            let null_safe = Expr::Or(
+                Box::new(Expr::IsNull(Box::new(Expr::Variable(node_vars[i].clone())))),
+                Box::new(Expr::Or(
+                    Box::new(Expr::IsNull(Box::new(Expr::Variable(node_vars[j].clone())))),
+                    Box::new(neq),
+                )),
+            );
+            pairs.push(null_safe);
         }
     }
 
@@ -298,7 +310,7 @@ fn build_isomorphism_filter(node_vars: &[String]) -> Option<Expr> {
 pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
     let prefix = "  ".repeat(indent);
     match plan {
-        LogicalPlan::LabelScan { variable, label, inline_props } => {
+        LogicalPlan::LabelScan { variable, label, inline_props, .. } => {
             let label_str = label.as_deref().unwrap_or("*");
             let props_str = if inline_props.is_empty() {
                 String::new()
