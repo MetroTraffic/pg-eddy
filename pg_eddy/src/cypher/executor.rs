@@ -121,6 +121,7 @@ impl CypherDuration {
     }
 
     /// Build an ISO 8601 duration string from components.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_iso(
         years: i64, months: i64, weeks: i64, days: i64,
         hours: i64, minutes: i64, seconds: i64, nanos: i64,
@@ -261,19 +262,14 @@ fn parse_date_str(s: &str) -> Option<NaiveDate> {
     // Ordinal basic: YYYYDDD
     if let Ok(d) = NaiveDate::parse_from_str(s, "%Y%j") { return Some(d); }
     // Year-month extended: YYYY-MM → 1st of month
-    if s.len() == 7 && s.as_bytes()[4] == b'-' {
-        if let Ok(d) = NaiveDate::parse_from_str(&format!("{s}-01"), "%Y-%m-%d") { return Some(d); }
-    }
+    if s.len() == 7 && s.as_bytes()[4] == b'-'
+        && let Ok(d) = NaiveDate::parse_from_str(&format!("{s}-01"), "%Y-%m-%d") { return Some(d); }
     // Year-month basic: YYYYMM → 1st of month
-    if s.len() == 6 && s.chars().all(|c| c.is_ascii_digit()) {
-        if let Ok(d) = NaiveDate::parse_from_str(&format!("{s}01"), "%Y%m%d") { return Some(d); }
-    }
+    if s.len() == 6 && s.chars().all(|c| c.is_ascii_digit())
+        && let Ok(d) = NaiveDate::parse_from_str(&format!("{s}01"), "%Y%m%d") { return Some(d); }
     // Year-only: YYYY → Jan 1
-    if s.len() == 4 && s.chars().all(|c| c.is_ascii_digit()) {
-        if let Ok(y) = s.parse::<i32>() {
-            return NaiveDate::from_ymd_opt(y, 1, 1);
-        }
-    }
+    if s.len() == 4 && s.chars().all(|c| c.is_ascii_digit())
+        && let Ok(y) = s.parse::<i32>() { return NaiveDate::from_ymd_opt(y, 1, 1); }
     // Week-based extended: YYYY-Www-D
     // Format: YYYY-W{ww}-{d}
     if s.len() >= 8 && &s[4..6] == "-W" {
@@ -341,10 +337,10 @@ fn parse_localtime_str(s: &str) -> Option<NaiveTime> {
 /// Returns seconds east of UTC.
 fn parse_offset(s: &str) -> Option<i32> {
     if s == "Z" || s == "z" { return Some(0); }
-    let (sign, rest) = if s.starts_with('+') {
-        (1i32, &s[1..])
-    } else if s.starts_with('-') {
-        (-1i32, &s[1..])
+    let (sign, rest) = if let Some(r) = s.strip_prefix('+') {
+        (1i32, r)
+    } else if let Some(r) = s.strip_prefix('-') {
+        (-1i32, r)
     } else {
         return None;
     };
@@ -737,10 +733,10 @@ fn split_datetime(s: &str) -> Result<(&str, &str), ExecError> {
 /// Strip a trailing [Timezone/Name] from a datetime string.
 /// Returns (string_without_bracket, Some(tz_name)) or (original, None).
 fn strip_tz_bracket(s: &str) -> (&str, Option<String>) {
-    if let (Some(lb), Some(rb)) = (s.rfind('['), s.rfind(']')) {
-        if rb == s.len() - 1 {
-            return (&s[..lb], Some(s[lb+1..rb].to_string()));
-        }
+    if let (Some(lb), Some(rb)) = (s.rfind('['), s.rfind(']'))
+        && rb == s.len() - 1
+    {
+        return (&s[..lb], Some(s[lb+1..rb].to_string()));
     }
     (s, None)
 }
@@ -987,16 +983,16 @@ pub fn execute(
         }
         LogicalPlan::VarLengthExpand {
             input, src_var, rel_var, dst_var,
-            rel_types, direction, min_hops, max_hops, optional,
+            rel_types, direction, min_hops, max_hops, optional, path_carry_var,
         } => {
             exec_var_length_expand(
                 input, src_var, rel_var.as_deref(), dst_var,
                 rel_types, *direction, *min_hops, *max_hops,
-                *optional, params,
+                *optional, path_carry_var.as_deref(), params,
             )
         }
-        LogicalPlan::NamedPath { input, path_var, src_var, rel_var, dst_var } => {
-            exec_named_path(input, path_var, src_var, rel_var.as_deref(), dst_var, params)
+        LogicalPlan::NamedPath { input, path_var, element_vars } => {
+            exec_named_path(input, path_var, element_vars, params)
         }
         LogicalPlan::Apply { outer, inner } => {
             exec_apply(outer, inner, params)
@@ -1414,6 +1410,86 @@ fn exec_cross_product(
     Ok(result)
 }
 
+/// Build a Value::Path from lists of node IDs and edge IDs (for var-length named paths).
+fn build_path_from_ids(
+    node_ids: &[i64],
+    edge_ids: &[i64],
+    direction: RelDirection,
+) -> Value {
+    use crate::catalog::labels::{label_name, prop_key_name, rel_type_name};
+    use crate::storage::{node_store, edge_store, prop_store};
+
+    let mut nodes: Vec<Value> = Vec::new();
+    let mut rels: Vec<Value> = Vec::new();
+
+    for &nid in node_ids {
+        let node_val = unsafe {
+            let rel = crate::open_nodes_relation();
+            let snapshot = pgrx::pg_sys::GetActiveSnapshot();
+            let r = node_store::find_node_by_id(rel, nid, snapshot);
+            pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+            r
+        };
+        if let Some(mut nr) = node_val {
+            if nr.overflow_blkno != 0 && nr.prop_bytes.is_empty() {
+                nr.prop_bytes = unsafe {
+                    let rel = crate::open_nodes_relation();
+                    let bytes = node_store::read_overflow_block(rel, nr.overflow_blkno);
+                    pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                    bytes
+                };
+            }
+            let labels: Vec<String> = nr.label_ids.iter().map(|id| label_name(*id)).collect();
+            let properties = prop_store::decode(&nr.prop_bytes, prop_key_name);
+            nodes.push(Value::Node { node_id: nid, labels, properties });
+        } else {
+            nodes.push(Value::Null);
+        }
+    }
+
+    for (i, &eid) in edge_ids.iter().enumerate() {
+        let edge_val = unsafe {
+            let edge_rel = crate::open_edges_relation();
+            let snapshot = pgrx::pg_sys::GetActiveSnapshot();
+            let r = edge_store::find_edge_by_id(edge_rel, eid, snapshot);
+            pgrx::pg_sys::table_close(edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+            r
+        };
+        if let Some(er) = edge_val {
+            let edge_props = prop_store::decode(&er.prop_bytes, prop_key_name);
+            let edge_type = rel_type_name(er.rel_type_id);
+            // Determine direction for this hop based on node_ids.
+            let (src_id, tgt_id) = if i + 1 < node_ids.len() {
+                (node_ids[i], node_ids[i + 1])
+            } else {
+                (er.source_node_id, er.target_node_id)
+            };
+            let (actual_src, actual_tgt) = match direction {
+                RelDirection::Out => (src_id, tgt_id),
+                RelDirection::In => (tgt_id, src_id),
+                RelDirection::Both => {
+                    if er.source_node_id == src_id {
+                        (er.source_node_id, er.target_node_id)
+                    } else {
+                        (er.target_node_id, er.source_node_id)
+                    }
+                }
+            };
+            rels.push(Value::Edge {
+                edge_id: eid,
+                rel_type: edge_type,
+                source: actual_src,
+                target: actual_tgt,
+                properties: edge_props,
+            });
+        } else {
+            rels.push(Value::Null);
+        }
+    }
+
+    Value::Path { nodes, rels }
+}
+
 /// BFS-based variable-length expansion: -[*min..max]-.
 #[allow(clippy::too_many_arguments)]
 fn exec_var_length_expand(
@@ -1426,6 +1502,7 @@ fn exec_var_length_expand(
     min_hops: u32,
     max_hops: Option<u32>,
     optional: bool,
+    path_carry_var: Option<&str>,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<Vec<Row>, ExecError> {
     use crate::catalog::labels::{label_name, prop_key_name};
@@ -1475,17 +1552,26 @@ fn exec_var_length_expand(
             _ => continue,
         };
 
-        // BFS: (node_id, depth, visited_edge_ids)
+        // BFS: (node_id, depth, visited_edge_ids, path_node_ids, path_edge_ids)
+        // path_node_ids/path_edge_ids are only populated when path_carry_var is set.
         let max_depth = max_hops.unwrap_or(u32::MAX).min(256); // safety cap
 
         struct BfsEntry {
             node_id: i64,
             depth: u32,
             visited_edge_ids: Vec<i64>,
+            path_node_ids: Vec<i64>,  // node IDs in order (for path tracking)
+            path_edge_ids: Vec<i64>,  // edge IDs in order (for path tracking)
         }
 
         let mut queue: std::collections::VecDeque<BfsEntry> = std::collections::VecDeque::new();
-        queue.push_back(BfsEntry { node_id: start_id, depth: 0, visited_edge_ids: Vec::new() });
+        queue.push_back(BfsEntry {
+            node_id: start_id,
+            depth: 0,
+            visited_edge_ids: Vec::new(),
+            path_node_ids: vec![start_id],
+            path_edge_ids: Vec::new(),
+        });
         let mut found_any = false;
 
         while let Some(entry) = queue.pop_front() {
@@ -1518,9 +1604,17 @@ fn exec_var_length_expand(
                         };
                         let mut row = input_row.clone();
                         row.insert(dst_var.to_string(), dst_val);
-                        // rel_var gets null (path rels stored separately in future)
                         if let Some(rv) = rel_var {
                             row.insert(rv.to_string(), Value::Null);
+                        }
+                        // Build and store the full path if path_carry_var is set.
+                        if let Some(pcv) = path_carry_var {
+                            let path_val = build_path_from_ids(
+                                &entry.path_node_ids,
+                                &entry.path_edge_ids,
+                                direction,
+                            );
+                            row.insert(pcv.to_string(), path_val);
                         }
                         result.push(row);
                         found_any = true;
@@ -1565,12 +1659,18 @@ fn exec_var_length_expand(
                             else { edge.source_node_id }
                         }
                     };
-                    let mut new_edges = entry.visited_edge_ids.clone();
-                    new_edges.push(edge.edge_id);
+                    let mut new_visited = entry.visited_edge_ids.clone();
+                    new_visited.push(edge.edge_id);
+                    let mut new_path_nodes = entry.path_node_ids.clone();
+                    new_path_nodes.push(next_node_id);
+                    let mut new_path_edges = entry.path_edge_ids.clone();
+                    new_path_edges.push(edge.edge_id);
                     queue.push_back(BfsEntry {
                         node_id: next_node_id,
                         depth: entry.depth + 1,
-                        visited_edge_ids: new_edges,
+                        visited_edge_ids: new_visited,
+                        path_node_ids: new_path_nodes,
+                        path_edge_ids: new_path_edges,
                     });
                 }
             }
@@ -1580,6 +1680,7 @@ fn exec_var_length_expand(
             let mut r = input_row.clone();
             r.insert(dst_var.to_string(), Value::Null);
             if let Some(rv) = rel_var { r.insert(rv.to_string(), Value::Null); }
+            if let Some(pcv) = path_carry_var { r.insert(pcv.to_string(), Value::Null); }
             result.push(r);
         }
     }
@@ -1587,28 +1688,65 @@ fn exec_var_length_expand(
     Ok(result)
 }
 
-/// Named path: packages the matched src/rel/dst into a Path value.
+/// Named path: packages the matched nodes+rels into a Path value using element_vars.
+/// element_vars alternates: [node_var, rel_var, node_var, rel_var, ..., node_var].
+/// For var-length segments, the rel_var slot holds a path_carry_var that the
+/// VarLengthExpand executor has already stored as a Value::Path.
 fn exec_named_path(
     input: &LogicalPlan,
     path_var: &str,
-    src_var: &str,
-    _rel_var: Option<&str>,
-    dst_var: &str,
+    element_vars: &[String],
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<Vec<Row>, ExecError> {
     let rows = execute(input, params)?;
     let mut result = Vec::new();
 
     for mut row in rows {
-        let src = row.get(src_var).cloned().unwrap_or(Value::Null);
-        let dst = row.get(dst_var).cloned().unwrap_or(Value::Null);
-        // For single-hop, rel is tracked separately; for simplicity we only
-        // create a two-node path (nodes: [src, dst], rels: []).
-        // A full path includes all intermediate nodes+rels from VarLengthExpand.
-        let path = Value::Path {
-            nodes: vec![src, dst],
-            rels: vec![],
-        };
+        // Single-node path (element_vars = [node_var]).
+        if element_vars.len() == 1 {
+            let node = row.get(&element_vars[0]).cloned().unwrap_or(Value::Null);
+            let path = Value::Path { nodes: vec![node], rels: vec![] };
+            row.insert(path_var.to_string(), path);
+            result.push(row);
+            continue;
+        }
+
+        // Multi-element: alternating node/rel.
+        // element_vars: [n0, r0, n1, r1, ..., nN]
+        // Check for var-length carry: if a rel slot holds a Value::Path (from VarLengthExpand),
+        // merge that path instead of looking up individual elements.
+        let mut nodes: Vec<Value> = Vec::new();
+        let mut rels: Vec<Value> = Vec::new();
+        let mut i = 0;
+        while i < element_vars.len() {
+            if i % 2 == 0 {
+                // Node slot.
+                let v = row.get(&element_vars[i]).cloned().unwrap_or(Value::Null);
+                nodes.push(v);
+                i += 1;
+            } else {
+                // Rel slot — could be a path_carry_var (Value::Path) from VarLengthExpand.
+                let v = row.get(&element_vars[i]).cloned().unwrap_or(Value::Null);
+                if let Value::Path { nodes: pnodes, rels: prels } = v {
+                    // Inline the carried path: merge into current path.
+                    // The first pnodes[0] is the same as the last pushed node — skip it.
+                    // Then alternately add rels and nodes.
+                    for (ri, rel_val) in prels.into_iter().enumerate() {
+                        rels.push(rel_val);
+                        if ri + 1 < pnodes.len() {
+                            nodes.push(pnodes[ri + 1].clone());
+                        }
+                    }
+                    // Skip the next node slot (already consumed from path).
+                    i += 2;
+                } else {
+                    rels.push(v);
+                    i += 1;
+                }
+            }
+        }
+
+        let path = Value::Path { nodes, rels };
         row.insert(path_var.to_string(), path);
         result.push(row);
     }
@@ -2698,7 +2836,7 @@ pub fn eval_expr(
             if let Value::Json(serde_json::Value::Object(m)) = &list_val {
                 return match &idx_val {
                     Value::Null => Ok(Value::Null),
-                    Value::Str(s) => Ok(m.get(s.as_str()).map(|v| json_to_value(v)).unwrap_or(Value::Null)),
+                    Value::Str(s) => Ok(m.get(s.as_str()).map(json_to_value).unwrap_or(Value::Null)),
                     _ => Err(ExecError {
                         message: "TypeError: map element access requires a string key".into(),
                     }),

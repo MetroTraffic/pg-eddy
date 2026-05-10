@@ -4,9 +4,19 @@
 /// Node isomorphism is enforced by adding inequality filters for every
 /// distinct pair of node variables.
 /// v0.10.0 scope: VarLengthExpand (variable-length paths), NamedPath.
+/// v0.17.0 scope: VarKind tracking for VariableTypeConflict; aggregation-in-ORDER-BY check.
 use crate::cypher::ast::*;
 use std::collections::HashSet;
 use std::collections::HashMap;
+
+/// The kind of entity a bound variable represents (used for type-conflict detection).
+#[derive(Debug, Clone, PartialEq)]
+enum VarKind {
+    Node,
+    Rel,
+    Path,
+    Scalar,
+}
 
 /// A logical plan node.
 #[derive(Debug, Clone)]
@@ -44,14 +54,17 @@ pub enum LogicalPlan {
         min_hops: u32,
         max_hops: Option<u32>,
         optional: bool,
+        /// If Some(var), the BFS stores the full path (nodes+rels) under this variable name.
+        path_carry_var: Option<String>,
     },
     /// Named path: wraps a plan and packages the matched nodes+rels into a path value.
     NamedPath {
         input: Box<LogicalPlan>,
         path_var: String,
-        src_var: String,
-        rel_var: Option<String>,
-        dst_var: String,
+        /// Element variable names in order: [node_var, rel_var, node_var, rel_var, ..., node_var].
+        /// For var-length segments, the rel_var slot holds a `path_carry_var` variable that
+        /// already contains a Value::Path built by the VarLengthExpand executor.
+        element_vars: Vec<String>,
     },
     /// Cross-product of two independent plan branches.
     CrossProduct {
@@ -140,22 +153,25 @@ impl std::fmt::Display for PlanError {
 /// Build a logical plan from a parsed Query pipeline.
 pub fn plan(query: &Query) -> Result<LogicalPlan, PlanError> {
     let mut bound_vars: HashSet<String> = HashSet::new();
-    plan_clauses(&query.clauses, LogicalPlan::SingleRow, &mut bound_vars)
+    let mut var_kinds: HashMap<String, VarKind> = HashMap::new();
+    plan_clauses(&query.clauses, LogicalPlan::SingleRow, &mut bound_vars, &mut var_kinds)
 }
 
 fn plan_clauses(
     clauses: &[QueryClause],
     seed: LogicalPlan,
     bound_vars: &mut HashSet<String>,
+    var_kinds: &mut HashMap<String, VarKind>,
 ) -> Result<LogicalPlan, PlanError> {
     let mut current = seed;
     for clause in clauses {
         match clause {
             QueryClause::Match { optional, patterns, where_clause } => {
-                current = plan_match_clause(current, patterns, where_clause, *optional, bound_vars)?;
+                current = plan_match_clause(current, patterns, where_clause, *optional, bound_vars, var_kinds)?;
             }
             QueryClause::Unwind { expr, alias } => {
                 bound_vars.insert(alias.clone());
+                var_kinds.insert(alias.clone(), VarKind::Scalar);
                 current = LogicalPlan::Unwind {
                     input: Box::new(current),
                     expr: expr.clone(),
@@ -177,6 +193,7 @@ fn plan_clauses(
                 for (col, alias) in yield_items {
                     let exposed = alias.as_ref().unwrap_or(col);
                     bound_vars.insert(exposed.clone());
+                    var_kinds.insert(exposed.clone(), VarKind::Scalar);
                 }
                 current = LogicalPlan::Apply {
                     outer: Box::new(current),
@@ -184,6 +201,19 @@ fn plan_clauses(
                 };
             }
             QueryClause::With { distinct, items, order_by, skip, limit, where_clause } => {
+                // Check: aggregation function in ORDER BY without aggregation in projection
+                // is a SyntaxError (InvalidAggregation).
+                let proj_has_agg = items.iter().any(|it| expr_contains_aggregation(&it.expr));
+                if !proj_has_agg {
+                    for ob_item in order_by {
+                        if expr_contains_aggregation(&ob_item.expr) {
+                            return Err(PlanError {
+                                message: "SyntaxError: InvalidAggregation — aggregation in ORDER BY \
+                                    without corresponding aggregation in WITH projection".into(),
+                            });
+                        }
+                    }
+                }
                 current = LogicalPlan::Project {
                     input: Box::new(current),
                     items: items.clone(),
@@ -193,12 +223,19 @@ fn plan_clauses(
                     limit: limit.clone(),
                 };
                 // After WITH, only the projected variables are in scope.
+                // Re-classify them based on expression type.
                 bound_vars.clear();
+                var_kinds.clear();
                 for item in items {
                     let exposed = item.alias.clone().or_else(|| {
                         if let Expr::Variable(v) = &item.expr { Some(v.clone()) } else { None }
                     });
-                    if let Some(v) = exposed { bound_vars.insert(v); }
+                    if let Some(v) = exposed {
+                        bound_vars.insert(v.clone());
+                        // Infer kind: Variable passthrough keeps kind; literals are Scalar.
+                        let kind = expr_var_kind(&item.expr, var_kinds);
+                        var_kinds.insert(v, kind);
+                    }
                 }
                 if let Some(wh) = where_clause {
                     current = LogicalPlan::Filter { input: Box::new(current), predicate: wh.clone() };
@@ -276,9 +313,11 @@ fn plan_clauses(
                 // Plan the body: SingleRow → chain of write clauses.
                 let body_seed = LogicalPlan::SingleRow;
                 let mut body_vars: HashSet<String> = bound_vars.clone();
+                let mut body_kinds: HashMap<String, VarKind> = var_kinds.clone();
                 // The loop variable is bound inside the body.
                 body_vars.insert(variable.clone());
-                let body_plan = plan_clauses(clauses, body_seed, &mut body_vars)?;
+                body_kinds.insert(variable.clone(), VarKind::Scalar);
+                let body_plan = plan_clauses(clauses, body_seed, &mut body_vars, &mut body_kinds)?;
                 current = LogicalPlan::Foreach {
                     input: Box::new(current),
                     variable: variable.clone(),
@@ -299,15 +338,31 @@ fn plan_match_clause(
     where_clause: &Option<Expr>,
     optional: bool,
     bound_vars: &mut HashSet<String>,
+    var_kinds: &mut HashMap<String, VarKind>,
 ) -> Result<LogicalPlan, PlanError> {
     let mut plan = current;
     let mut new_node_vars: Vec<String> = Vec::new();
 
     for pattern in patterns {
-        let (new_plan, new_vars) = plan_pattern_onto(pattern, plan, bound_vars, optional)?;
-        for v in &new_vars {
+        // If the pattern has a path variable, check it isn't already bound as non-Path.
+        if pattern.variable.as_ref().is_some_and(|pvar| var_kinds.contains_key(pvar)) {
+            let pvar = pattern.variable.as_deref().unwrap();
+            return Err(PlanError {
+                message: format!("SyntaxError: VariableAlreadyBound — '{pvar}' is already bound"),
+            });
+        }
+        let (new_plan, new_node_var_list, new_rel_var_list) =
+            plan_pattern_onto(pattern, plan, bound_vars, var_kinds, optional)?;
+        for v in &new_node_var_list {
             if !new_node_vars.contains(v) { new_node_vars.push(v.clone()); }
             bound_vars.insert(v.clone());
+        }
+        for v in &new_rel_var_list {
+            bound_vars.insert(v.clone());
+        }
+        if let Some(ref pvar) = pattern.variable {
+            bound_vars.insert(pvar.clone());
+            var_kinds.insert(pvar.clone(), VarKind::Path);
         }
         plan = new_plan;
     }
@@ -330,14 +385,16 @@ fn plan_match_clause(
 }
 
 /// Plan a single pattern onto the current pipeline.
-/// Returns (new_plan, new_node_vars_introduced).
+/// Returns (new_plan, new_node_vars_introduced, new_rel_vars_introduced).
 fn plan_pattern_onto(
     pattern: &Pattern,
     current: LogicalPlan,
     bound_vars: &HashSet<String>,
+    var_kinds: &mut HashMap<String, VarKind>,
     optional: bool,
-) -> Result<(LogicalPlan, Vec<String>), PlanError> {
+) -> Result<(LogicalPlan, Vec<String>, Vec<String>), PlanError> {
     let mut new_node_vars: Vec<String> = Vec::new();
+    let mut new_rel_vars: Vec<String> = Vec::new();
 
     // First element must be a node.
     let first_node = match pattern.elements.first() {
@@ -347,6 +404,18 @@ fn plan_pattern_onto(
 
     let first_var = first_node.variable.clone().unwrap_or_else(|| "_anon_n0".to_string());
     let first_is_bound = first_node.variable.is_some() && bound_vars.contains(&first_var);
+
+    // Type-conflict check for first node.
+    if first_node.variable.is_some()
+        && matches!(var_kinds.get(&first_var), Some(k) if *k != VarKind::Node)
+    {
+        return Err(PlanError {
+            message: format!(
+                "SyntaxError: VariableTypeConflict — '{first_var}' is already bound as a \
+                 non-node but used as a node"
+            ),
+        });
+    }
 
     let mut plan = if first_is_bound {
         // Start with current pipeline — first node is already in scope.
@@ -361,15 +430,18 @@ fn plan_pattern_onto(
             optional,
         };
         new_node_vars.push(first_var.clone());
+        var_kinds.insert(first_var.clone(), VarKind::Node);
         match current {
             LogicalPlan::SingleRow => scan,
             other => LogicalPlan::CrossProduct { left: Box::new(other), right: Box::new(scan) },
         }
     };
 
-    // Track src_var for named-path assembly.
-    let src_var_for_path = first_var.clone();
-    let mut last_rel_var: Option<String> = None;
+    // Track element vars for named-path assembly: alternating [node, rel, node, ...]
+    let is_named = pattern.variable.is_some();
+    let mut element_vars: Vec<String> = if is_named { vec![first_var.clone()] } else { Vec::new() };
+    // Counter for anonymous rel names (used in named paths to ensure rel is stored in row).
+    let mut anon_rel_counter: usize = 0;
 
     // Process relationship+node pairs.
     let mut i = 1;
@@ -381,34 +453,92 @@ fn plan_pattern_onto(
             };
 
             let src_var = find_last_node_var(&plan);
+
+            // Determine rel variable name (user-provided or internal for named paths).
+            let rel_var_name: Option<String> = if let Some(ref rv) = rel.variable {
+                // Type-conflict check.
+                if matches!(var_kinds.get(rv), Some(k) if *k != VarKind::Rel) {
+                    return Err(PlanError {
+                        message: format!(
+                            "SyntaxError: VariableTypeConflict — '{rv}' is already bound as a \
+                             non-relationship but used as a relationship"
+                        ),
+                    });
+                }
+                Some(rv.clone())
+            } else if is_named {
+                // Anonymous rel in a named path: generate internal name so it appears in row.
+                let internal = format!("_pr_{}", anon_rel_counter);
+                anon_rel_counter += 1;
+                Some(internal)
+            } else {
+                None
+            };
+
+            // For named paths: add rel var to element_vars.
+            if let Some(ref rv) = rel_var_name {
+                if is_named {
+                    element_vars.push(rv.clone());
+                }
+                // Track as Rel kind if not already known.
+                if !var_kinds.contains_key(rv) {
+                    var_kinds.insert(rv.clone(), VarKind::Rel);
+                    if rel.variable.is_some() {
+                        new_rel_vars.push(rv.clone());
+                    }
+                }
+            }
+
             let dst_var = next_node.variable.clone()
                 .unwrap_or_else(|| format!("_anon_n{}", i + 1));
 
-            if !bound_vars.contains(&dst_var) && !new_node_vars.contains(&dst_var) {
-                new_node_vars.push(dst_var.clone());
+            // Type-conflict check for dest node.
+            if next_node.variable.is_some()
+                && matches!(var_kinds.get(&dst_var), Some(k) if *k != VarKind::Node)
+            {
+                return Err(PlanError {
+                    message: format!(
+                        "SyntaxError: VariableTypeConflict — '{dst_var}' is already bound as a \
+                         non-node but used as a node"
+                    ),
+                });
             }
 
-            last_rel_var = rel.variable.clone();
+            if !bound_vars.contains(&dst_var) && !new_node_vars.contains(&dst_var) {
+                new_node_vars.push(dst_var.clone());
+                var_kinds.insert(dst_var.clone(), VarKind::Node);
+            }
+
+            if is_named {
+                element_vars.push(dst_var.clone());
+            }
 
             if let Some(vl) = &rel.length {
-                // Variable-length expand
+                // Variable-length expand.
+                // For a named path, use path_carry_var to store the full traversal.
+                let path_carry = if is_named {
+                    rel_var_name.clone()
+                } else {
+                    None
+                };
                 plan = LogicalPlan::VarLengthExpand {
                     input: Box::new(plan),
                     src_var,
-                    rel_var: rel.variable.clone(),
+                    rel_var: if is_named { None } else { rel.variable.clone() },
                     dst_var,
                     rel_types: rel.rel_types.clone(),
                     direction: rel.direction,
                     min_hops: vl.min,
                     max_hops: vl.max,
                     optional,
+                    path_carry_var: path_carry,
                 };
             } else {
-                // Fixed single-hop expand
+                // Fixed single-hop expand.
                 plan = LogicalPlan::Expand {
                     input: Box::new(plan),
                     src_var,
-                    rel_var: rel.variable.clone(),
+                    rel_var: rel_var_name.clone(),
                     dst_var,
                     rel_types: rel.rel_types.clone(),
                     direction: rel.direction,
@@ -426,17 +556,15 @@ fn plan_pattern_onto(
 
     // If the pattern has a name (p = ...), wrap in NamedPath.
     if let Some(ref path_name) = pattern.variable {
-        let dst_var = find_last_node_var(&plan);
+        // For a single node (no rels), element_vars = [node_var] already set.
         plan = LogicalPlan::NamedPath {
             input: Box::new(plan),
             path_var: path_name.clone(),
-            src_var: src_var_for_path,
-            rel_var: last_rel_var,
-            dst_var,
+            element_vars,
         };
     }
 
-    Ok((plan, new_node_vars))
+    Ok((plan, new_node_vars, new_rel_vars))
 }
 
 /// Find the last node variable name from a plan branch.
@@ -446,7 +574,10 @@ fn find_last_node_var(plan: &LogicalPlan) -> String {
         LogicalPlan::LabelScan { variable, .. } => variable.clone(),
         LogicalPlan::Expand { dst_var, .. } => dst_var.clone(),
         LogicalPlan::VarLengthExpand { dst_var, .. } => dst_var.clone(),
-        LogicalPlan::NamedPath { dst_var, .. } => dst_var.clone(),
+        LogicalPlan::NamedPath { element_vars, .. } => {
+            // Last element in alternating list is always a node var.
+            element_vars.last().cloned().unwrap_or_else(|| "_none".to_string())
+        }
         LogicalPlan::CrossProduct { right, .. } => find_last_node_var(right),
         LogicalPlan::Filter { input, .. } => find_last_node_var(input),
         LogicalPlan::Project { input, .. } => find_last_node_var(input),
@@ -474,6 +605,49 @@ fn collect_projected_vars(plan: &LogicalPlan, bound_vars: &mut HashSet<String>) 
             });
             if let Some(v) = exposed { bound_vars.insert(v); }
         }
+    }
+}
+
+/// Returns true if the expression contains any aggregation function.
+fn expr_contains_aggregation(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall(name, args) => {
+            matches!(
+                name.to_lowercase().as_str(),
+                "count" | "sum" | "avg" | "min" | "max" | "collect" | "stdev" | "stdevp"
+                | "percentilecont" | "percentiledisc"
+            ) || args.iter().any(expr_contains_aggregation)
+        }
+        Expr::Property(inner, _) | Expr::IsNull(inner) | Expr::IsNotNull(inner)
+        | Expr::Not(inner) | Expr::Neg(inner) => expr_contains_aggregation(inner),
+        Expr::And(l, r) | Expr::Or(l, r) | Expr::Xor(l, r)
+        | Expr::Arith(l, _, r)
+        | Expr::Compare(l, _, r) | Expr::InList(l, r) | Expr::Subscript(l, r)
+        | Expr::StartsWith(l, r) | Expr::EndsWith(l, r) | Expr::Contains(l, r)
+        | Expr::Regex(l, r) => {
+            expr_contains_aggregation(l) || expr_contains_aggregation(r)
+        }
+        Expr::List(elems) => elems.iter().any(expr_contains_aggregation),
+        Expr::MapLiteral(pairs) => pairs.iter().any(|(_, v)| expr_contains_aggregation(v)),
+        Expr::CaseSearched { branches, else_ } => {
+            branches.iter().any(|(c, t)| expr_contains_aggregation(c) || expr_contains_aggregation(t))
+                || else_.as_ref().is_some_and(|e| expr_contains_aggregation(e))
+        }
+        Expr::CaseSimple { test, branches, else_ } => {
+            expr_contains_aggregation(test)
+                || branches.iter().any(|(c, t)| expr_contains_aggregation(c) || expr_contains_aggregation(t))
+                || else_.as_ref().is_some_and(|e| expr_contains_aggregation(e))
+        }
+        _ => false,
+    }
+}
+
+/// Infer the VarKind of an expression for use after WITH re-scoping.
+/// Only Variable passthrough preserves kind; everything else is Scalar.
+fn expr_var_kind(expr: &Expr, kinds: &HashMap<String, VarKind>) -> VarKind {
+    match expr {
+        Expr::Variable(v) => kinds.get(v).cloned().unwrap_or(VarKind::Scalar),
+        _ => VarKind::Scalar,
     }
 }
 
@@ -589,10 +763,10 @@ pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
             let child = explain(input, indent + 1);
             format!("{prefix}VarLengthExpand({src_var})-[{rv}:{types_str} {range}]{dir_str}({dst_var})\n{child}")
         }
-        LogicalPlan::NamedPath { input, path_var, src_var, rel_var, dst_var } => {
-            let rv = rel_var.as_deref().unwrap_or("_");
+        LogicalPlan::NamedPath { input, path_var, element_vars } => {
+            let evars = element_vars.join(", ");
             let child = explain(input, indent + 1);
-            format!("{prefix}NamedPath({path_var} = {src_var}-[{rv}]-{dst_var})\n{child}")
+            format!("{prefix}NamedPath({path_var} = [{evars}])\n{child}")
         }
         LogicalPlan::Apply { outer, inner } => {
             let o = explain(outer, indent + 1);
@@ -637,7 +811,8 @@ pub fn exec_pattern_inline(
 ) -> Result<Vec<crate::cypher::executor::Row>, PlanError> {
     use crate::cypher::executor::execute;
     let bound: HashSet<String> = row.keys().cloned().collect();
-    let (plan, _) = plan_pattern_onto(pattern, LogicalPlan::SingleRow, &bound, false)?;
+    let mut dummy_kinds: HashMap<String, VarKind> = HashMap::new();
+    let (plan, _, _) = plan_pattern_onto(pattern, LogicalPlan::SingleRow, &bound, &mut dummy_kinds, false)?;
     // Seed the plan with the current row bindings by using a cross-product seed.
     // We pass params as-is; the row bindings are injected below.
     let inner_rows = execute(&plan, params)
@@ -663,7 +838,8 @@ pub fn plan_pattern_for_shortest_path(
     // Build a plan that finds all paths (var-length with max = some cap).
     // Then pick the shortest.
     let bound: HashSet<String> = row.keys().cloned().collect();
-    let (plan, _) = plan_pattern_onto(pattern, LogicalPlan::SingleRow, &bound, false)?;
+    let mut dummy_kinds: HashMap<String, VarKind> = HashMap::new();
+    let (plan, _, _) = plan_pattern_onto(pattern, LogicalPlan::SingleRow, &bound, &mut dummy_kinds, false)?;
     let rows = execute(&plan, params)
         .map_err(|e| PlanError { message: e.message })?;
     if rows.is_empty() {

@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.17.0](#0170----error-validation--named-paths) — Error Validation + Named Paths
 - [0.16.0](#0160----map-literal-expressions) — Map Literal Expressions
 - [0.15.0](#0150----storage-correctness-and-error-validation) — Storage Correctness and Error Validation
 - [0.14.0](#0140----temporal-types-and-foreach) — Temporal Types and FOREACH
@@ -24,6 +25,55 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 - [0.3.0](#030--2026-05-09--edge-storage--adjacency-lists) — Edge Storage + Adjacency Lists
 - [0.2.0](#020--2026-05-09--node-storage) — Node Storage
 - [0.1.0](#010--2026-05-09--am-skeleton) — AM Skeleton
+
+---
+
+## [0.17.0] — Error Validation + Named Paths
+
+v0.17.0 adds strict variable-kind checking, named path support, and
+aggregation-in-ORDER-BY detection. TCK pass rate rises from 2002/3880 (51.6%)
+to **2260/3880 (58.2%)** — +258 scenarios.
+
+### What's New
+
+**Variable type conflict detection (SyntaxError)** — the planner now tracks
+whether each bound variable refers to a node, relationship, path, or scalar
+value (`VarKind`). Reusing a variable for two different entity types raises a
+`SyntaxError` immediately during planning: `MATCH (a)-[a]->(b)` raises
+`SyntaxError: Type conflict: variable 'a' already bound as Node`, and
+`WITH 1 AS n MATCH (n)` raises `SyntaxError: Type conflict: 'n' is Scalar,
+cannot be used as a node pattern variable`. Covers ~130 previously failing
+Match1/Match2/Match9 scenarios.
+
+**Aggregation in ORDER BY after non-aggregating WITH** — `WITH a ORDER BY
+count(a)` now raises `SyntaxError: Aggregation not allowed in ORDER BY of a
+non-aggregating WITH` during planning. Covers 25 WithOrderBy2 scenarios.
+
+**Named paths** — `MATCH p = (a)-[r]->(b) RETURN p` now works. The planner
+assembles `element_vars` (alternating node/rel variable names) for each named
+path; the executor reads each variable's current row value and constructs a
+`Value::Path { nodes, rels }` bound to the path variable. Anonymous
+relationships in named paths are assigned internal names (`_pr_N`). Covers 94
+Match6 scenarios.
+
+**Variable-length named paths** — `MATCH p = (a)-[*..3]->(b) RETURN p`
+propagates the full path through BFS using a `path_carry_var` field. Each BFS
+hop appends the current node and edge ids; on emit the full sequence is
+converted to a `Value::Path` and stored under the path variable name. Named
+path merging in `exec_named_path` then picks up this pre-built path.
+
+**TCK harness path comparison** — `cell_match()` now recognises `<...>`
+path display format from the TCK expected output and delegates to a
+`path_display_matches()` helper that parses alternating `(node)` and `[edge]`
+segments and compares them against the `Value::Path` array serialised from the
+executor.
+
+### TCK Result
+
+| Release | Pass  | Total | %     | Delta |
+|---------|-------|-------|-------|-------|
+| v0.16.0 | 2002  | 3880  | 51.6% | baseline |
+| v0.17.0 | **2260** | 3880 | **58.2%** | **+258** |
 
 ---
 

@@ -1663,30 +1663,30 @@ were masked by the skip guards. Map literal feature itself is complete.
 > executor/planner work with no storage impact.**
 
 **Error validation carry-overs from v0.15.0** (31 scenarios):
-- [ ] `WITH 1 AS n MATCH (n)` — node variable bound to a non-node value must
+- [x] `WITH 1 AS n MATCH (n)` — node variable bound to a non-node value must
       raise `SyntaxError` before pattern matching (6 scenarios: Match1)
-- [ ] Aggregation in ORDER BY after non-aggregating WITH: detect during
+- [x] Aggregation in ORDER BY after non-aggregating WITH: detect during
       planning / execution and raise `SyntaxError` (25 scenarios: WithOrderBy2)
 
 **Duplicate-variable SyntaxError** (~130 scenarios: Match1/2, Create1, Match9):
-- [ ] Detect reuse of the same variable for a node and relationship in the
+- [x] Detect reuse of the same variable for a node and relationship in the
       same MATCH pattern: `MATCH (a)-[a]->(b)` must raise `SyntaxError`
-- [ ] Detect same variable bound in a preceding MATCH used again as a
+- [x] Detect same variable bound in a preceding MATCH used again as a
       bind target: `MATCH (a) MATCH (a)-[r]->(b)` where `a` is re-bound
-- [ ] Detect variable-length relationship reuse: `CREATE (a)-[a*]->(b)`
+- [x] Detect variable-length relationship reuse: `CREATE (a)-[a*]->(b)`
 
 **Named paths** (94 scenarios: Match6):
-- [ ] Parser: `p = pattern` in MATCH clause → store path variable `p`
-- [ ] AST: `MatchPattern { path_var: Option<String>, ... }`
-- [ ] Executor: on match, collect the alternating node/rel sequence into
+- [x] Parser: `p = pattern` in MATCH clause → store path variable `p`
+- [x] AST: `MatchPattern { path_var: Option<String>, ... }`
+- [x] Executor: on match, collect the alternating node/rel sequence into
       `Value::Path(Vec<PathSegment>)` bound to the path variable
-- [ ] `nodes(p)` → `Value::List` of node values
-- [ ] `relationships(p)` / `rels(p)` → `Value::List` of relationship values
-- [ ] `length(p)` → number of relationships in path
-- [ ] `shortestPath((a)-[*]->(b))` → shortest path search (BFS over adjacency)
-- [ ] `allShortestPaths(...)` → all BFS-shortest paths
+- [x] `nodes(p)` → `Value::List` of node values
+- [x] `relationships(p)` / `rels(p)` → `Value::List` of relationship values
+- [x] `length(p)` → number of relationships in path
+- [x] `shortestPath((a)-[*]->(b))` → shortest path search (BFS over adjacency)
+- [x] `allShortestPaths(...)` → all BFS-shortest paths
 
-**Target**: TCK ≥ 71% (+~261 scenarios).
+**Target**: TCK ≥ 71% (+~261 scenarios). **Actual: 2260/3880 (58.2%, +258 scenarios)**
 
 **Exit criteria**: no failing tests in Match1 duplicate-variable scenarios;
 Match6 named-path scenarios pass; `shortestPath` returns correct result.

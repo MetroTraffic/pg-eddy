@@ -1,0 +1,11 @@
+-- pg_eddy--0.6.0--0.7.0.sql
+-- Migration from v0.6.0 to v0.7.0.
+--
+-- No new catalog objects are required for v0.17.0.
+-- Changes are purely in the Rust executor and planner:
+--   - VarKind tracking for variable type conflict detection
+--   - Named path support (p = pattern) with path_carry_var in BFS
+--   - Aggregation-in-ORDER-BY SyntaxError detection
+--   - WITH non-node/rel binding SyntaxError detection
+--
+-- This file intentionally has no DDL statements.

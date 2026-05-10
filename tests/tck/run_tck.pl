@@ -473,6 +473,11 @@ sub cell_match {
         return undef if ref($act) eq 'HASH' && node_display_matches($exp, $act);
         return "node mismatch (expected $exp)";
     }
+    if ($exp =~ /^</) {
+        # Path display: <(:A)-[:KNOWS]->(:B {name: 'B'})>
+        return undef if ref($act) eq 'ARRAY' && path_display_matches($exp, $act);
+        return "path mismatch (expected $exp, got " . _repr($act) . ")";
+    }
     if ($exp =~ /^\[/) {
         # Could be an edge display [type] or a list [1, 2, 3]
         return undef if ref($act) eq 'HASH' && edge_display_matches($exp, $act);
@@ -567,6 +572,51 @@ sub parse_prop_display {
         else { last; }
     }
     return %out;
+}
+
+# Compare a path display string like <(:A)-[:KNOWS]->(:B)> against an actual
+# path value (Perl arrayref of alternating node/edge hashrefs from JSON).
+sub path_display_matches {
+    my ($d, $actual) = @_;
+    # Strip outer < >
+    (my $inner = $d) =~ s/^<\s*|\s*>$//g;
+    # Extract alternating (...) and [...] segments from the path display.
+    my @segments;
+    my $pos = 0;
+    my $len = length($inner);
+    while ($pos < $len) {
+        # Skip connectors: ->, <-, -
+        while ($pos < $len && substr($inner, $pos, 1) =~ /[-<> ]/) { $pos++; }
+        last if $pos >= $len;
+        my $ch = substr($inner, $pos, 1);
+        if ($ch eq '(' || $ch eq '[') {
+            my $close = $ch eq '(' ? ')' : ']';
+            my $depth = 1; my $start = $pos; $pos++;
+            while ($pos < $len && $depth > 0) {
+                my $c = substr($inner, $pos, 1);
+                $depth++ if $c eq '(' || $c eq '[' || $c eq '{';
+                $depth-- if $c eq ')' || $c eq ']' || $c eq '}';
+                $pos++;
+            }
+            push @segments, substr($inner, $start, $pos - $start);
+        } else {
+            $pos++;
+        }
+    }
+    # actual is JSON array: [node0, edge0, node1, edge1, ..., nodeN]
+    return 0 if scalar(@segments) != scalar(@$actual);
+    for my $i (0..$#segments) {
+        my $seg = $segments[$i];
+        my $av  = $actual->[$i];
+        if ($seg =~ /^\(/) {
+            return 0 unless ref($av) eq 'HASH' && node_display_matches($seg, $av);
+        } elsif ($seg =~ /^\[/) {
+            return 0 unless ref($av) eq 'HASH' && edge_display_matches($seg, $av);
+        } else {
+            return 0;  # unexpected segment type
+        }
+    }
+    return 1;
 }
 
 # Parse a full Cypher map display like {a: 1, b: 'x', c: {d: 2}} into key=>raw_value pairs.
