@@ -78,6 +78,13 @@ pub enum LogicalPlan {
         expr: Expr,
         alias: String,
     },
+    /// Apply: run an inner subquery for each outer row (CALL { } subquery).
+    Apply {
+        outer: Box<LogicalPlan>,
+        inner: Box<LogicalPlan>,
+    },
+    /// Empty plan: produces zero rows (used for unimplemented CALL procedures).
+    Empty,
 }
 
 /// A plan error.
@@ -108,6 +115,27 @@ pub fn plan(query: &Query) -> Result<LogicalPlan, PlanError> {
                     input: Box::new(current),
                     expr: expr.clone(),
                     alias: alias.clone(),
+                };
+            }
+            QueryClause::CallSubquery { subquery } => {
+                let inner_plan = plan(subquery)?;
+                // Collect variables exposed by inner plan's Project if any
+                collect_projected_vars(&inner_plan, &mut bound_vars);
+                current = LogicalPlan::Apply {
+                    outer: Box::new(current),
+                    inner: Box::new(inner_plan),
+                };
+            }
+            QueryClause::CallProcedure { yield_items, .. } => {
+                // Procedure registry not yet implemented: produce empty rows.
+                // Bind the YIELD variables so downstream clauses don't error.
+                for (col, alias) in yield_items {
+                    let exposed = alias.as_ref().unwrap_or(col);
+                    bound_vars.insert(exposed.clone());
+                }
+                current = LogicalPlan::Apply {
+                    outer: Box::new(current),
+                    inner: Box::new(LogicalPlan::Empty),
                 };
             }
             QueryClause::With { distinct, items, order_by, skip, limit, where_clause } => {
@@ -306,12 +334,26 @@ fn find_last_node_var(plan: &LogicalPlan) -> String {
         LogicalPlan::Filter { input, .. } => find_last_node_var(input),
         LogicalPlan::Project { input, .. } => find_last_node_var(input),
         LogicalPlan::Unwind { alias, .. } => alias.clone(),
+        LogicalPlan::Apply { outer, .. } => find_last_node_var(outer),
+        LogicalPlan::Empty => "_none".to_string(),
     }
 }
 
 /// Build an isomorphism filter: for N node variables, emit
 /// `a <> b AND a <> c AND b <> c` using id() comparisons.
 /// Null-safe: if either variable is NULL (from OPTIONAL MATCH), the pair passes.
+/// Collect all variables exposed by the topmost Project node of a plan.
+fn collect_projected_vars(plan: &LogicalPlan, bound_vars: &mut HashSet<String>) {
+    if let LogicalPlan::Project { items, .. } = plan {
+        for item in items {
+            let exposed = item.alias.clone().or_else(|| {
+                if let Expr::Variable(v) = &item.expr { Some(v.clone()) } else { None }
+            });
+            if let Some(v) = exposed { bound_vars.insert(v); }
+        }
+    }
+}
+
 fn build_isomorphism_filter(node_vars: &[String]) -> Option<Expr> {
     if node_vars.len() < 2 {
         return None;
@@ -429,6 +471,12 @@ pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
             let child = explain(input, indent + 1);
             format!("{prefix}NamedPath({path_var} = {src_var}-[{rv}]-{dst_var})\n{child}")
         }
+        LogicalPlan::Apply { outer, inner } => {
+            let o = explain(outer, indent + 1);
+            let i = explain(inner, indent + 1);
+            format!("{prefix}Apply\n{o}\n{i}")
+        }
+        LogicalPlan::Empty => format!("{prefix}Empty"),
     }
 }
 
@@ -528,5 +576,22 @@ mod tests {
         let p = plan(&q).unwrap();
         let s = explain(&p, 0);
         assert!(s.contains("Filter"));
+    }
+
+    #[test]
+    fn test_plan_call_subquery() {
+        let q = parse("CALL { MATCH (n:Person) RETURN n } RETURN n").unwrap();
+        let p = plan(&q).unwrap();
+        let s = explain(&p, 0);
+        assert!(s.contains("Apply"), "expected Apply in plan: {s}");
+    }
+
+    #[test]
+    fn test_plan_call_procedure_yields_empty() {
+        let q = parse("CALL test.doNothing() YIELD x RETURN x").unwrap();
+        let p = plan(&q).unwrap();
+        let s = explain(&p, 0);
+        assert!(s.contains("Apply"), "expected Apply in plan: {s}");
+        assert!(s.contains("Empty"), "expected Empty in plan: {s}");
     }
 }

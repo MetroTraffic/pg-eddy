@@ -26,10 +26,12 @@ pub enum Token {
     Null,
     True,
     False,
-    Create,   // reserved for v0.11.0
-    Delete,   // reserved for v0.11.0
-    Detach,   // reserved for v0.11.0
-    Set,      // reserved for v0.11.0
+    Create,   // reserved for v0.12.0
+    Delete,   // reserved for v0.12.0
+    Detach,   // reserved for v0.12.0
+    Set,      // reserved for v0.12.0
+    Call,     // CALL clause (v0.11.0)
+    Yield,    // YIELD in CALL (v0.11.0)
     With,     // WITH clause (also used in STARTS WITH / ENDS WITH)
     Unwind,   // UNWIND clause
     Case,     // CASE expression
@@ -347,6 +349,8 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
                 "DELETE" => Token::Delete,
                 "DETACH" => Token::Detach,
                 "SET" => Token::Set,
+                "CALL" => Token::Call,
+                "YIELD" => Token::Yield,
                 "WITH" => Token::With,
                 "UNWIND" => Token::Unwind,
                 "CASE" => Token::Case,

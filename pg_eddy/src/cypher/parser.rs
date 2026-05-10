@@ -119,6 +119,66 @@ impl Parser {
                     let alias = self.eat_ident_flexible()?;
                     clauses.push(QueryClause::Unwind { expr, alias });
                 }
+                Token::Call => {
+                    self.advance();
+                    // Two forms:
+                    //   CALL { subquery } — subquery form
+                    //   CALL proc.name(args) YIELD col [AS alias], ...  — procedure call
+                    if *self.peek() == Token::LBrace {
+                        self.advance(); // consume {
+                        let subquery = self.parse_query()?;
+                        self.expect(&Token::RBrace)?;
+                        clauses.push(QueryClause::CallSubquery { subquery: Box::new(subquery) });
+                    } else {
+                        // Parse procedure name: ident.ident.ident (dot-separated)
+                        let mut proc_name = self.eat_ident_flexible()?;
+                        while *self.peek() == Token::Dot {
+                            self.advance();
+                            let next = self.eat_ident_flexible()?;
+                            proc_name.push('.');
+                            proc_name.push_str(&next);
+                        }
+                        // Parse optional argument list
+                        let args = if *self.peek() == Token::LParen {
+                            self.advance(); // (
+                            let mut args = Vec::new();
+                            if *self.peek() != Token::RParen {
+                                args.push(self.parse_expr()?);
+                                while *self.peek() == Token::Comma {
+                                    self.advance();
+                                    args.push(self.parse_expr()?);
+                                }
+                            }
+                            self.expect(&Token::RParen)?;
+                            args
+                        } else {
+                            Vec::new()
+                        };
+                        // Parse optional YIELD clause
+                        let yield_items = if *self.peek() == Token::Yield {
+                            self.advance();
+                            let mut items = Vec::new();
+                            loop {
+                                let col = self.eat_ident_flexible()?;
+                                let alias = if *self.peek() == Token::As {
+                                    self.advance();
+                                    Some(self.eat_ident_flexible()?)
+                                } else {
+                                    None
+                                };
+                                items.push((col, alias));
+                                if *self.peek() != Token::Comma {
+                                    break;
+                                }
+                                self.advance();
+                            }
+                            items
+                        } else {
+                            Vec::new()
+                        };
+                        clauses.push(QueryClause::CallProcedure { proc_name, args, yield_items });
+                    }
+                }
                 Token::With => {
                     self.advance();
                     let (distinct, items) = self.parse_return_items()?;
@@ -137,7 +197,8 @@ impl Parser {
                     clauses.push(QueryClause::Return { distinct, items, order_by, skip, limit });
                     break;
                 }
-                Token::Eof => break,
+                // `}` terminates a subquery without RETURN (CALL { } or EXISTS { })
+                Token::Eof | Token::RBrace => break,
                 other => {
                     return Err(ParseError {
                         message: format!("unexpected token in query: {:?}", other),
@@ -147,7 +208,7 @@ impl Parser {
             }
         }
 
-        if *self.peek() != Token::Eof {
+        if *self.peek() != Token::Eof && *self.peek() != Token::RBrace {
             return Err(ParseError {
                 message: format!("unexpected token after RETURN: {:?}", self.peek()),
                 offset: self.offset(),
@@ -452,12 +513,29 @@ impl Parser {
     fn eat_ident_flexible(&mut self) -> Result<String, ParseError> {
         match self.peek().clone() {
             Token::Ident(name) => { self.advance(); Ok(name) }
-            Token::End => { self.advance(); Ok("end".to_string()) }
+            Token::End   => { self.advance(); Ok("end".to_string()) }
+            Token::Yield => { self.advance(); Ok("yield".to_string()) }
+            Token::Call  => { self.advance(); Ok("call".to_string()) }
             other => Err(ParseError {
                 message: format!("expected identifier, got {:?}", other),
                 offset: self.offset(),
             }),
         }
+    }
+
+    /// Parse `exists { (pattern) [WHERE pred] }` — pattern-only subquery form.
+    /// Converts to: Query { clauses: [Match { patterns, where_clause }] }
+    /// with no RETURN (the EXISTS evaluator just checks for any row).
+    fn parse_exists_subquery(&mut self) -> Result<Query, ParseError> {
+        // Possibly starts with MATCH keyword — skip it
+        if *self.peek() == Token::Match {
+            self.advance();
+        }
+        let patterns = self.parse_patterns()?;
+        let where_clause = self.try_parse_where()?;
+        Ok(Query {
+            clauses: vec![QueryClause::Match { optional: false, patterns, where_clause }],
+        })
     }
 
     fn parse_return_item(&mut self) -> Result<ReturnItem, ParseError> {
@@ -786,6 +864,21 @@ impl Parser {
             }
             Token::Ident(name) => {
                 self.advance();
+                // exists { subquery } — existential subquery predicate
+                if name.eq_ignore_ascii_case("exists") && *self.peek() == Token::LBrace {
+                    self.advance(); // consume {
+                    // The subquery is a full Cypher query (MATCH ... [RETURN]) or a pattern-only form
+                    // Pattern-only: exists { (n)-->() } which has no RETURN
+                    // We need to handle the simple pattern-only form too:
+                    //   Treat it as MATCH pattern
+                    let subquery = if matches!(self.peek(), Token::LParen | Token::Match | Token::OptionalMatch) {
+                        self.parse_exists_subquery()?
+                    } else {
+                        self.parse_query()?
+                    };
+                    self.expect(&Token::RBrace)?;
+                    return Ok(Expr::Exists { subquery: Box::new(subquery) });
+                }
                 // Check for function call: name(...)
                 if *self.peek() == Token::LParen {
                     self.advance(); // (
@@ -1262,6 +1355,57 @@ mod tests {
             }
             other => panic!("expected CaseSimple, got {other:?}"),
         }
+    }
+
+    // v0.11.0 parser tests
+
+    #[test]
+    fn test_exists_subquery_simple() {
+        // exists { (n)-->() } — pattern-only form
+        let q = parse("MATCH (n) WHERE exists { (n)-->() } RETURN n").unwrap();
+        match first_where(&q) {
+            Some(Expr::Exists { subquery }) => {
+                assert_eq!(subquery.clauses.len(), 1);
+                assert!(matches!(&subquery.clauses[0], QueryClause::Match { .. }));
+            }
+            other => panic!("expected Exists, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_exists_subquery_with_where() {
+        // exists { MATCH (n)-[:R]->(m) WHERE m.val > 5 }
+        let q = parse("MATCH (n) WHERE exists { MATCH (n)-[:R]->(m) WHERE m.val > 5 } RETURN n").unwrap();
+        match first_where(&q) {
+            Some(Expr::Exists { subquery }) => {
+                match &subquery.clauses[0] {
+                    QueryClause::Match { where_clause, .. } => assert!(where_clause.is_some()),
+                    other => panic!("expected Match clause, got {other:?}"),
+                }
+            }
+            other => panic!("expected Exists, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_call_subquery() {
+        // CALL { MATCH (n) RETURN n } RETURN n
+        let q = parse("CALL { MATCH (n:Person) RETURN n } RETURN n").unwrap();
+        assert!(q.clauses.iter().any(|c| matches!(c, QueryClause::CallSubquery { .. })));
+    }
+
+    #[test]
+    fn test_call_procedure_yield() {
+        // CALL dbms.info() YIELD name RETURN name
+        let q = parse("CALL dbms.info() YIELD name RETURN name").unwrap();
+        assert!(q.clauses.iter().any(|c| matches!(c, QueryClause::CallProcedure { .. })));
+    }
+
+    #[test]
+    fn test_call_procedure_no_yield() {
+        // CALL test.doNothing()
+        let q = parse("CALL test.doNothing()").unwrap();
+        assert!(q.clauses.iter().any(|c| matches!(c, QueryClause::CallProcedure { .. })));
     }
 }
 

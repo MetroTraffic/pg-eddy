@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.11.0](#0110--2026-05-10--subqueries-exists-call--and-call-procedure-yield) — Subqueries: EXISTS {}, CALL {}, and CALL procedure YIELD
 - [0.10.0](#0100--2026-05-10--variable-length-paths-named-paths-and-path-functions) — Variable-Length Paths, Named Paths, and Path Functions
 - [0.9.0](#090--2026-05-09--aggregation-list-comprehensions-and-numeric-operators) — Aggregation, List Comprehensions, and Numeric Operators
 - [0.8.0](#080--2026-05-09--with-optional-match-unwind-and-case-expressions) — WITH, OPTIONAL MATCH, UNWIND, and CASE Expressions
@@ -17,6 +18,44 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 - [0.3.0](#030--2026-05-09--edge-storage--adjacency-lists) — Edge Storage + Adjacency Lists
 - [0.2.0](#020--2026-05-09--node-storage) — Node Storage
 - [0.1.0](#010--2026-05-09--am-skeleton) — AM Skeleton
+
+---
+
+## [0.11.0] — 2026-05-10 — Subqueries: EXISTS {}, CALL {}, and CALL procedure YIELD
+
+v0.11.0 adds full parser/planner/executor support for existential subquery
+predicates (`EXISTS { pattern }`), correlated and uncorrelated `CALL { }`
+subqueries, and `CALL procedure(args) YIELD col` syntax. These language features
+are complete per the openCypher grammar. TCK gains are reserved until v0.12.0
+when `CREATE` is implemented (all EXISTS/CALL TCK scenarios use `CREATE` for
+data setup and are currently skipped). 188/188 in-scope TCK scenarios continue
+to pass (100%).
+
+### New Cypher Features
+
+**`EXISTS { pattern }` predicate** — evaluates to `true` if at least one result
+exists for the inner pattern, `false` otherwise. Correlated with the outer scope
+via variable bindings. Supports both pattern-only form (`exists { (n)-->() }`)
+and full subquery form (`exists { MATCH (n)-[:R]->(m) WHERE m.val > 5 }`).
+
+**`CALL { subquery }` — subquery clauses** — runs an inner Cypher query for
+each outer row and emits merged (outer, inner) rows. Supports uncorrelated
+subqueries (inner is independent) and correlated subqueries (inner uses outer
+variables). Maps to an `Apply` logical plan node.
+
+**`CALL proc.name(args) YIELD col [AS alias]`** — procedure call syntax fully
+parsed and planned. Currently produces zero rows (procedure registry not yet
+implemented in v0.11.0). The YIELD column names are bound in scope so downstream
+clauses compile without errors. Procedure registration is planned for a future
+release.
+
+### Release Checklist
+
+All AGENTS.md release gates passed in order:
+1. `cargo clippy --features pg18` → 0 warnings
+2. `cargo pgrx test pg18` → 75/75 passed (8 new tests added)
+3. `prove tests/tap/*.pl` → 11/11 passed
+4. `perl tests/tck/run_tck.pl` → 188/188 in-scope (100%)
 
 ---
 

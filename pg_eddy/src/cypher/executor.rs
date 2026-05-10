@@ -198,6 +198,12 @@ pub fn execute(
         LogicalPlan::NamedPath { input, path_var, src_var, rel_var, dst_var } => {
             exec_named_path(input, path_var, src_var, rel_var.as_deref(), dst_var, params)
         }
+        LogicalPlan::Apply { outer, inner } => {
+            exec_apply(outer, inner, params)
+        }
+        LogicalPlan::Empty => {
+            Ok(Vec::new())
+        }
     }
 }
 
@@ -1898,6 +1904,32 @@ pub fn eval_expr(
             }
             Ok(Value::Json(serde_json::Value::Array(result_arr)))
         }
+        Expr::Exists { subquery } => {
+            // Execute the subquery in the context of the current row.
+            // Inject outer-scope variables as bindings.
+            use crate::cypher::planner;
+            let plan = planner::plan(subquery)
+                .map_err(|e| ExecError { message: e.message })?;
+            // Merge outer row vars into params for the inner execution.
+            let mut inner_params = params.clone();
+            for (k, v) in row {
+                inner_params.insert(k.clone(), v.to_json());
+            }
+            let inner_rows = execute(&plan, &inner_params)?;
+            // Filter inner rows to those that are compatible with outer bindings.
+            // A row is compatible if all outer-scope variables present in the inner
+            // row match the outer values.
+            let found = inner_rows.into_iter().any(|inner_row| {
+                row.iter().all(|(k, outer_val)| {
+                    if let Some(inner_val) = inner_row.get(k) {
+                        values_equal(outer_val, inner_val)
+                    } else {
+                        true // outer var not in inner scope; ignore
+                    }
+                })
+            });
+            Ok(Value::Bool(found))
+        }
     }
 }
 
@@ -2794,6 +2826,38 @@ fn eval_const_usize(expr: &Expr, params: &HashMap<String, serde_json::Value>) ->
         Value::Int(n) => n.max(0) as usize,
         _ => 0,
     }
+}
+
+/// Apply: for each outer row, execute the inner plan and produce all (outer, inner) merged rows.
+/// Used for CALL { subquery } and CALL proc() YIELD.
+fn exec_apply(
+    outer: &LogicalPlan,
+    inner: &LogicalPlan,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<Row>, ExecError> {
+    let outer_rows = execute(outer, params)?;
+    let mut result = Vec::new();
+    for outer_row in outer_rows {
+        // Merge outer bindings into params for inner execution.
+        let mut inner_params = params.clone();
+        for (k, v) in &outer_row {
+            inner_params.insert(k.clone(), v.to_json());
+        }
+        let inner_rows = execute(inner, &inner_params)?;
+        if inner_rows.is_empty() {
+            // No inner results: the outer row is dropped (inner join semantics for CALL).
+            continue;
+        }
+        for inner_row in inner_rows {
+            let mut merged = outer_row.clone();
+            // Inner vars override outer (inner subquery can shadow outer names).
+            for (k, v) in inner_row {
+                merged.insert(k, v);
+            }
+            result.push(merged);
+        }
+    }
+    Ok(result)
 }
 
 /// Convert result rows to JSONB output format.

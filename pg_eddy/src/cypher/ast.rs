@@ -4,6 +4,7 @@
 /// IN list membership, list literals, additional built-in functions.
 /// v0.10.0 scope: variable-length paths, named paths, path functions,
 /// shortestPath/allShortestPaths, pattern comprehensions.
+/// v0.11.0 scope: EXISTS { } predicate, CALL { } subqueries, CALL proc() YIELD.
 /// A sort key in ORDER BY.
 #[derive(Debug, Clone)]
 pub struct OrderItem {
@@ -30,6 +31,19 @@ pub enum QueryClause {
     Unwind {
         expr: Expr,
         alias: String,
+    },
+    /// CALL { subquery } — uncorrelated or correlated subquery.
+    /// `import_vars` lists variables passed in from outer scope.
+    CallSubquery {
+        subquery: Box<Query>,
+    },
+    /// CALL proc.name(arg, …) YIELD col1, col2 — procedure call.
+    CallProcedure {
+        #[allow(dead_code)]
+        proc_name: String,
+        #[allow(dead_code)]
+        args: Vec<Expr>,
+        yield_items: Vec<(String, Option<String>)>, // (column, alias)
     },
     /// WITH clause: intermediate projection (may include WHERE after it).
     With {
@@ -208,6 +222,11 @@ pub enum Expr {
         pattern: Pattern,
         predicate: Option<Box<Expr>>,
         projection: Box<Expr>,
+    },
+    /// EXISTS { pattern } — existential subquery predicate (v0.11.0).
+    /// Returns true if at least one result exists for the inner pattern query.
+    Exists {
+        subquery: Box<Query>,
     },
 }
 

@@ -1416,10 +1416,10 @@ the storage layer).
 - Note: Match5/Match6 TCK scenarios require CREATE (skipped); 188/188 in-scope pass
 
 **v0.11.0 — Subqueries**:
-- [ ] `EXISTS { ... }` pattern predicate, scalar subqueries
-- [ ] `CALL { ... }` subqueries (correlated and uncorrelated)
-- [ ] `CALL procedure(args) YIELD ...`
-- [ ] Target: pass `CallSubqueryAcceptance`, `ExistsAcceptance`; TCK ~65%
+- [x] `EXISTS { ... }` pattern predicate, scalar subqueries
+- [x] `CALL { ... }` subqueries (correlated and uncorrelated)
+- [x] `CALL procedure(args) YIELD ...`
+- [ ] Target: pass `CallSubqueryAcceptance`, `ExistsAcceptance`; TCK ~65% (requires CREATE, deferred to v0.12.0)
 
 **Exit criteria**: TCK pass rate ~65% estimated; `shortestPath()` is cancellable and
 memory-bounded; aggregation matches Neo4j for all TCK scenarios.

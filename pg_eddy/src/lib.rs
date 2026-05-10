@@ -1711,7 +1711,30 @@ mod tests {
             "expected NamedPath plan node, got: {s3}"
         );
     }
+
+    #[pg_test]
+    fn test_subquery_call_exists_parse_plan() {
+        use crate::cypher::parser::parse;
+        use crate::cypher::planner::{plan, explain};
+
+        // CALL { } subquery should produce Apply plan node.
+        let q = parse("CALL { MATCH (n:Person) RETURN n } RETURN n").expect("parse failed");
+        let p = plan(&q).expect("plan failed");
+        let s = explain(&p, 0);
+        assert!(s.contains("Apply"), "expected Apply in CALL subquery plan: {s}");
+
+        // CALL proc() YIELD — should produce Apply + Empty.
+        let q2 = parse("CALL test.doNothing() YIELD x RETURN x").expect("parse failed");
+        let p2 = plan(&q2).expect("plan failed");
+        let s2 = explain(&p2, 0);
+        assert!(s2.contains("Empty"), "expected Empty in procedure plan: {s2}");
+
+        // exists { } should parse without error.
+        let q3 = parse("MATCH (n) WHERE exists { (n)-->() } RETURN n").expect("parse failed");
+        let _ = plan(&q3).expect("plan failed");
+    }
 }
+
 
 #[cfg(test)]
 pub mod pg_test {
