@@ -251,22 +251,6 @@ fn find_last_node_var(plan: &LogicalPlan) -> String {
     }
 }
 
-/// Collect all named node variables from a slice of patterns.
-fn collect_node_variables(patterns: &[Pattern]) -> Vec<String> {
-    let mut vars = Vec::new();
-    let mut seen = HashSet::new();
-    for pattern in patterns {
-        for elem in &pattern.elements {
-            if let PatternElement::Node(n) = elem
-                && let Some(ref v) = n.variable
-                    && seen.insert(v.clone()) {
-                        vars.push(v.clone());
-                    }
-        }
-    }
-    vars
-}
-
 /// Build an isomorphism filter: for N node variables, emit
 /// `a <> b AND a <> c AND b <> c` using id() comparisons.
 /// Null-safe: if either variable is NULL (from OPTIONAL MATCH), the pair passes.

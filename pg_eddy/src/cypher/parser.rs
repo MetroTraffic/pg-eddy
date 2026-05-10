@@ -395,19 +395,6 @@ impl Parser {
         Ok(props)
     }
 
-    /// Parse RETURN items: expr [AS alias], ... (old API, kept for compatibility)
-    fn parse_return_clause(&mut self) -> Result<ReturnClause, ParseError> {
-        let distinct = if *self.peek() == Token::Distinct {
-            self.advance();
-            true
-        } else {
-            false
-        };
-
-        let items = self.parse_return_clause_items()?;
-        Ok(ReturnClause { distinct, items })
-    }
-
     /// Parse a comma-separated list of return items (without the DISTINCT prefix).
     fn parse_return_clause_items(&mut self) -> Result<Vec<ReturnItem>, ParseError> {
         let mut items = vec![self.parse_return_item()?];
@@ -762,12 +749,12 @@ impl Parser {
                             Expr::BoolLit(true)
                         };
                         self.expect(&Token::RParen)?;
-                        return Ok(self.parse_property_chain(Expr::ListPredicate {
+                        return self.parse_property_chain(Expr::ListPredicate {
                             kind,
                             variable: var,
                             list_expr: Box::new(list_expr),
                             predicate: Box::new(predicate),
-                        })?);
+                        }).map(Ok)?;
                     }
 
                     // filter(x IN list WHERE pred) — list comprehension without projection
@@ -784,12 +771,12 @@ impl Parser {
                             None
                         };
                         self.expect(&Token::RParen)?;
-                        return Ok(self.parse_property_chain(Expr::ListComprehension {
+                        return self.parse_property_chain(Expr::ListComprehension {
                             variable: var,
                             list_expr: Box::new(list_expr),
                             predicate,
                             projection: None,
-                        })?);
+                        }).map(Ok)?;
                     }
 
                     // extract(x IN list | expr) — deprecated list comprehension
@@ -806,12 +793,12 @@ impl Parser {
                             None
                         };
                         self.expect(&Token::RParen)?;
-                        return Ok(self.parse_property_chain(Expr::ListComprehension {
+                        return self.parse_property_chain(Expr::ListComprehension {
                             variable: var,
                             list_expr: Box::new(list_expr),
                             predicate: None,
                             projection,
-                        })?);
+                        }).map(Ok)?;
                     }
 
                     // Aggregate functions: handle DISTINCT prefix

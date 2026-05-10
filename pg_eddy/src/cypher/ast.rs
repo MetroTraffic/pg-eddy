@@ -2,7 +2,6 @@
 ///
 /// v0.7.0 scope: MATCH/WHERE/RETURN + ORDER BY/SKIP/LIMIT, string predicates,
 /// IN list membership, list literals, additional built-in functions.
-
 /// A sort key in ORDER BY.
 #[derive(Debug, Clone)]
 pub struct OrderItem {
@@ -86,13 +85,6 @@ pub enum RelDirection {
     Out,   // -[]->(b)
     In,    // <-[]-(b)
     Both,  // -[]-(b)  (undirected)
-}
-
-/// RETURN clause items.
-#[derive(Debug, Clone)]
-pub struct ReturnClause {
-    pub distinct: bool,
-    pub items: Vec<ReturnItem>,
 }
 
 /// A single RETURN item: expression optionally aliased.

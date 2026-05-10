@@ -810,23 +810,23 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
         Expr::Subscript(l, r) => expr_has_aggregate(l) || expr_has_aggregate(r),
         Expr::ListSlice { list_expr, from, to, .. } => {
             expr_has_aggregate(list_expr)
-                || from.as_deref().map_or(false, expr_has_aggregate)
-                || to.as_deref().map_or(false, expr_has_aggregate)
+                || from.as_deref().is_some_and(expr_has_aggregate)
+                || to.as_deref().is_some_and(expr_has_aggregate)
         }
         Expr::List(exprs) => exprs.iter().any(expr_has_aggregate),
         Expr::CaseSearched { branches, else_ } => {
             branches.iter().any(|(c, t)| expr_has_aggregate(c) || expr_has_aggregate(t))
-                || else_.as_deref().map_or(false, expr_has_aggregate)
+                || else_.as_deref().is_some_and(expr_has_aggregate)
         }
         Expr::CaseSimple { test, branches, else_ } => {
             expr_has_aggregate(test)
                 || branches.iter().any(|(w, t)| expr_has_aggregate(w) || expr_has_aggregate(t))
-                || else_.as_deref().map_or(false, expr_has_aggregate)
+                || else_.as_deref().is_some_and(expr_has_aggregate)
         }
         Expr::ListComprehension { list_expr, predicate, projection, .. } => {
             expr_has_aggregate(list_expr)
-                || predicate.as_deref().map_or(false, expr_has_aggregate)
-                || projection.as_deref().map_or(false, expr_has_aggregate)
+                || predicate.as_deref().is_some_and(expr_has_aggregate)
+                || projection.as_deref().is_some_and(expr_has_aggregate)
         }
         Expr::ListPredicate { list_expr, predicate, .. } => {
             expr_has_aggregate(list_expr) || expr_has_aggregate(predicate)
@@ -1188,7 +1188,7 @@ fn eval_percentile(
         Value::Int(i) => i as f64,
         _ => return Ok(Value::Null),
     };
-    if pct < 0.0 || pct > 1.0 {
+    if !(0.0..=1.0).contains(&pct) {
         return Err(ExecError { message: "percentile must be between 0.0 and 1.0".into() });
     }
     let mut vals: Vec<f64> = group_rows.iter()
@@ -1216,55 +1216,7 @@ fn value_fingerprint(v: &Value) -> String {
     serde_json::to_string(&v.to_json()).unwrap_or_default()
 }
 
-/// Returns true if the expression contains a Variable or Property reference that is
-/// NOT nested inside an aggregate function call.  Used to detect AmbiguousAggregationExpression.
-fn expr_has_direct_var_ref(expr: &Expr) -> bool {
-    match expr {
-        Expr::Variable(_) => true,
-        Expr::Property(base, _) => expr_has_direct_var_ref(base),
-        Expr::FunctionCall(name, args) => {
-            if is_aggregate_name(name) {
-                false // refs inside aggregates are correctly aggregated
-            } else {
-                args.iter().any(expr_has_direct_var_ref)
-            }
-        }
-        Expr::Arith(l, _, r) | Expr::Compare(l, _, r) | Expr::And(l, r) | Expr::Or(l, r)
-        | Expr::Xor(l, r)
-        | Expr::StartsWith(l, r) | Expr::EndsWith(l, r) | Expr::Contains(l, r)
-        | Expr::Regex(l, r) | Expr::InList(l, r) => {
-            expr_has_direct_var_ref(l) || expr_has_direct_var_ref(r)
-        }
-        Expr::Not(e) | Expr::Neg(e) | Expr::IsNull(e) | Expr::IsNotNull(e)
-        | Expr::Property(e, _) => expr_has_direct_var_ref(e),
-        Expr::Subscript(l, r) => expr_has_direct_var_ref(l) || expr_has_direct_var_ref(r),
-        Expr::ListSlice { list_expr, from, to, .. } => {
-            expr_has_direct_var_ref(list_expr)
-                || from.as_deref().map_or(false, expr_has_direct_var_ref)
-                || to.as_deref().map_or(false, expr_has_direct_var_ref)
-        }
-        Expr::List(es) => es.iter().any(expr_has_direct_var_ref),
-        Expr::CaseSearched { branches, else_ } => {
-            branches.iter().any(|(c, t)| expr_has_direct_var_ref(c) || expr_has_direct_var_ref(t))
-                || else_.as_deref().map_or(false, expr_has_direct_var_ref)
-        }
-        Expr::CaseSimple { test, branches, else_ } => {
-            expr_has_direct_var_ref(test)
-                || branches.iter().any(|(w, t)| expr_has_direct_var_ref(w) || expr_has_direct_var_ref(t))
-                || else_.as_deref().map_or(false, expr_has_direct_var_ref)
-        }
-        Expr::ListComprehension { list_expr, predicate, projection, .. } => {
-            expr_has_direct_var_ref(list_expr)
-                || predicate.as_deref().map_or(false, expr_has_direct_var_ref)
-                || projection.as_deref().map_or(false, expr_has_direct_var_ref)
-        }
-        Expr::ListPredicate { list_expr, predicate, .. } => {
-            expr_has_direct_var_ref(list_expr) || expr_has_direct_var_ref(predicate)
-        }
-        // Literals, Star, Parameter, NullLit don't reference variables
-        _ => false,
-    }
-}
+
 
 /// Collect all Variable/Property leaf expressions that are NOT nested inside an
 /// aggregate function call.  These are the "free variable references" that must
@@ -1614,8 +1566,7 @@ pub fn eval_expr(
                 }
                 ListPredicateKind::Single => {
                     if true_count == 1 && !has_null { Ok(Value::Bool(true)) }
-                    else if true_count > 1 { Ok(Value::Bool(false)) }
-                    else if true_count == 0 && !has_null { Ok(Value::Bool(false)) }
+                    else if true_count > 1 || (true_count == 0 && !has_null) { Ok(Value::Bool(false)) }
                     else { Ok(Value::Null) }
                 }
             }
