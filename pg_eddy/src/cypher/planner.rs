@@ -85,6 +85,37 @@ pub enum LogicalPlan {
     },
     /// Empty plan: produces zero rows (used for unimplemented CALL procedures).
     Empty,
+    // -----------------------------------------------------------------------
+    // v0.12.0: Write plan nodes
+    // -----------------------------------------------------------------------
+    /// Create nodes and relationships from CREATE patterns.
+    CreatePattern {
+        input: Box<LogicalPlan>,
+        patterns: Vec<Pattern>,
+    },
+    /// SET properties/labels.
+    SetProp {
+        input: Box<LogicalPlan>,
+        items: Vec<SetItem>,
+    },
+    /// REMOVE properties/labels.
+    RemoveProp {
+        input: Box<LogicalPlan>,
+        items: Vec<RemoveItem>,
+    },
+    /// DELETE (or DETACH DELETE) nodes/relationships.
+    DeleteNodes {
+        input: Box<LogicalPlan>,
+        exprs: Vec<Expr>,
+        detach: bool,
+    },
+    /// MERGE pattern [ON CREATE SET ...] [ON MATCH SET ...].
+    MergePattern {
+        input: Box<LogicalPlan>,
+        pattern: Pattern,
+        on_create: Vec<SetItem>,
+        on_match: Vec<SetItem>,
+    },
 }
 
 /// A plan error.
@@ -167,6 +198,64 @@ pub fn plan(query: &Query) -> Result<LogicalPlan, PlanError> {
                     order_by: order_by.clone(),
                     skip: skip.clone(),
                     limit: limit.clone(),
+                };
+            }
+            // v0.12.0 write clauses
+            QueryClause::Create { patterns } => {
+                // Bind any variables introduced by CREATE patterns.
+                for pattern in patterns {
+                    for elem in &pattern.elements {
+                        if let PatternElement::Node(n) = elem
+                            && let Some(v) = &n.variable {
+                                bound_vars.insert(v.clone());
+                            }
+                        if let PatternElement::Relationship(r) = elem
+                            && let Some(v) = &r.variable {
+                                bound_vars.insert(v.clone());
+                            }
+                    }
+                }
+                current = LogicalPlan::CreatePattern {
+                    input: Box::new(current),
+                    patterns: patterns.clone(),
+                };
+            }
+            QueryClause::Set { items } => {
+                current = LogicalPlan::SetProp {
+                    input: Box::new(current),
+                    items: items.clone(),
+                };
+            }
+            QueryClause::Remove { items } => {
+                current = LogicalPlan::RemoveProp {
+                    input: Box::new(current),
+                    items: items.clone(),
+                };
+            }
+            QueryClause::Delete { exprs, detach } => {
+                current = LogicalPlan::DeleteNodes {
+                    input: Box::new(current),
+                    exprs: exprs.clone(),
+                    detach: *detach,
+                };
+            }
+            QueryClause::Merge { pattern, on_create, on_match } => {
+                // Variables from the merge pattern come into scope.
+                for elem in &pattern.elements {
+                    if let PatternElement::Node(n) = elem
+                        && let Some(v) = &n.variable {
+                            bound_vars.insert(v.clone());
+                        }
+                    if let PatternElement::Relationship(r) = elem
+                        && let Some(v) = &r.variable {
+                            bound_vars.insert(v.clone());
+                        }
+                }
+                current = LogicalPlan::MergePattern {
+                    input: Box::new(current),
+                    pattern: pattern.clone(),
+                    on_create: on_create.clone(),
+                    on_match: on_match.clone(),
                 };
             }
         }
@@ -336,6 +425,11 @@ fn find_last_node_var(plan: &LogicalPlan) -> String {
         LogicalPlan::Unwind { alias, .. } => alias.clone(),
         LogicalPlan::Apply { outer, .. } => find_last_node_var(outer),
         LogicalPlan::Empty => "_none".to_string(),
+        LogicalPlan::CreatePattern { input, .. } => find_last_node_var(input),
+        LogicalPlan::SetProp { input, .. } => find_last_node_var(input),
+        LogicalPlan::RemoveProp { input, .. } => find_last_node_var(input),
+        LogicalPlan::DeleteNodes { input, .. } => find_last_node_var(input),
+        LogicalPlan::MergePattern { input, .. } => find_last_node_var(input),
     }
 }
 
@@ -477,6 +571,27 @@ pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
             format!("{prefix}Apply\n{o}\n{i}")
         }
         LogicalPlan::Empty => format!("{prefix}Empty"),
+        LogicalPlan::CreatePattern { input, .. } => {
+            let child = explain(input, indent + 1);
+            format!("{prefix}CreatePattern\n{child}")
+        }
+        LogicalPlan::SetProp { input, items } => {
+            let child = explain(input, indent + 1);
+            format!("{prefix}SetProp({} items)\n{child}", items.len())
+        }
+        LogicalPlan::RemoveProp { input, items } => {
+            let child = explain(input, indent + 1);
+            format!("{prefix}RemoveProp({} items)\n{child}", items.len())
+        }
+        LogicalPlan::DeleteNodes { input, detach, .. } => {
+            let child = explain(input, indent + 1);
+            let d = if *detach { "DETACH " } else { "" };
+            format!("{prefix}{d}DeleteNodes\n{child}")
+        }
+        LogicalPlan::MergePattern { input, .. } => {
+            let child = explain(input, indent + 1);
+            format!("{prefix}MergePattern\n{child}")
+        }
     }
 }
 

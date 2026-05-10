@@ -199,6 +199,77 @@ impl Parser {
                 }
                 // `}` terminates a subquery without RETURN (CALL { } or EXISTS { })
                 Token::Eof | Token::RBrace => break,
+                // v0.12.0 write clauses
+                Token::Create => {
+                    self.advance();
+                    let patterns = self.parse_patterns()?;
+                    clauses.push(QueryClause::Create { patterns });
+                }
+                Token::Delete => {
+                    self.advance();
+                    let exprs = self.parse_expr_list()?;
+                    clauses.push(QueryClause::Delete { exprs, detach: false });
+                }
+                Token::Detach => {
+                    // DETACH DELETE
+                    self.advance();
+                    self.expect(&Token::Delete)?;
+                    let exprs = self.parse_expr_list()?;
+                    clauses.push(QueryClause::Delete { exprs, detach: true });
+                }
+                Token::Set => {
+                    self.advance();
+                    let items = self.parse_set_items()?;
+                    clauses.push(QueryClause::Set { items });
+                }
+                Token::Remove => {
+                    self.advance();
+                    let items = self.parse_remove_items()?;
+                    clauses.push(QueryClause::Remove { items });
+                }
+                Token::Merge => {
+                    self.advance();
+                    let pattern = self.parse_pattern()?;
+                    let mut on_create = Vec::new();
+                    let mut on_match = Vec::new();
+                    // Optional ON CREATE SET / ON MATCH SET
+                    loop {
+                        if *self.peek() == Token::On {
+                            self.advance();
+                            match self.peek().clone() {
+                                Token::Ident(ref s) if s.eq_ignore_ascii_case("CREATE") => {
+                                    self.advance();
+                                    self.expect(&Token::Set)?;
+                                    on_create = self.parse_set_items()?;
+                                }
+                                Token::Create => {
+                                    self.advance();
+                                    self.expect(&Token::Set)?;
+                                    on_create = self.parse_set_items()?;
+                                }
+                                Token::Ident(ref s) if s.eq_ignore_ascii_case("MATCH") => {
+                                    self.advance();
+                                    self.expect(&Token::Set)?;
+                                    on_match = self.parse_set_items()?;
+                                }
+                                Token::Match => {
+                                    self.advance();
+                                    self.expect(&Token::Set)?;
+                                    on_match = self.parse_set_items()?;
+                                }
+                                other => {
+                                    return Err(ParseError {
+                                        message: format!("expected CREATE or MATCH after ON, got {:?}", other),
+                                        offset: self.offset(),
+                                    });
+                                }
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    clauses.push(QueryClause::Merge { pattern, on_create, on_match });
+                }
                 other => {
                     return Err(ParseError {
                         message: format!("unexpected token in query: {:?}", other),
@@ -513,11 +584,118 @@ impl Parser {
     fn eat_ident_flexible(&mut self) -> Result<String, ParseError> {
         match self.peek().clone() {
             Token::Ident(name) => { self.advance(); Ok(name) }
-            Token::End   => { self.advance(); Ok("end".to_string()) }
-            Token::Yield => { self.advance(); Ok("yield".to_string()) }
-            Token::Call  => { self.advance(); Ok("call".to_string()) }
+            Token::End    => { self.advance(); Ok("end".to_string()) }
+            Token::Yield  => { self.advance(); Ok("yield".to_string()) }
+            Token::Call   => { self.advance(); Ok("call".to_string()) }
+            Token::On     => { self.advance(); Ok("on".to_string()) }
+            Token::Remove => { self.advance(); Ok("remove".to_string()) }
+            Token::Merge  => { self.advance(); Ok("merge".to_string()) }
             other => Err(ParseError {
                 message: format!("expected identifier, got {:?}", other),
+                offset: self.offset(),
+            }),
+        }
+    }
+
+    /// Parse a comma-separated list of expressions (for DELETE).
+    fn parse_expr_list(&mut self) -> Result<Vec<Expr>, ParseError> {
+        let mut exprs = vec![self.parse_expr()?];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            exprs.push(self.parse_expr()?);
+        }
+        Ok(exprs)
+    }
+
+    /// Parse SET items: `n.prop = expr | n = {map} | n += {map} | n:Label`
+    fn parse_set_items(&mut self) -> Result<Vec<SetItem>, ParseError> {
+        let mut items = Vec::new();
+        loop {
+            let item = self.parse_set_item()?;
+            items.push(item);
+            if *self.peek() != Token::Comma {
+                break;
+            }
+            self.advance();
+        }
+        Ok(items)
+    }
+
+    fn parse_set_item(&mut self) -> Result<SetItem, ParseError> {
+        // Start with an identifier (the variable or property access)
+        let var = self.eat_ident_flexible()?;
+
+        match self.peek().clone() {
+            Token::Colon => {
+                // n:Label[:Label2 ...]
+                let mut labels = Vec::new();
+                while *self.peek() == Token::Colon {
+                    self.advance();
+                    labels.push(self.eat_ident_flexible()?);
+                }
+                Ok(SetItem::Label(var, labels))
+            }
+            Token::Dot => {
+                // n.prop = expr
+                self.advance();
+                let prop = self.eat_ident_flexible()?;
+                self.expect(&Token::Eq)?;
+                let val = self.parse_expr()?;
+                Ok(SetItem::Property(Expr::Property(Box::new(Expr::Variable(var)), prop), val))
+            }
+            Token::Eq => {
+                // n = {map}
+                self.advance();
+                let val = self.parse_expr()?;
+                Ok(SetItem::Variable(var, val))
+            }
+            Token::PlusEq => {
+                // n += {map}
+                self.advance();
+                let val = self.parse_expr()?;
+                Ok(SetItem::MergeMap(var, val))
+            }
+            other => Err(ParseError {
+                message: format!("expected ., :, =, or += in SET item, got {:?}", other),
+                offset: self.offset(),
+            }),
+        }
+    }
+
+    /// Parse REMOVE items: `n.prop | n:Label`
+    fn parse_remove_items(&mut self) -> Result<Vec<RemoveItem>, ParseError> {
+        let mut items = Vec::new();
+        loop {
+            let item = self.parse_remove_item()?;
+            items.push(item);
+            if *self.peek() != Token::Comma {
+                break;
+            }
+            self.advance();
+        }
+        Ok(items)
+    }
+
+    fn parse_remove_item(&mut self) -> Result<RemoveItem, ParseError> {
+        let var = self.eat_ident_flexible()?;
+        match self.peek().clone() {
+            Token::Dot => {
+                // n.prop
+                self.advance();
+                let prop = self.eat_ident_flexible()?;
+                Ok(RemoveItem::Property(Expr::Variable(var), prop))
+            }
+            Token::Colon => {
+                // n:Label[:Label2 ...]
+                let mut labels = Vec::new();
+                while *self.peek() == Token::Colon {
+                    self.advance();
+                    labels.push(self.eat_ident_flexible()?);
+                }
+                Ok(RemoveItem::Label(var, labels))
+            }
+            other => Err(ParseError {
+                message: format!("expected . or : in REMOVE item, got {:?}", other),
                 offset: self.offset(),
             }),
         }

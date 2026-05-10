@@ -62,6 +62,54 @@ pub enum QueryClause {
         skip: Option<Expr>,
         limit: Option<Expr>,
     },
+    // -----------------------------------------------------------------------
+    // v0.12.0: Write clauses
+    // -----------------------------------------------------------------------
+    /// CREATE pattern[, pattern] — create nodes and relationships.
+    Create {
+        patterns: Vec<Pattern>,
+    },
+    /// MERGE pattern [ON CREATE SET ...] [ON MATCH SET ...]
+    Merge {
+        pattern: Pattern,
+        on_create: Vec<SetItem>,
+        on_match: Vec<SetItem>,
+    },
+    /// SET n.prop = expr | n = {map} | n += {map} | n:Label
+    Set {
+        items: Vec<SetItem>,
+    },
+    /// REMOVE n.prop | n:Label
+    Remove {
+        items: Vec<RemoveItem>,
+    },
+    /// DELETE n [, m, ...] or DETACH DELETE n [, m, ...]
+    Delete {
+        exprs: Vec<Expr>,
+        detach: bool,
+    },
+}
+
+/// A SET item: one of four forms.
+#[derive(Debug, Clone)]
+pub enum SetItem {
+    /// `n.prop = expr`
+    Property(Expr, Expr),
+    /// `n = {map}` — replace all properties
+    Variable(String, Expr),
+    /// `n += {map}` — merge properties
+    MergeMap(String, Expr),
+    /// `n:Label[:Label2 ...]` — add labels
+    Label(String, Vec<String>),
+}
+
+/// A REMOVE item: one of two forms.
+#[derive(Debug, Clone)]
+pub enum RemoveItem {
+    /// `n.prop`
+    Property(Expr, String),
+    /// `n:Label[:Label2 ...]`
+    Label(String, Vec<String>),
 }
 
 /// A single pattern: a chain of nodes connected by relationships.

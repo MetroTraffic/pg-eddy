@@ -1420,6 +1420,7 @@ the storage layer).
 - [x] `CALL { ... }` subqueries (correlated and uncorrelated)
 - [x] `CALL procedure(args) YIELD ...`
 - [ ] Target: pass `CallSubqueryAcceptance`, `ExistsAcceptance`; TCK ~65% (requires CREATE, deferred to v0.12.0)
+- [x] v0.12.0 unlocked all CREATE-dependent TCK scenarios; pass rate improved
 
 **Exit criteria**: TCK pass rate ~65% estimated; `shortestPath()` is cancellable and
 memory-bounded; aggregation matches Neo4j for all TCK scenarios.
@@ -1435,14 +1436,14 @@ comparison requires Cypher `CREATE` for data loading; the v0.5.1 storage-
 layer micro-benchmark already proved raw adjacency-follow speed.
 
 **v0.12.0 — Write clauses**:
-- [ ] `CREATE (n:Label {prop: value})`, `CREATE (a)-[:TYPE]->(b)`
-- [ ] `MERGE ... ON CREATE SET ... ON MATCH SET ...` with uniqueness constraint
+- [x] `CREATE (n:Label {prop: value})`, `CREATE (a)-[:TYPE]->(b)`
+- [x] `MERGE ... ON CREATE SET ... ON MATCH SET ...` with uniqueness constraint
       enforcement
-- [ ] `SET n.prop = value`, `SET n += {map}`, `SET n = {map}`
-- [ ] `SET n:Label`, `REMOVE n:Label`, `REMOVE n.prop`
-- [ ] `DELETE n`, `DETACH DELETE n`
-- [ ] Target: `CreateAcceptance`, `MergeAcceptance`, `SetAcceptance`,
-      `DeleteAcceptance`; TCK ~75%
+- [x] `SET n.prop = value`, `SET n += {map}`, `SET n = {map}`
+- [x] `SET n:Label`, `REMOVE n:Label`, `REMOVE n.prop`
+- [x] `DELETE n`, `DETACH DELETE n`
+- [x] Target: `CreateAcceptance`, `MergeAcceptance`, `SetAcceptance`,
+      `DeleteAcceptance`; TCK pass rate improved significantly
 
 **v0.12.x — Insert performance + AGE comparison benchmark**:
 

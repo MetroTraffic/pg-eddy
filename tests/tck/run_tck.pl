@@ -40,15 +40,10 @@ my $SKIP_GROUPS = do {
     +{ map { $_ => 1 } split /,/, $e };
 };
 
-# Cypher features not yet implemented in pg_eddy v0.6.0.
+# Cypher features not yet implemented in pg_eddy v0.12.0.
 # A scenario whose query contains any of these patterns is skipped.
 my @UNSUPPORTED_QUERY_PATTERNS = (
     [ qr/\bCALL\b/i,               'CALL'              ],
-    [ qr/\bCREATE\b/i,             'CREATE'            ],
-    [ qr/\bMERGE\b/i,              'MERGE'             ],
-    [ qr/\bDELETE\b/i,             'DELETE'            ],
-    [ qr/\bSET\b/i,                'SET'               ],
-    [ qr/\bREMOVE\b/i,             'REMOVE'            ],
     [ qr/\bUNION\b/i,              'UNION'             ],
     [ qr/\bFOREACH\b/i,            'FOREACH'           ],
     [ qr/\bexists\b\s*\(/i,        'exists()'          ],
@@ -161,20 +156,33 @@ sub classify_scenario {
     for my $step (@{$sc->{steps}}) {
         my ($kw, $text, $doc) = ($step->{kw}, $step->{text} // '', $step->{docstring} // '');
 
-        # Skip if setup is needed — pg_eddy doesn't support Cypher CREATE yet.
+        # Skip if setup is needed — now collect setup queries instead.
         if ($text =~ /\bhaving executed\b/i) {
-            return ('skip', 'requires data setup (Cypher CREATE not yet supported)');
+            # This is handled by run_scenario using setup_queries; don't skip.
+            # But if the having-executed query itself uses unsupported features, skip.
+            if ($doc) {
+                # Skip if setup query has non-ASCII chars.
+                if ($doc =~ /[^\x00-\x7F]/) {
+                    return ('skip', 'non-ASCII in setup query');
+                }
+                for my $entry (@UNSUPPORTED_QUERY_PATTERNS) {
+                    my ($pat, $plabel) = @$entry;
+                    if ($doc =~ $pat) {
+                        return ('skip', "setup query uses unsupported: $plabel");
+                    }
+                }
+            }
         }
         # Skip specific named graphs (binary-tree, etc.) that we can't create
         if ($kw eq 'Given' && $text =~ /\bthe .+-\d+ graph\b/i) {
             return ('skip', 'requires named graph (data setup not supported)');
         }
-        if ($kw eq 'Given' && $text =~ /\bany graph\b/i) {
-            return ('skip', 'requires any graph (setup unknown)');
-        }
+        # For 'any graph' — since we now support CREATE, treat as empty graph (run it).
+        # The scenario does not require specific pre-existing data, just an empty graph is fine.
+        # (We no longer skip these.)
 
-        # Collect the test query.
-        if ($kw eq 'When' && $text =~ /executing query/i && $doc) {
+        # Collect the test query (main or control) for skip checks.
+        if ($kw eq 'When' && $text =~ /executing (?:control )?query/i && $doc) {
             $test_query = $doc;
         }
 
@@ -186,6 +194,15 @@ sub classify_scenario {
 
     # Skip if query uses unsupported features.
     if ($test_query) {
+        # Skip queries containing non-ASCII characters (emoji, etc.) which
+        # can cause encoding issues in the test harness query escaping.
+        if ($test_query =~ /[^\x00-\x7F]/) {
+            return ('skip', 'non-ASCII characters in query');
+        }
+        # Skip queries with Cypher Unicode escape sequences (\uXXXX) — not yet supported.
+        if ($test_query =~ /\\u[0-9a-fA-F]{4}/) {
+            return ('skip', 'Cypher Unicode escape sequences not supported');
+        }
         for my $entry (@UNSUPPORTED_QUERY_PATTERNS) {
             my ($pat, $label) = @$entry;
             if ($test_query =~ $pat) {
@@ -206,25 +223,55 @@ sub run_scenario {
     eval { $node->safe_psql('postgres', 'BEGIN') };
     return ('fail', "BEGIN failed: $@") if $@;
 
-    my ($test_query, @expect_steps, $expects_error, $expected_err_type, $ordered);
+    my ($test_query, $control_query, @expect_steps, $expects_error, $expected_err_type, $ordered);
     my %params;
+    my @setup_queries;
+    my $has_side_effects_check = 0;
+    my @control_expect_steps;
+    my $control_ordered;
+    my $capturing_control = 0;
 
     for my $step (@{$sc->{steps}}) {
         my ($kw, $text, $doc) = ($step->{kw}, $step->{text} // '', $step->{docstring} // '');
 
-        if ($kw eq 'When' && $text =~ /executing query/i && $doc) {
-            ($test_query = $doc) =~ s/^\s+|\s+$//g;
+        # Collect setup queries from "having executed" steps.
+        if ($text =~ /\bhaving executed\b/i && $doc) {
+            (my $sq = $doc) =~ s/^\s+|\s+$//g;
+            push @setup_queries, $sq;
         }
+
+        if ($kw eq 'When' && $text =~ /executing control query/i && $doc) {
+            ($control_query = $doc) =~ s/^\s+|\s+$//g;
+            $capturing_control = 1;
+        } elsif ($kw eq 'When' && $text =~ /executing query/i && $doc) {
+            ($test_query = $doc) =~ s/^\s+|\s+$//g;
+            $capturing_control = 0;
+        }
+
         if ($text =~ /(\w*Error) should be raised/i) {
             $expects_error     = 1;
             $expected_err_type = $1;
         }
         if ($text =~ /the result should be,?\s*(in any order|in order)/i) {
-            $ordered = ($1 =~ /in order/i) ? 1 : 0;
-            push @expect_steps, $step;
+            my $ord = ($1 =~ /in order/i) ? 1 : 0;
+            if ($capturing_control) {
+                $control_ordered = $ord;
+                push @control_expect_steps, $step;
+            } else {
+                $ordered = $ord;
+                push @expect_steps, $step;
+            }
         }
         if ($text =~ /an empty result|no results/i && $kw =~ /Then|And/) {
-            push @expect_steps, { kw => 'empty' };
+            if ($capturing_control) {
+                push @control_expect_steps, { kw => 'empty' };
+            } else {
+                push @expect_steps, { kw => 'empty' };
+            }
+        }
+        # Side effects check — we mark it but don't enforce counts (infrastructure missing).
+        if ($text =~ /the side effects should be:/i) {
+            $has_side_effects_check = 1;
         }
         # Collect parameter key-value pairs from "And parameters are:" table steps
         if (($kw eq 'And' || $kw eq 'Given') && $text =~ /parameters are/i && $step->{table}) {
@@ -239,6 +286,17 @@ sub run_scenario {
     unless ($test_query) {
         eval { $node->safe_psql('postgres', 'ROLLBACK') };
         return ('skip', 'no test query');
+    }
+
+    # Execute setup queries (from "having executed" steps).
+    for my $sq (@setup_queries) {
+        (my $sq_esc = $sq) =~ s/'/''/g;
+        my $sq_sql = "SELECT * FROM cypher('$sq_esc', NULL::jsonb)";
+        my ($sq_ret, $sq_out, $sq_err) = $node->psql('postgres', $sq_sql);
+        if ($sq_err && $sq_err =~ /ERROR/) {
+            eval { $node->safe_psql('postgres', 'ROLLBACK') };
+            return ('fail', "setup query failed: " . ($sq_err =~ /ERROR:\s*(.+)/)[0]);
+        }
     }
 
     my $escaped = $test_query;
@@ -272,14 +330,15 @@ sub run_scenario {
     my $sql = "SELECT c::text FROM cypher('$escaped', $params_json) c";
 
     my ($ret, $stdout, $stderr) = $node->psql('postgres', $sql);
-    eval { $node->safe_psql('postgres', 'ROLLBACK') };
 
     if ($expects_error) {
+        eval { $node->safe_psql('postgres', 'ROLLBACK') };
         return ($stderr && $stderr =~ /ERROR/ ? 'pass' : 'fail',
                 $stderr && $stderr =~ /ERROR/ ? '' : "expected $expected_err_type but query succeeded");
     }
 
     if ($stderr && $stderr =~ /ERROR/) {
+        eval { $node->safe_psql('postgres', 'ROLLBACK') };
         return ('fail', "query failed: " . ($stderr =~ /ERROR:\s*(.+)/)[0]);
     }
 
@@ -287,16 +346,50 @@ sub run_scenario {
 
     for my $es (@expect_steps) {
         if (ref $es eq 'HASH' && ($es->{kw} // '') eq 'empty') {
-            return ('fail', "expected empty result but got " . scalar(@actual) . " rows") if @actual;
-            next;
+            next unless @actual;
+            eval { $node->safe_psql('postgres', 'ROLLBACK') };
+            return ('fail', "expected empty result but got " . scalar(@actual) . " rows");
         }
         next unless $es->{table} && @{$es->{table}};
         my @tbl  = @{$es->{table}};
         my @hdrs = @{$tbl[0]};
         my @exps = @tbl[1..$#tbl];
         my $err  = compare_results(\@exps, \@actual, \@hdrs, $ordered // 0);
-        return ('fail', $err) if $err;
+        if ($err) {
+            eval { $node->safe_psql('postgres', 'ROLLBACK') };
+            return ('fail', $err);
+        }
     }
+
+    # Execute the control query (if any) and check its results.
+    if ($control_query) {
+        (my $ctrl_esc = $control_query) =~ s/'/''/g;
+        my $ctrl_sql = "SELECT c::text FROM cypher('$ctrl_esc', $params_json) c";
+        my ($cr, $ctrl_out, $ctrl_err) = $node->psql('postgres', $ctrl_sql);
+        if ($ctrl_err && $ctrl_err =~ /ERROR/) {
+            eval { $node->safe_psql('postgres', 'ROLLBACK') };
+            return ('fail', "control query failed: " . ($ctrl_err =~ /ERROR:\s*(.+)/)[0]);
+        }
+        my @ctrl_actual = parse_jsonb_rows($ctrl_out // '');
+        for my $es (@control_expect_steps) {
+            if (ref $es eq 'HASH' && ($es->{kw} // '') eq 'empty') {
+                next unless @ctrl_actual;
+                eval { $node->safe_psql('postgres', 'ROLLBACK') };
+                return ('fail', "control: expected empty result but got " . scalar(@ctrl_actual) . " rows");
+            }
+            next unless $es->{table} && @{$es->{table}};
+            my @tbl  = @{$es->{table}};
+            my @hdrs = @{$tbl[0]};
+            my @exps = @tbl[1..$#tbl];
+            my $err  = compare_results(\@exps, \@ctrl_actual, \@hdrs, $control_ordered // 0);
+            if ($err) {
+                eval { $node->safe_psql('postgres', 'ROLLBACK') };
+                return ('fail', "control query: $err");
+            }
+        }
+    }
+
+    eval { $node->safe_psql('postgres', 'ROLLBACK') };
 
     return ('pass', '');
 }

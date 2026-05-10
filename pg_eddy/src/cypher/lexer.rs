@@ -26,10 +26,13 @@ pub enum Token {
     Null,
     True,
     False,
-    Create,   // reserved for v0.12.0
-    Delete,   // reserved for v0.12.0
-    Detach,   // reserved for v0.12.0
-    Set,      // reserved for v0.12.0
+    Create,   // v0.12.0 write clause
+    Delete,   // v0.12.0 write clause
+    Detach,   // v0.12.0 write clause
+    Set,      // v0.12.0 write clause
+    Merge,    // v0.12.0 write clause
+    Remove,   // v0.12.0 write clause
+    On,       // ON CREATE / ON MATCH in MERGE (v0.12.0)
     Call,     // CALL clause (v0.11.0)
     Yield,    // YIELD in CALL (v0.11.0)
     With,     // WITH clause (also used in STARTS WITH / ENDS WITH)
@@ -74,6 +77,7 @@ pub enum Token {
     Ge,         // >=
     RegexMatch, // =~
     Plus,       // +
+    PlusEq,     // +=
     Star,       // *
     Slash,      // /
     Percent,    // %
@@ -349,6 +353,9 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
                 "DELETE" => Token::Delete,
                 "DETACH" => Token::Detach,
                 "SET" => Token::Set,
+                "MERGE" => Token::Merge,
+                "REMOVE" => Token::Remove,
+                "ON" => Token::On,
                 "CALL" => Token::Call,
                 "YIELD" => Token::Yield,
                 "WITH" => Token::With,
@@ -375,7 +382,15 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
             b':' => { tokens.push(SpannedToken { token: Token::Colon, offset: start }); pos += 1; }
             b',' => { tokens.push(SpannedToken { token: Token::Comma, offset: start }); pos += 1; }
             b'|' => { tokens.push(SpannedToken { token: Token::Pipe, offset: start }); pos += 1; }
-            b'+' => { tokens.push(SpannedToken { token: Token::Plus, offset: start }); pos += 1; }
+            b'+' => {
+                if pos + 1 < bytes.len() && bytes[pos + 1] == b'=' {
+                    tokens.push(SpannedToken { token: Token::PlusEq, offset: start });
+                    pos += 2;
+                } else {
+                    tokens.push(SpannedToken { token: Token::Plus, offset: start });
+                    pos += 1;
+                }
+            }
             b'*' => { tokens.push(SpannedToken { token: Token::Star, offset: start }); pos += 1; }
             b'%' => { tokens.push(SpannedToken { token: Token::Percent, offset: start }); pos += 1; }
             b'^' => { tokens.push(SpannedToken { token: Token::Caret, offset: start }); pos += 1; }

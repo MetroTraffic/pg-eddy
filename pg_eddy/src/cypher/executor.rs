@@ -204,6 +204,22 @@ pub fn execute(
         LogicalPlan::Empty => {
             Ok(Vec::new())
         }
+        // v0.12.0 write plan nodes
+        LogicalPlan::CreatePattern { input, patterns } => {
+            exec_create_pattern(input, patterns, params)
+        }
+        LogicalPlan::SetProp { input, items } => {
+            exec_set_prop(input, items, params)
+        }
+        LogicalPlan::RemoveProp { input, items } => {
+            exec_remove_prop(input, items, params)
+        }
+        LogicalPlan::DeleteNodes { input, exprs, detach } => {
+            exec_delete_nodes(input, exprs, *detach, params)
+        }
+        LogicalPlan::MergePattern { input, pattern, on_create, on_match } => {
+            exec_merge_pattern(input, pattern, on_create, on_match, params)
+        }
     }
 }
 
@@ -2869,4 +2885,676 @@ pub fn rows_to_jsonb(rows: Vec<Row>) -> Vec<pgrx::JsonB> {
         }
         pgrx::JsonB(serde_json::Value::Object(m))
     }).collect()
+}
+
+// ===========================================================================
+// v0.12.0: Write clause executors
+// ===========================================================================
+
+/// Execute CREATE patterns, creating nodes and relationships.
+/// For each input row, create all pattern nodes/rels and pass through the row
+/// (augmented with any new variables introduced by CREATE).
+fn exec_create_pattern(
+    input: &LogicalPlan,
+    patterns: &[Pattern],
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<Row>, ExecError> {
+    let input_rows = execute(input, params)?;
+    let mut result = Vec::new();
+    for row in input_rows {
+        let mut new_row = row.clone();
+        // Execute each pattern in sequence, materialising new nodes and rels.
+        for pattern in patterns {
+            create_pattern_in_row(pattern, &mut new_row, params)?;
+        }
+        result.push(new_row);
+    }
+    // If there were no input rows (empty pipeline), create once.
+    if result.is_empty() && matches!(input, LogicalPlan::SingleRow) {
+        let mut new_row = Row::new();
+        for pattern in patterns {
+            create_pattern_in_row(pattern, &mut new_row, params)?;
+        }
+        result.push(new_row);
+    }
+    Ok(result)
+}
+
+/// Create a single pattern (sequence of nodes/rels) updating `row` with new vars.
+fn create_pattern_in_row(
+    pattern: &Pattern,
+    row: &mut Row,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<(), ExecError> {
+    use crate::catalog::labels::{ensure_label, ensure_prop_key, ensure_rel_type, next_node_id, next_edge_id};
+    use crate::storage::{prop_store, node_store, edge_store};
+
+    let mut last_node_id: Option<i64> = None;
+
+    for (i, elem) in pattern.elements.iter().enumerate() {
+        match elem {
+            PatternElement::Node(n) => {
+                let var = n.variable.as_deref();
+
+                // If the node has a variable and it's already bound, reuse it.
+                if let Some(v) = var
+                    && let Some(existing) = row.get(v)
+                        && let Value::Node { node_id, .. } = existing {
+                            last_node_id = Some(*node_id);
+                            continue;
+                        }
+
+                // Create a new node.
+                let labels: Vec<String> = n.labels.clone();
+                let label_ids: Vec<i32> = labels.iter().map(|l| ensure_label(l)).collect();
+
+                // Evaluate properties.
+                let mut prop_map = serde_json::Map::new();
+                for (k, expr) in &n.properties {
+                    let v = eval_expr(expr, row, params)?;
+                    prop_map.insert(k.clone(), v.to_json());
+                }
+                let prop_bytes = prop_store::encode(&prop_map, |name| -> Result<i32, std::convert::Infallible> {
+                    Ok(ensure_prop_key(name))
+                }).unwrap_or_default();
+
+                let node_id = next_node_id();
+                unsafe {
+                    let rel = crate::open_nodes_relation();
+                    node_store::insert_node(rel, node_id, &label_ids, &prop_bytes);
+                    pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                }
+                // Maintain label_index.
+                for lid in &label_ids {
+                    pgrx::Spi::run_with_args(
+                        "INSERT INTO _pg_eddy.label_index(label_id, node_id) VALUES ($1, $2)",
+                        &[pgrx::datum::DatumWithOid::from(*lid), pgrx::datum::DatumWithOid::from(node_id)],
+                    ).unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index insert: {e}"));
+                }
+
+                let node_val = Value::Node { node_id, labels: labels.clone(), properties: prop_map };
+                if let Some(v) = var {
+                    row.insert(v.to_string(), node_val);
+                }
+                last_node_id = Some(node_id);
+            }
+            PatternElement::Relationship(r) => {
+                if i == 0 {
+                    return Err(ExecError { message: "pattern cannot start with a relationship".into() });
+                }
+
+                let src_id = last_node_id.ok_or_else(|| ExecError {
+                    message: "no source node for relationship".into(),
+                })?;
+
+                // Peek at the next element to get the destination node id.
+                let next_elem = pattern.elements.get(i + 1);
+                let dst_id = match next_elem {
+                    Some(PatternElement::Node(n2)) => {
+                        // If destination is already bound, use its id; otherwise will be created by next iteration.
+                        // We create destination nodes eagerly here to handle forward references.
+                        let var = n2.variable.as_deref();
+                        if let Some(v) = var {
+                            if let Some(existing) = row.get(v) {
+                                if let Value::Node { node_id, .. } = existing {
+                                    *node_id
+                                } else {
+                                    return Err(ExecError { message: format!("variable {} is not a node", v) });
+                                }
+                            } else {
+                                // Pre-create the destination node so we can form the edge.
+                                let labels: Vec<String> = n2.labels.clone();
+                                let label_ids: Vec<i32> = labels.iter().map(|l| ensure_label(l)).collect();
+                                let mut prop_map = serde_json::Map::new();
+                                for (k, expr) in &n2.properties {
+                                    let v2 = eval_expr(expr, row, params)?;
+                                    prop_map.insert(k.clone(), v2.to_json());
+                                }
+                                let prop_bytes = prop_store::encode(&prop_map, |name| -> Result<i32, std::convert::Infallible> {
+                                    Ok(ensure_prop_key(name))
+                                }).unwrap_or_default();
+                                let nid = next_node_id();
+                                unsafe {
+                                    let rel = crate::open_nodes_relation();
+                                    node_store::insert_node(rel, nid, &label_ids, &prop_bytes);
+                                    pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                                }
+                                for lid in &label_ids {
+                                    pgrx::Spi::run_with_args(
+                                        "INSERT INTO _pg_eddy.label_index(label_id, node_id) VALUES ($1, $2)",
+                                        &[pgrx::datum::DatumWithOid::from(*lid), pgrx::datum::DatumWithOid::from(nid)],
+                                    ).unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index insert: {e}"));
+                                }
+                                let node_val = Value::Node { node_id: nid, labels, properties: prop_map };
+                                if let Some(v) = var {
+                                    row.insert(v.to_string(), node_val);
+                                }
+                                // Track this as the last node so the next iteration skips it.
+                                last_node_id = Some(nid);
+                                nid
+                            }
+                        } else {
+                            // Anonymous destination node — create it.
+                            let labels: Vec<String> = n2.labels.clone();
+                            let label_ids: Vec<i32> = labels.iter().map(|l| ensure_label(l)).collect();
+                            let mut prop_map = serde_json::Map::new();
+                            for (k, expr) in &n2.properties {
+                                let vv = eval_expr(expr, row, params)?;
+                                prop_map.insert(k.clone(), vv.to_json());
+                            }
+                            let prop_bytes = prop_store::encode(&prop_map, |name| -> Result<i32, std::convert::Infallible> {
+                                Ok(ensure_prop_key(name))
+                            }).unwrap_or_default();
+                            let nid = next_node_id();
+                            unsafe {
+                                let rel = crate::open_nodes_relation();
+                                node_store::insert_node(rel, nid, &label_ids, &prop_bytes);
+                                pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                            }
+                            for lid in &label_ids {
+                                pgrx::Spi::run_with_args(
+                                    "INSERT INTO _pg_eddy.label_index(label_id, node_id) VALUES ($1, $2)",
+                                    &[pgrx::datum::DatumWithOid::from(*lid), pgrx::datum::DatumWithOid::from(nid)],
+                                ).unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index insert: {e}"));
+                            }
+                            last_node_id = Some(nid);
+                            nid
+                        }
+                    }
+                    _ => return Err(ExecError { message: "relationship must be followed by a node".into() }),
+                };
+
+                // Create the relationship.
+                let rel_type = r.rel_types.first().cloned().unwrap_or_else(|| "RELATED_TO".to_string());
+                let type_id = ensure_rel_type(&rel_type);
+                let mut prop_map = serde_json::Map::new();
+                for (k, expr) in &r.properties {
+                    let v = eval_expr(expr, row, params)?;
+                    prop_map.insert(k.clone(), v.to_json());
+                }
+                let prop_bytes = prop_store::encode(&prop_map, |name| -> Result<i32, std::convert::Infallible> {
+                    Ok(ensure_prop_key(name))
+                }).unwrap_or_default();
+
+                let (actual_src, actual_dst) = match r.direction {
+                    RelDirection::In => (dst_id, src_id),
+                    _ => (src_id, dst_id),
+                };
+
+                let edge_id = next_edge_id();
+                unsafe {
+                    let node_rel = crate::open_nodes_relation();
+                    let edge_rel = crate::open_edges_relation();
+                    edge_store::insert_edge(node_rel, edge_rel, edge_id, type_id, actual_src, actual_dst, &prop_bytes);
+                    pgrx::pg_sys::table_close(edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                    pgrx::pg_sys::table_close(node_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                }
+                pgrx::Spi::run_with_args(
+                    "INSERT INTO _pg_eddy.edge_type_src(type_id, src_node_id, edge_id) VALUES ($1, $2, $3)",
+                    &[pgrx::datum::DatumWithOid::from(type_id), pgrx::datum::DatumWithOid::from(actual_src), pgrx::datum::DatumWithOid::from(edge_id)],
+                ).unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_src insert: {e}"));
+                pgrx::Spi::run_with_args(
+                    "INSERT INTO _pg_eddy.edge_type_dst(type_id, dst_node_id, edge_id) VALUES ($1, $2, $3)",
+                    &[pgrx::datum::DatumWithOid::from(type_id), pgrx::datum::DatumWithOid::from(actual_dst), pgrx::datum::DatumWithOid::from(edge_id)],
+                ).unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_dst insert: {e}"));
+
+                if let Some(rv) = &r.variable {
+                    let edge_val = Value::Edge { edge_id, rel_type, source: actual_src, target: actual_dst, properties: prop_map };
+                    row.insert(rv.clone(), edge_val);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Execute SET clause: modify properties or labels on bound nodes/rels.
+fn exec_set_prop(
+    input: &LogicalPlan,
+    items: &[SetItem],
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<Row>, ExecError> {
+    use crate::catalog::labels::{ensure_label, ensure_prop_key, label_name, prop_key_name, label_id_by_name};
+    use crate::storage::{prop_store, node_store};
+
+    let input_rows = execute(input, params)?;
+    let mut result = Vec::new();
+
+    for mut row in input_rows {
+        for item in items {
+            match item {
+                SetItem::Property(prop_expr, val_expr) => {
+                    // prop_expr is Expr::Property(Expr::Variable(v), key)
+                    let (var, key) = match prop_expr {
+                        Expr::Property(inner, k) => {
+                            match inner.as_ref() {
+                                Expr::Variable(v) => (v.clone(), k.clone()),
+                                _ => return Err(ExecError { message: "SET property must reference a variable".into() }),
+                            }
+                        }
+                        _ => return Err(ExecError { message: "SET property must reference a property access".into() }),
+                    };
+                    let val = eval_expr(val_expr, &row, params)?;
+                    // Load current node state.
+                    let node_id = node_id_from_row(&row, &var)?;
+                    let mut rec = load_node(node_id)?;
+                    // Resolve overflow if needed.
+                    if rec.overflow_blkno != 0 && rec.prop_bytes.is_empty() {
+                        rec.prop_bytes = unsafe {
+                            let rel = crate::open_nodes_relation();
+                            let bytes = node_store::read_overflow_block(rel, rec.overflow_blkno);
+                            pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                            bytes
+                        };
+                    }
+                    let mut props = prop_store::decode(&rec.prop_bytes, prop_key_name);
+                    if val == Value::Null {
+                        props.remove(&key);
+                    } else {
+                        props.insert(key.clone(), val.to_json());
+                    }
+                    let new_bytes = prop_store::encode(&props, |name| -> Result<i32, std::convert::Infallible> {
+                        Ok(ensure_prop_key(name))
+                    }).unwrap_or_default();
+                    unsafe {
+                        let rel = crate::open_nodes_relation();
+                        node_store::update_node(rel, node_id, &rec.label_ids, &new_bytes);
+                        pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                    }
+                    // Update in-memory row value.
+                    if let Some(Value::Node { properties, .. }) = row.get_mut(&var) {
+                        if val == Value::Null {
+                            properties.remove(&key);
+                        } else {
+                            properties.insert(key.clone(), val.to_json());
+                        }
+                    }
+                }
+                SetItem::Variable(var, val_expr) => {
+                    // n = {map} — replace all properties.
+                    let val = eval_expr(val_expr, &row, params)?;
+                    let new_props = match val.to_json() {
+                        serde_json::Value::Object(m) => m,
+                        _ => return Err(ExecError { message: format!("SET {var} = must be a map") }),
+                    };
+                    let node_id = node_id_from_row(&row, var)?;
+                    let rec = load_node(node_id)?;
+                    let new_bytes = prop_store::encode(&new_props, |name| -> Result<i32, std::convert::Infallible> {
+                        Ok(ensure_prop_key(name))
+                    }).unwrap_or_default();
+                    unsafe {
+                        let rel = crate::open_nodes_relation();
+                        node_store::update_node(rel, node_id, &rec.label_ids, &new_bytes);
+                        pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                    }
+                    if let Some(Value::Node { properties, .. }) = row.get_mut(var) {
+                        *properties = new_props;
+                    }
+                }
+                SetItem::MergeMap(var, val_expr) => {
+                    // n += {map} — merge properties.
+                    let val = eval_expr(val_expr, &row, params)?;
+                    let extra = match val.to_json() {
+                        serde_json::Value::Object(m) => m,
+                        _ => return Err(ExecError { message: format!("SET {var} += must be a map") }),
+                    };
+                    let node_id = node_id_from_row(&row, var)?;
+                    let mut rec = load_node(node_id)?;
+                    if rec.overflow_blkno != 0 && rec.prop_bytes.is_empty() {
+                        rec.prop_bytes = unsafe {
+                            let rel = crate::open_nodes_relation();
+                            let bytes = node_store::read_overflow_block(rel, rec.overflow_blkno);
+                            pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                            bytes
+                        };
+                    }
+                    let mut props = prop_store::decode(&rec.prop_bytes, prop_key_name);
+                    for (k, v) in extra.iter() {
+                        if v.is_null() {
+                            props.remove(k);
+                        } else {
+                            props.insert(k.clone(), v.clone());
+                        }
+                    }
+                    let new_bytes = prop_store::encode(&props, |name| -> Result<i32, std::convert::Infallible> {
+                        Ok(ensure_prop_key(name))
+                    }).unwrap_or_default();
+                    unsafe {
+                        let rel = crate::open_nodes_relation();
+                        node_store::update_node(rel, node_id, &rec.label_ids, &new_bytes);
+                        pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                    }
+                    if let Some(Value::Node { properties, .. }) = row.get_mut(var) {
+                        for (k, v) in &extra {
+                            if v.is_null() {
+                                properties.remove(k);
+                            } else {
+                                properties.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                }
+                SetItem::Label(var, new_labels) => {
+                    // n:Label — add labels to node.
+                    let node_id = node_id_from_row(&row, var)?;
+                    let mut rec = load_node(node_id)?;
+                    if rec.overflow_blkno != 0 && rec.prop_bytes.is_empty() {
+                        rec.prop_bytes = unsafe {
+                            let rel = crate::open_nodes_relation();
+                            let bytes = node_store::read_overflow_block(rel, rec.overflow_blkno);
+                            pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                            bytes
+                        };
+                    }
+                    let mut label_ids = rec.label_ids.clone();
+                    for lname in new_labels {
+                        let lid = ensure_label(lname);
+                        if !label_ids.contains(&lid) {
+                            label_ids.push(lid);
+                            pgrx::Spi::run_with_args(
+                                "INSERT INTO _pg_eddy.label_index(label_id, node_id) VALUES ($1, $2)",
+                                &[pgrx::datum::DatumWithOid::from(lid), pgrx::datum::DatumWithOid::from(node_id)],
+                            ).unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index insert: {e}"));
+                        }
+                    }
+                    unsafe {
+                        let rel = crate::open_nodes_relation();
+                        node_store::update_node(rel, node_id, &label_ids, &rec.prop_bytes);
+                        pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                    }
+                    // Update in-memory node labels.
+                    if let Some(Value::Node { labels, .. }) = row.get_mut(var) {
+                        for lname in new_labels {
+                            if !labels.contains(lname) {
+                                labels.push(lname.clone());
+                            }
+                        }
+                    }
+                    let _ = label_id_by_name; // suppress unused warning
+                    let _ = label_name;
+                }
+            }
+        }
+        result.push(row);
+    }
+    Ok(result)
+}
+
+/// Execute REMOVE clause: remove properties or labels from bound nodes.
+fn exec_remove_prop(
+    input: &LogicalPlan,
+    items: &[RemoveItem],
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<Row>, ExecError> {
+    use crate::catalog::labels::{label_id_by_name, ensure_prop_key, prop_key_name};
+    use crate::storage::{prop_store, node_store};
+
+    let input_rows = execute(input, params)?;
+    let mut result = Vec::new();
+
+    for mut row in input_rows {
+        for item in items {
+            match item {
+                RemoveItem::Property(var_expr, key) => {
+                    let var = if let Expr::Variable(v) = var_expr { v } else {
+                        return Err(ExecError { message: "REMOVE property must reference a variable".into() });
+                    };
+                    let node_id = node_id_from_row(&row, var)?;
+                    let mut rec = load_node(node_id)?;
+                    if rec.overflow_blkno != 0 && rec.prop_bytes.is_empty() {
+                        rec.prop_bytes = unsafe {
+                            let rel = crate::open_nodes_relation();
+                            let bytes = node_store::read_overflow_block(rel, rec.overflow_blkno);
+                            pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                            bytes
+                        };
+                    }
+                    let mut props = prop_store::decode(&rec.prop_bytes, prop_key_name);
+                    props.remove(key);
+                    let new_bytes = prop_store::encode(&props, |name| -> Result<i32, std::convert::Infallible> {
+                        Ok(ensure_prop_key(name))
+                    }).unwrap_or_default();
+                    unsafe {
+                        let rel = crate::open_nodes_relation();
+                        node_store::update_node(rel, node_id, &rec.label_ids, &new_bytes);
+                        pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                    }
+                    if let Some(Value::Node { properties, .. }) = row.get_mut(var) {
+                        properties.remove(key);
+                    }
+                }
+                RemoveItem::Label(var, rm_labels) => {
+                    let node_id = node_id_from_row(&row, var)?;
+                    let mut rec = load_node(node_id)?;
+                    if rec.overflow_blkno != 0 && rec.prop_bytes.is_empty() {
+                        rec.prop_bytes = unsafe {
+                            let rel = crate::open_nodes_relation();
+                            let bytes = node_store::read_overflow_block(rel, rec.overflow_blkno);
+                            pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                            bytes
+                        };
+                    }
+                    let mut label_ids = rec.label_ids.clone();
+                    for lname in rm_labels {
+                        if let Some(lid) = label_id_by_name(lname) {
+                            label_ids.retain(|&l| l != lid);
+                            pgrx::Spi::run_with_args(
+                                "DELETE FROM _pg_eddy.label_index WHERE label_id = $1 AND node_id = $2",
+                                &[pgrx::datum::DatumWithOid::from(lid), pgrx::datum::DatumWithOid::from(node_id)],
+                            ).unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index delete: {e}"));
+                        }
+                    }
+                    unsafe {
+                        let rel = crate::open_nodes_relation();
+                        node_store::update_node(rel, node_id, &label_ids, &rec.prop_bytes);
+                        pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                    }
+                    if let Some(Value::Node { labels, .. }) = row.get_mut(var) {
+                        labels.retain(|l| !rm_labels.contains(l));
+                    }
+                }
+            }
+        }
+        result.push(row);
+    }
+    Ok(result)
+}
+
+/// Execute DELETE / DETACH DELETE.
+fn exec_delete_nodes(
+    input: &LogicalPlan,
+    exprs: &[Expr],
+    detach: bool,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<Row>, ExecError> {
+    use crate::catalog::labels::next_edge_id;
+    use crate::storage::edge_store::{Direction, adjacency_follow, delete_edge};
+    use crate::storage::node_store::delete_node_by_id;
+    use std::collections::HashSet;
+
+    let input_rows = execute(input, params)?;
+
+    for row in &input_rows {
+        for expr in exprs {
+            let val = eval_expr(expr, row, params)?;
+            match val {
+                Value::Node { node_id, .. } => {
+                    if detach {
+                        // Collect and delete all edges first.
+                        let all_edge_ids: Vec<i64> = unsafe {
+                            let node_rel = crate::open_nodes_relation();
+                            let edge_rel = crate::open_edges_relation();
+                            let snapshot = pgrx::pg_sys::GetActiveSnapshot();
+                            let out_edges = adjacency_follow(node_rel, edge_rel, node_id, Direction::Out, None, snapshot);
+                            let in_edges = adjacency_follow(node_rel, edge_rel, node_id, Direction::In, None, snapshot);
+                            pgrx::pg_sys::table_close(edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                            pgrx::pg_sys::table_close(node_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                            let mut seen: HashSet<i64> = HashSet::new();
+                            for e in out_edges.iter().chain(in_edges.iter()) { seen.insert(e.edge_id); }
+                            seen.into_iter().collect()
+                        };
+                        unsafe {
+                            let edge_rel = crate::open_edges_relation();
+                            for eid in &all_edge_ids { delete_edge(edge_rel, *eid); }
+                            pgrx::pg_sys::table_close(edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                        }
+                        if !all_edge_ids.is_empty() {
+                            pgrx::Spi::run_with_args(
+                                "DELETE FROM _pg_eddy.edge_type_src WHERE edge_id = ANY($1)",
+                                &[pgrx::datum::DatumWithOid::from(all_edge_ids.as_slice())],
+                            ).unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_src delete: {e}"));
+                            pgrx::Spi::run_with_args(
+                                "DELETE FROM _pg_eddy.edge_type_dst WHERE edge_id = ANY($1)",
+                                &[pgrx::datum::DatumWithOid::from(all_edge_ids.as_slice())],
+                            ).unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_dst delete: {e}"));
+                        }
+                    }
+                    // Delete the node.
+                    unsafe {
+                        let rel = crate::open_nodes_relation();
+                        delete_node_by_id(rel, node_id);
+                        pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                    }
+                    pgrx::Spi::run_with_args(
+                        "DELETE FROM _pg_eddy.label_index WHERE node_id = $1",
+                        &[pgrx::datum::DatumWithOid::from(node_id)],
+                    ).unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index delete: {e}"));
+                }
+                Value::Null => { /* no-op for null nodes */ }
+                other => {
+                    return Err(ExecError {
+                        message: format!("DELETE: expected a node, got {:?}", other),
+                    });
+                }
+            }
+        }
+    }
+    let _ = next_edge_id; // suppress unused import warning
+    Ok(Vec::new()) // DELETE returns no rows
+}
+
+/// Execute MERGE pattern.
+fn exec_merge_pattern(
+    input: &LogicalPlan,
+    pattern: &Pattern,
+    on_create: &[SetItem],
+    on_match: &[SetItem],
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<Row>, ExecError> {
+    use crate::cypher::planner::plan;
+
+    let input_rows = execute(input, params)?;
+    let mut result = Vec::new();
+
+    // Build a read-only match plan from the pattern.
+    let match_clause = crate::cypher::ast::QueryClause::Match {
+        optional: false,
+        patterns: vec![pattern.clone()],
+        where_clause: None,
+    };
+    let match_query = crate::cypher::ast::Query { clauses: vec![match_clause] };
+    let match_plan = plan(&match_query).map_err(|e| ExecError { message: e.message })?;
+
+    for outer_row in input_rows {
+        // Inject outer row bindings into params.
+        let mut merged_params = params.clone();
+        for (k, v) in &outer_row {
+            merged_params.insert(k.clone(), v.to_json());
+        }
+
+        // Try to match the pattern.
+        let matches = execute(&match_plan, &merged_params)?;
+
+        if matches.is_empty() {
+            // Pattern not found — CREATE it.
+            let mut new_row = outer_row.clone();
+            create_pattern_in_row(pattern, &mut new_row, params)?;
+            // Apply ON CREATE SET.
+            if !on_create.is_empty() {
+                // Run set with the new_row as context params.
+                let mut ctx = merged_params.clone();
+                for (k, v) in &new_row {
+                    ctx.insert(k.clone(), v.to_json());
+                }
+                let set_rows = exec_set_prop(
+                    &crate::cypher::planner::LogicalPlan::SingleRow,
+                    on_create,
+                    &ctx,
+                )?;
+                if let Some(set_row) = set_rows.into_iter().next() {
+                    for (k, v) in set_row {
+                        new_row.insert(k, v);
+                    }
+                }
+            }
+            result.push(new_row);
+        } else {
+            // Pattern found — apply ON MATCH SET to each match.
+            for mut match_row in matches {
+                // Merge outer row.
+                for (k, v) in &outer_row {
+                    match_row.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+                if !on_match.is_empty() {
+                    let mut ctx = merged_params.clone();
+                    for (k, v) in &match_row {
+                        ctx.insert(k.clone(), v.to_json());
+                    }
+                    // Re-execute set on the actual matched row.
+                    let set_rows = exec_set_prop(
+                        &crate::cypher::planner::LogicalPlan::SingleRow,
+                        on_match,
+                        &ctx,
+                    )?;
+                    if let Some(set_row) = set_rows.into_iter().next() {
+                        for (k, v) in set_row {
+                            match_row.insert(k, v);
+                        }
+                    }
+                }
+                result.push(match_row);
+            }
+        }
+    }
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Write-clause helpers
+// ---------------------------------------------------------------------------
+
+use crate::storage::node_store::NodeRecord;
+
+fn load_node(node_id: i64) -> Result<NodeRecord, ExecError> {
+    use crate::storage::node_store;
+    let rec = unsafe {
+        let rel = crate::open_nodes_relation();
+        let snapshot = pgrx::pg_sys::GetActiveSnapshot();
+        let r = node_store::find_node_by_id(rel, node_id, snapshot);
+        pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+        r
+    };
+    rec.ok_or_else(|| ExecError { message: format!("node {} not found", node_id) })
+}
+
+fn node_id_from_row(row: &Row, var: &str) -> Result<i64, ExecError> {
+    match row.get(var) {
+        Some(Value::Node { node_id, .. }) => Ok(*node_id),
+        Some(Value::Int(id)) => Ok(*id),
+        Some(other) => Err(ExecError { message: format!("variable {var} is not a node (got {:?})", other) }),
+        None => Err(ExecError { message: format!("variable {var} not in scope") }),
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Null, Value::Null) => true,
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            _ => false,
+        }
+    }
 }

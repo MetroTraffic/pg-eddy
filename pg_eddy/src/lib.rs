@@ -155,7 +155,7 @@ fn node_count() -> i64 {
 ///
 /// # Safety
 /// The returned `Relation` must be closed before the current transaction ends.
-unsafe fn open_nodes_relation() -> pgrx::pg_sys::Relation {
+pub(crate) unsafe fn open_nodes_relation() -> pgrx::pg_sys::Relation {
     use pgrx::pg_sys;
 
     // Resolve schema-qualified name.
@@ -176,7 +176,7 @@ unsafe fn open_nodes_relation() -> pgrx::pg_sys::Relation {
 ///
 /// # Safety
 /// The returned `Relation` must be closed before the current transaction ends.
-unsafe fn open_edges_relation() -> pgrx::pg_sys::Relation {
+pub(crate) unsafe fn open_edges_relation() -> pgrx::pg_sys::Relation {
     use pgrx::pg_sys;
 
     let schema_name = std::ffi::CString::new("_pg_eddy").unwrap();
@@ -1099,8 +1099,28 @@ fn cypher(query: &str, params: Option<pgrx::JsonB>) -> SetOfIterator<'static, pg
         Err(e) => error!("pg_eddy cypher exec error: {e}"),
     };
 
-    let results = cypher::executor::rows_to_jsonb(rows);
+    // Write queries that have no RETURN clause end with a write plan node (not Project).
+    // In that case, execute the side-effects but return zero rows.
+    let results = if is_write_only_plan(&plan) {
+        vec![]
+    } else {
+        cypher::executor::rows_to_jsonb(rows)
+    };
     SetOfIterator::new(results)
+}
+
+/// Returns true if the plan's root (terminal) node is a write node rather than Project.
+/// Used to suppress internal row output for write-only queries.
+fn is_write_only_plan(plan: &cypher::planner::LogicalPlan) -> bool {
+    use cypher::planner::LogicalPlan;
+    matches!(
+        plan,
+        LogicalPlan::CreatePattern { .. }
+            | LogicalPlan::SetProp { .. }
+            | LogicalPlan::RemoveProp { .. }
+            | LogicalPlan::DeleteNodes { .. }
+            | LogicalPlan::MergePattern { .. }
+    )
 }
 
 /// Return the logical execution plan for a Cypher query as text.
@@ -1732,6 +1752,72 @@ mod tests {
         // exists { } should parse without error.
         let q3 = parse("MATCH (n) WHERE exists { (n)-->() } RETURN n").expect("parse failed");
         let _ = plan(&q3).expect("plan failed");
+    }
+
+    #[pg_test]
+    fn test_cypher_create_node() {
+        // Create a node via Cypher and verify it exists.
+        Spi::run("SELECT * FROM cypher('CREATE (:CypherTestPerson {name: ''Alice''})', NULL::jsonb)").unwrap();
+        // Verify with a MATCH.
+        let count: i64 = Spi::get_one(
+            "SELECT count(*) FROM cypher('MATCH (n:CypherTestPerson) RETURN n.name', NULL::jsonb)"
+        ).unwrap().unwrap_or(0);
+        assert!(count >= 1, "Created node not found by MATCH, count={count}");
+    }
+
+    #[pg_test]
+    fn test_cypher_create_relationship() {
+        // Create two nodes and a relationship, then verify with MATCH.
+        Spi::run("SELECT * FROM cypher('CREATE (:CypherRelA {id: 1})-[:KNOWS]->(:CypherRelB {id: 2})', NULL::jsonb)").unwrap();
+        let count: i64 = Spi::get_one(
+            "SELECT count(*) FROM cypher('MATCH (a:CypherRelA)-[:KNOWS]->(b:CypherRelB) RETURN a', NULL::jsonb)"
+        ).unwrap().unwrap_or(0);
+        assert!(count >= 1, "Relationship not found after CREATE, count={count}");
+    }
+
+    #[pg_test]
+    fn test_cypher_set_property() {
+        // Create then SET a property.
+        Spi::run("SELECT * FROM cypher('CREATE (:CypherSetTest {x: 1})', NULL::jsonb)").unwrap();
+        Spi::run("SELECT * FROM cypher('MATCH (n:CypherSetTest) SET n.x = 99', NULL::jsonb)").unwrap();
+        let count: i64 = Spi::get_one(
+            "SELECT count(*) FROM cypher('MATCH (n:CypherSetTest) WHERE n.x = 99 RETURN n', NULL::jsonb)"
+        ).unwrap().unwrap_or(0);
+        assert!(count >= 1, "SET did not update property, count={count}");
+    }
+
+    #[pg_test]
+    fn test_cypher_delete_node() {
+        // Create a node, delete it, verify it's gone.
+        Spi::run("SELECT * FROM cypher('CREATE (:CypherDelTest {tag: ''bye''})', NULL::jsonb)").unwrap();
+        Spi::run("SELECT * FROM cypher('MATCH (n:CypherDelTest) DETACH DELETE n', NULL::jsonb)").unwrap();
+        let count: i64 = Spi::get_one(
+            "SELECT count(*) FROM cypher('MATCH (n:CypherDelTest) RETURN n', NULL::jsonb)"
+        ).unwrap().unwrap_or(0);
+        assert!(count == 0, "Node still exists after DETACH DELETE, count={count}");
+    }
+
+    #[pg_test]
+    fn test_write_parse_plan() {
+        // Verify CREATE, MERGE, SET, REMOVE, DELETE parse and plan without error.
+        use crate::cypher::parser::parse;
+        use crate::cypher::planner::{plan, explain};
+
+        let queries = [
+            "CREATE (n:Foo {x: 1})",
+            "CREATE (a:A)-[:REL]->(b:B)",
+            "MATCH (n:Foo) SET n.x = 2",
+            "MATCH (n:Foo) REMOVE n.x",
+            "MATCH (n:Foo) DELETE n",
+            "MATCH (n:Foo) DETACH DELETE n",
+            "MERGE (n:Foo {x: 1})",
+            "MERGE (n:Bar) ON CREATE SET n.created = true ON MATCH SET n.updated = true",
+        ];
+        for q_str in &queries {
+            let q = parse(q_str).unwrap_or_else(|e| pgrx::error!("parse failed for '{}': {}", q_str, e));
+            let p = plan(&q).unwrap_or_else(|e| pgrx::error!("plan failed for '{}': {}", q_str, e));
+            let _s = explain(&p, 0);
+        }
     }
 }
 

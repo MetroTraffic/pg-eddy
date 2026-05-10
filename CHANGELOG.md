@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.12.0](#0120--2026-05-10--cypher-write-language-create-merge-set-remove-delete) — Cypher Write Language: CREATE, MERGE, SET, REMOVE, DELETE
 - [0.11.0](#0110--2026-05-10--subqueries-exists-call--and-call-procedure-yield) — Subqueries: EXISTS {}, CALL {}, and CALL procedure YIELD
 - [0.10.0](#0100--2026-05-10--variable-length-paths-named-paths-and-path-functions) — Variable-Length Paths, Named Paths, and Path Functions
 - [0.9.0](#090--2026-05-09--aggregation-list-comprehensions-and-numeric-operators) — Aggregation, List Comprehensions, and Numeric Operators
@@ -18,6 +19,67 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 - [0.3.0](#030--2026-05-09--edge-storage--adjacency-lists) — Edge Storage + Adjacency Lists
 - [0.2.0](#020--2026-05-09--node-storage) — Node Storage
 - [0.1.0](#010--2026-05-09--am-skeleton) — AM Skeleton
+
+---
+
+## [0.12.0] — 2026-05-10 — Cypher Write Language: CREATE, MERGE, SET, REMOVE, DELETE
+
+v0.12.0 delivers the full Cypher write language, completing the read+write
+pipeline from lexer to storage. All five write clauses are now supported:
+`CREATE`, `MERGE`, `SET`, `REMOVE`, and `DELETE` (including `DETACH DELETE`).
+
+### What's New
+
+**CREATE**
+- `CREATE (n:Label {prop: val})` — create nodes with labels and properties
+- `CREATE (a)-[:REL_TYPE {prop: val}]->(b)` — create relationships with properties
+- `MATCH ... CREATE ...` — create new nodes/relationships for each matched row
+- Multi-hop patterns: `CREATE (a)-[:R]->(b)-[:R]->(c)` in a single clause
+
+**MERGE**
+- `MERGE (n:Label {prop: val})` — find or create a node matching the pattern
+- `MERGE ... ON CREATE SET n.x = 1` — set properties only when creating
+- `MERGE ... ON MATCH SET n.x = 1` — set properties only when finding existing
+- `MERGE` on relationship patterns with full ON CREATE / ON MATCH support
+
+**SET**
+- `SET n.prop = expr` — set a single property
+- `SET n = {map}` — replace all properties with a map literal
+- `SET n += {map}` — merge properties (add/overwrite, keep unset)
+- `SET n:Label` — add a label to a node
+
+**REMOVE**
+- `REMOVE n.prop` — delete a single property
+- `REMOVE n:Label` — remove a label from a node
+
+**DELETE / DETACH DELETE**
+- `DELETE n` — delete a node (fails if it has relationships)
+- `DETACH DELETE n` — delete a node and all its relationships
+
+### Pipeline Changes
+
+| Layer | Changes |
+|---|---|
+| Lexer | `Token::Merge`, `Token::Remove`, `Token::On`, `Token::PlusEq` (`+=`) |
+| AST | `QueryClause::{Create,Merge,Set,Remove,Delete}`, `SetItem`, `RemoveItem` |
+| Parser | Full write clause parsing; `MERGE ON CREATE`/`ON MATCH` sub-clauses |
+| Planner | `CreatePattern`, `MergePattern`, `SetProp`, `RemoveProp`, `DeleteNodes` |
+| Executor | Write executors using storage layer; `is_write_only_plan()` detection |
+
+### TCK Progress
+
+OpenCypher TCK pass rate improved from **188/3880** (v0.11.0) to **1254/3880**
+(v0.12.0), a gain of 1,066 newly passing scenarios enabled by write clause
+support. See README badge for the current count.
+
+### Unit Tests
+
+80 unit tests pass (up from 75 in v0.11.0), covering:
+- `test_cypher_create_node` — CREATE and re-MATCH a node with label + properties
+- `test_cypher_create_relationship` — CREATE nodes then a relationship between them
+- `test_cypher_set_property` — CREATE + SET a property, verify with MATCH
+- `test_cypher_delete_node` — CREATE then DELETE a node
+- `test_write_parse_plan` — parse all five write clause types without panic
 
 ---
 
