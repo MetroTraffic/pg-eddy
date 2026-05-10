@@ -1385,20 +1385,23 @@ the storage layer).
 - [x] TCK: 172/3881 overall (4.4%); 172/172 in-scope (100%)
 
 **v0.9.0 — Aggregation and functions**:
-- [ ] Aggregation: `COUNT(*)`, `COUNT(DISTINCT)`, `SUM`, `AVG`, `MIN`, `MAX`,
-      `COLLECT`, `COLLECT(DISTINCT)`, `stDev()`, `stDevP()`,
-      `percentileCont()`, `percentileDisc()`
-- [ ] List comprehensions: `[x IN list WHERE ... | expr]`
+- [x] Aggregation: `COUNT(*)`, `COUNT(DISTINCT)`, `SUM`, `AVG`, `MIN`, `MAX`,
+      `COLLECT`, `COLLECT(DISTINCT)`, `stDev()`, `stDevP()`
+- [x] List comprehensions: `[x IN list WHERE ... | expr]`
+- [x] List predicates: `any()`, `all()`, `none()`, `single()`
+- [x] XOR operator; exponentiation (`^`) left-associative; subscript; slice
+- [x] Null propagation: `compare_values` returns `Option<bool>`; boolean ordering
+- [x] List sort ordering: cross-type (null > list > number > string > bool)
+- [x] OPTIONAL MATCH null-safe isomorphism filter
+- [x] Column naming for `count(DISTINCT)`, `IS NULL`, `IS NOT NULL`, Compare/Arith
 - [x] String functions: `toLower()`, `toUpper()`, `trim()`, `ltrim()`,
       `rtrim()`, `substring()`, `replace()`, `split()` (done in v0.7.0);
       remaining: `left()`, `right()`
 - [x] Math functions: `abs()`, `ceil()`, `floor()`, `round()`, `sqrt()`,
       `sign()`, `log()`, `log10()`, `exp()`, `sin()`, `cos()`, `tan()`,
-      `asin()`, `acos()`, `atan()`, `atan2()` (done in v0.7.0);
-      remaining: `toRadians()`, `toDegrees()`, `rand()`, `randomUUID()`
-- [ ] `rand()`, `randomUUID()`
-- [ ] Target: pass `AggregationAcceptance`, `ExpressionAcceptance`,
-      `TypeConversionAcceptance`, `NullAcceptance`; TCK ~40%
+      `asin()`, `acos()`, `atan()`, `atan2()` (done in v0.7.0)
+- [ ] `percentileCont()`, `percentileDisc()`, `rand()`, `randomUUID()`
+- [x] TCK: 188/3880 overall (4.8%); 188/188 in-scope (100%)
 
 **v0.10.0 — Variable-length paths**:
 - [ ] Variable-length paths via bounded `WITH RECURSIVE` + PG18 `CYCLE` clause

@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.9.0](#090--2026-05-09--aggregation-list-comprehensions-and-numeric-operators) — Aggregation, List Comprehensions, and Numeric Operators
 - [0.8.0](#080--2026-05-09--with-optional-match-unwind-and-case-expressions) — WITH, OPTIONAL MATCH, UNWIND, and CASE Expressions
 - [0.7.0](#070--2026-05-09--cypher-predicates-ordering-and-built-in-functions) — Cypher Predicates, Ordering, and Built-in Functions
 - [0.6.0](#060--2026-05-09--cypher-query-engine) — Cypher Query Engine
@@ -15,6 +16,74 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 - [0.3.0](#030--2026-05-09--edge-storage--adjacency-lists) — Edge Storage + Adjacency Lists
 - [0.2.0](#020--2026-05-09--node-storage) — Node Storage
 - [0.1.0](#010--2026-05-09--am-skeleton) — AM Skeleton
+
+---
+
+## [0.9.0] — 2026-05-09 — Aggregation, List Comprehensions, and Numeric Operators
+
+v0.9.0 expands the Cypher engine with a complete aggregation suite, list
+comprehensions and predicates, correct numeric semantics, and full openCypher
+null propagation for comparisons. 188/188 in-scope TCK scenarios pass (100%).
+
+### New Cypher Features
+
+**Aggregation functions** — full suite: `count(*)`, `count(expr)`,
+`count(DISTINCT expr)`, `sum`, `avg`, `min`, `max`, `stdev`, `stdevp`,
+`collect`, `collect(DISTINCT expr)`. All aggregate functions correctly ignore
+null inputs and return null when the input set is empty (except `count` which
+returns 0).
+
+**List comprehensions**: `[x IN list WHERE pred | projection]` — filters a list
+and optionally transforms each element. The WHERE clause and projection are
+both optional.
+
+**List predicates**: `any(x IN list WHERE pred)`, `all(x IN list WHERE pred)`,
+`none(x IN list WHERE pred)`, `single(x IN list WHERE pred)`.
+
+**XOR operator**: `a XOR b` — boolean exclusive-or with full null propagation.
+
+**Exponentiation**: `x ^ y` — left-associative per the openCypher spec
+(`4^6^3 = (4^6)^3`).
+
+**List subscript and slice**: `list[i]`, `list[i..j]` — with null-safe
+element access.
+
+**List concatenation with scalar append**: `list + element`, `element + list`.
+
+### Correctness Fixes
+
+**Null propagation in all comparisons**: `compare_values` now returns
+`Option<bool>` — ordering operators (`<`, `>`, `<=`, `>=`) on null inputs
+produce null, while equality (`=`) between different types produces `false`
+rather than null.
+
+**List equality semantics**: `[a, b] = [c, d]` uses recursive element
+comparison with full null propagation. Lists of different lengths are
+definitively not equal (no null short-circuit on length mismatch).
+
+**Cross-type sort ordering**: `ORDER BY` now respects the openCypher type
+ordering: `null > lists > numbers > strings > booleans`. Mixed-type lists
+sort lexicographically with per-element type ordering.
+
+**Boolean ordering**: `false < true` is now correctly implemented for
+`<`, `>`, `<=`, `>=` operators.
+
+**OPTIONAL MATCH null safety**: OPTIONAL MATCH on relationships
+(`OPTIONAL MATCH ()-[r]->()`) now correctly returns one null row when no
+relationships exist. The node isomorphism filter is null-safe so null nodes
+from OPTIONAL MATCH pass through instead of being filtered out.
+
+**Column naming**: `RETURN count(a) > 0`, `RETURN count(DISTINCT a)`,
+`RETURN n.x IS NULL` now produce correct column names matching the Cypher
+expression text.
+
+### TCK
+
+- 188/3880 overall (4.8%); 188/188 in-scope (100%)
+- Newly unlocked acceptance tests: `Aggregation1`–`Aggregation8`,
+  `ListComprehension`, `ListPredicate`, `Comparison1` (list equality),
+  `ReturnOrderBy1` / `WithOrderBy1` (list sort), `Graph6` (optional rel),
+  `Null1`, `Null2` (IS NULL column names), `Precedence1` (^, boolean order)
 
 ---
 
