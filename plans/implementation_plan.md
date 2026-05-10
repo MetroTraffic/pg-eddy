@@ -1558,38 +1558,96 @@ TCK groups; TCK pass rate ≥ 80%.
 
 ---
 
-**v0.15.0 — Schema DDL** *(formerly v0.13.0)*:
+**v0.15.0 — Storage Correctness + Error Validation** *(replaces Schema DDL)*:
+
+> **Why this milestone was reshuffled**: TCK failure analysis after v0.14.0
+> shows that **70% of all 1047 failures** (732 scenarios) are storage errors:
+> 575 `could not read blocks` + 111 `PageAddItemExtended failed` from setup
+> queries, plus 46 from query execution. An additional 227 failures (22%) are
+> missing error validation (queries succeed when they should raise
+> `SyntaxError`/`TypeError`/`ArgumentError`). Together these two categories
+> account for **92% of all failures**. Fixing them unblocks the true TCK pass
+> rate. Property indexes and Schema DDL move to v0.16.0.
+
+**Storage bugs** (P0 — causes 70% of all TCK failures):
+- [ ] Fix `clear()` to properly reset AM relation storage — the
+      `RelationTruncate(rel, 0)` call truncates the file but subsequent
+      CREATE scenarios hit `could not read blocks 1..1` and
+      `PageAddItemExtended failed on block 1` errors. Root cause: either the
+      buffer manager retains stale references, or the adjacency header region
+      on block 0 is not properly initialized after truncation. Investigate
+      and fix.
+- [ ] Fix missing MAXALIGN in `update_node` free-space check: the check uses
+      `new_item.len() + sizeof(ItemIdData)` but `PageAddItemExtended` requires
+      `MAXALIGN(new_item.len()) + sizeof(ItemIdData)`. Use
+      `(new_item.len() + 7) & !7` (matches `find_or_extend_page`).
+- [ ] Cross-page node update: when an updated node record doesn't fit on
+      its current page, delete-and-reinsert on a new page. Currently this
+      raises PE201 ("PageAddItemExtended failed for node update"). The fix
+      is bounded — PROP_INLINE_MAX=48 and MAX_LABELS=32 cap record size, so
+      this only fires on very full pages where old+new records must coexist.
+
+**Error validation** (22% of failures — expected errors not raised):
+- [ ] Boolean operators on non-booleans: `1 AND true`, `'x' OR false`,
+      `NOT 1` must raise `TypeError` (76 scenarios: Boolean1/2/3/4)
+- [ ] Undefined variables in ORDER BY: `WITH n ORDER BY m` must raise
+      `SyntaxError` (40 scenarios: WithOrderBy1/2/3)
+- [ ] Invalid argument types for `range()`: raise `ArgumentError` (19 scenarios)
+- [ ] Property access on non-graph-elements: `1.prop` must raise `TypeError`
+      (14 scenarios: Graph6)
+- [ ] Node variable bound to a value: `WITH 1 AS n MATCH (n)` must raise
+      `SyntaxError` (6 scenarios: Match1)
+- [ ] Aggregation in ORDER BY after non-aggregating WITH: raise `SyntaxError`
+      (25 scenarios: WithOrderBy2)
+
+**Target**: TCK ≥ 75% after this milestone (up from 42.0% in v0.14.0).
+
+**Exit criteria**: `could not read blocks` and `PageAddItemExtended` errors
+no longer appear in TCK output; boolean type-checking raises TypeError;
+undefined ORDER BY variables raise SyntaxError; TCK pass rate ≥ 75%.
+
+---
+
+**v0.16.0 — Property Indexes + Schema DDL** *(combined)*:
+- [ ] `pg_eddy.create_node_index(label TEXT, property_key TEXT)` — per-property
+      B-tree index; integrated with query planner so `WHERE n.prop = $val`
+      uses the index instead of full scan
+- [ ] `pg_eddy.create_unique_constraint(label TEXT, property_key TEXT)` —
+      uniqueness enforcement at write time
 - [ ] `CREATE CONSTRAINT ON (n:Label) ASSERT n.prop IS UNIQUE`
 - [ ] `CREATE CONSTRAINT ON (n:Label) ASSERT EXISTS(n.prop)`
 - [ ] `CREATE INDEX ON :Label(prop)` / `DROP INDEX`
 - [ ] `SHOW CONSTRAINTS`, `SHOW INDEXES`
-- [ ] Target: `SchemaAcceptance`; TCK ~90%
+- [ ] Target: `SchemaAcceptance`; TCK ~85%
 
-**Exit criteria**: ~90% TCK pass estimated; all write clauses work correctly
-under concurrent access.
+**Exit criteria**: IS-1 node lookup within 2× of AGE (property index used);
+schema DDL Cypher commands work; ~85% TCK pass.
 
 ---
 
-### Phase 8 — Performance Hardening and 100% TCK Compliance (v0.16.0–v0.18.0)
+### Phase 8 — Performance Hardening and 100% TCK Compliance (v0.17.0–v0.19.0)
 
-**v0.16.0 — Query optimisation**:
+**v0.17.0 — Query optimisation + remaining correctness**:
 - [ ] Cost model for AM scan operators: adjacency-follow O(degree) vs B-tree
       O(log N + degree) using `pg_class.reltuples` for label selectivity
 - [ ] Join order enumeration for multi-hop MATCH patterns
 - [ ] Predicate pushdown into the AM scan (WHERE on indexed properties as scan
       predicates, not post-filters)
 - [ ] `pg_eddy.cypher_explain(analyze := TRUE)` with per-operator timings
-- [ ] Parallel label scan via PostgreSQL parallel worker infrastructure
+- [ ] Pattern expressions in RETURN / WHERE (deferred from v0.13.0)
+- [ ] Remaining wrong-result fixes
+- [ ] Target: TCK ~95%
 
-**v0.17.0 — TCK gap closure**:
+**v0.18.0 — TCK gap closure**:
 - [ ] Remaining temporal type edge cases: timezone-aware datetime operations,
       `LOAD CSV FROM 'path' AS row` (local filesystem only)
 - [ ] All remaining TCK group failures fixed; target: 100% pass rate
       (document any spec deviations with upstream references)
 - [ ] `null_semantics.sql` regression suite covers all `NullAcceptance`
       scenarios
+- [ ] Parallel label scan via PostgreSQL parallel worker infrastructure
 
-**v0.18.0 — Production readiness**:
+**v0.19.0 — Production readiness**:
 - [ ] LDBC SNB IS-1 through IS-7 and IC-1 through IC-14 benchmarked in full
       (extending the v0.12.x IS-1/IS-3 baseline to the complete suite);
       published baselines with hardware spec, dataset size, and raw output;
@@ -1611,7 +1669,7 @@ under concurrent access.
 remaining spec deviations); LDBC SNB full suite published baselines (IS-1
 through IS-7, IC-1 through IC-14); AGE comparison passes 2× gate on IS-3
 (first confirmed at v0.12.x; IS-1 competitive after property indexes in
-v0.14.0); pg_dump round-trip verified;
+v0.16.0); pg_dump round-trip verified;
 `pg_eddy.health_check()` returns OK; Docker + CNPG images published.
 
 ---
@@ -2133,19 +2191,20 @@ Each item notes its origin phase and its current planned target.
 |---|---|---|---|
 | REPLICA IDENTITY support | Phase 2 | Phase 7+ (IVM prerequisite) | Custom AM tables have no SQL columns; requires slot callbacks with column data. See [`plans/ivm_plan.md`](ivm_plan.md) §1. |
 | Slot callback verification | Phase 2 | Phase 7+ | Verify slot callbacks produce correct `TupleTableSlot` for trigger machinery. |
-| Insert performance fix (5× slower than AGE) | v0.5.2 | v0.12.x | Batch catalog writes to `edge_type_src`/`edge_type_dst`; target within 2× of AGE. Root cause: per-edge SPI INSERT overhead. |
-| Cross-page node update | Phase 3 | v0.13.0+ | Currently node update fails if new record won't fit on same page. |
+| Insert performance fix (5× slower than AGE) | v0.5.2 | ✅ v0.12.1 | Batch catalog writes via `CatalogWriteBuffer`; resolved. |
+| Cross-page node update | Phase 3 | v0.15.0 | `update_node` fails with PE201 when page is too full for old+new record to coexist. Fix: delete-and-reinsert on a different page. Bounded risk: PROP_INLINE_MAX=48 and MAX_LABELS=32 cap max record size at ~224 bytes. Also: missing MAXALIGN in `update_node` free-space check (uses raw `new_item.len()` instead of `(new_item.len() + 7) & !7`). |
+| `clear()` storage corruption | v0.13.0 | v0.15.0 | `RelationTruncate(rel, 0)` causes `could not read blocks` and `PageAddItemExtended failed` in subsequent scenarios. 70% of TCK failures. |
 
 ### Indexes, Constraints, Import/Export
 
 | Item | Origin | Target | Notes |
 |---|---|---|---|
-| Property indexes (`create_node_index`) | v0.5.3 | v0.13.0 | Per-property B-tree index; design alongside query planner for predicate pushdown. |
-| Unique constraints | v0.5.3 | v0.13.0 | `CREATE CONSTRAINT ... ASSERT n.prop IS UNIQUE` |
-| Existence constraints | v0.5.3 | v0.13.0 | `CREATE CONSTRAINT ... ASSERT EXISTS(n.prop)` |
-| CSV import/export | v0.5.3 | v0.12.0+ | `load_csv_nodes`, `load_csv_edges` with `fast := TRUE` option; `export_cypher_script()` |
-| `pg_dump`/`pg_restore` round-trip | v0.5.3 | v0.17.0 | Test on 1M+ node graph; must be lossless. |
-| Performance CI gate | v0.5.3 | v0.12.x | Automated per-PR: label-scan <5ms on 1M nodes; 1-hop expand <1ms on 10M edges. |
+| Property indexes (`create_node_index`) | v0.5.3 | v0.16.0 | Per-property B-tree index; design alongside query planner for predicate pushdown. |
+| Unique constraints | v0.5.3 | v0.16.0 | `CREATE CONSTRAINT ... ASSERT n.prop IS UNIQUE` |
+| Existence constraints | v0.5.3 | v0.16.0 | `CREATE CONSTRAINT ... ASSERT EXISTS(n.prop)` |
+| CSV import/export | v0.5.3 | v0.18.0+ | `load_csv_nodes`, `load_csv_edges` with `fast := TRUE` option; `export_cypher_script()` |
+| `pg_dump`/`pg_restore` round-trip | v0.5.3 | v0.18.0 | Test on 1M+ node graph; must be lossless. |
+| Performance CI gate | v0.5.3 | v0.19.0 | Automated per-PR: label-scan <5ms on 1M nodes; 1-hop expand <1ms on 10M edges. |
 
 ### Testing
 
