@@ -1466,23 +1466,108 @@ layer micro-benchmark already proved raw adjacency-follow speed.
 - [x] CI performance gate: IS-3 ratio > 1.0 (pg_eddy slower) fails benchmark script
       (exits 1); current result WARN (within 2×)
 
-**v0.13.0 — Schema DDL**:
+**v0.13.0 — Storage Stabilisation + Parser Hardening** *(replaces Schema DDL as next milestone)*:
+
+> **Why this milestone was inserted**: TCK analysis after v0.12.1 found that
+> 53% of all 1487 failures (790 scenarios) are caused by a `PageAddItemExtended
+> failed on block 1` storage error and cascading `could not read blocks`
+> errors. An additional 15% fail due to accumulated graph state between TCK
+> scenarios (the TCK harness calls BEGIN/ROLLBACK in separate psql connections,
+> making them no-ops). These two bugs together block more TCK progress than
+> any missing feature. Schema DDL is moved to v0.15.0.
+
+**Storage bug** (P0 — causes 53% of all TCK failures):
+- [ ] Fix MAXALIGN in `find_or_extend_page` (node_store.rs + edge_store.rs):
+      the free-space check uses `item_size + sizeof(ItemIdData)` but
+      `PageAddItemExtended` allocates `MAXALIGN(item_size) + sizeof(ItemIdData)`.
+      On 64-bit PostgreSQL, MAXALIGN = 8 bytes. When a page has exactly 46–51
+      bytes free (a typical remainder for small nodes), the check passes but the
+      actual insert fails. Fix: `MAXALIGN(item_size) + sizeof(ItemIdData)`.
+- [ ] Fix TCK harness graph reset: each `run_scenario` call in `run_tck.pl`
+      should call `pg_eddy.clear()` at the beginning so data does not
+      accumulate across scenarios. The existing `BEGIN`/`ROLLBACK` pairs are
+      no-ops because each `$node->psql()` call opens a new connection.
+
+**Parser gaps** (causes 149 parse-error TCK failures):
+- [ ] Map literals in expression context: `{key: value}` is currently only
+      parsed at the pattern level. Recognise `{` as start of a MapExpr when
+      inside `WHERE`, `RETURN`, `WITH`, `SET`, `CREATE`, and general expression
+      positions. Covers `RETURN {name: n.name}`, `WHERE n = {x: 1}`, etc.
+- [ ] Hex and octal integer literals: `0x1A2B`, `0o777` (and uppercase `0X`,
+      `0O`). The lexer currently treats the token after `0x`/`0o` as an
+      identifier. Add lexer rules to consume hex/octal digit sequences and
+      produce an `IntegerLiteral` token.
+- [ ] Pattern expressions in RETURN / WHERE: `(a)-[:R]->(b)` used as an
+      expression value (not a MATCH pattern). Currently the parser emits
+      `LArrow` unexpectedly when seeing `<-` inside an expression context.
+      Parse as a `PatternExpr` and evaluate as a boolean path predicate.
+- [ ] Large integer literals: `9223372036854775808` overflows `i64::MAX`;
+      parse as `Float` or raise a clear `SyntaxError` rather than panicking.
+
+**Validation gaps** (causes 225 TCK failures — expected errors not raised):
+- [ ] Reject re-binding of already-bound variables in `CREATE`:
+      `CREATE (n) CREATE (n)` should raise `SyntaxError` (variable `n` already
+      bound). Currently the second CREATE creates a duplicate.
+- [ ] Reject direction-less relationship in CREATE: `CREATE (a)-[r:R]-(b)` (no
+      arrow) should raise `SyntaxError`. Currently accepted and treated as
+      undirected.
+- [ ] Reject relationship in node position / node in relationship position
+      type mismatches — raise `TypeError` per openCypher spec.
+
+**Other high-value fixes** (from 115 wrong-result / data-isolation failures):
+- [ ] Fix `MATCH` on empty graph: `MATCH (n) RETURN n` must return 0 rows after
+      `pg_eddy.clear()`. Currently returns stale rows from prior scenarios
+      (root cause: the graph-reset fix above will resolve this).
+- [ ] Fix `OPTIONAL MATCH` on empty graph: same root cause.
+- [ ] Fix control-query wrong row counts caused by accumulated data.
+
+**Target**: TCK ≥ 65% after this milestone (up from 32.3% in v0.12.1).
+
+**Exit criteria**: `PageAddItemExtended` error no longer appears in TCK output;
+TCK harness correctly resets graph between scenarios; map literals parse in all
+expression positions; hex/octal literals parse; TCK pass rate ≥ 65%.
+
+---
+
+**v0.14.0 — Property Indexes + Temporal Types**:
+
+> Moves temporal functions earlier (from v0.16.0) because they account for
+> 14% of TCK failures (201 scenarios), and property indexes fix the IS-1
+> benchmark regression (7× slower than AGE due to full-table-scan node lookup).
+
+- [ ] `pg_eddy.create_node_index(label TEXT, property_key TEXT)` — per-property
+      B-tree index; `DROP INDEX ON :Label(prop)`; integrated with query planner
+      so `WHERE n.prop = $val` uses the index instead of full scan
+- [ ] `pg_eddy.create_unique_constraint(label TEXT, property_key TEXT)` —
+      uniqueness enforcement at write time
+- [ ] Temporal constructors: `datetime()`, `date()`, `time()`, `localtime()`,
+      `localdatetime()`, `duration()` — parse ISO 8601 strings / component maps
+- [ ] Temporal arithmetic: `duration.inSeconds()`, `duration.inDays()`,
+      `duration.inMonths()`, `duration.between()` — duration extraction methods
+- [ ] `FOREACH (x IN list | clause)` — simple iteration with write clauses
+- [ ] Target: `TemporalAcceptance`, `ForeachAcceptance`; TCK ≥ 80%
+
+**Exit criteria**: IS-1 node lookup within 2× of AGE (property index used);
+temporal constructors and arithmetic pass all `Temporal2`/`Temporal4`/`Temporal10`
+TCK groups; TCK pass rate ≥ 80%.
+
+---
+
+**v0.15.0 — Schema DDL** *(formerly v0.13.0)*:
 - [ ] `CREATE CONSTRAINT ON (n:Label) ASSERT n.prop IS UNIQUE`
 - [ ] `CREATE CONSTRAINT ON (n:Label) ASSERT EXISTS(n.prop)`
 - [ ] `CREATE INDEX ON :Label(prop)` / `DROP INDEX`
 - [ ] `SHOW CONSTRAINTS`, `SHOW INDEXES`
-- [ ] `FOREACH (x IN list | clause)`
-- [ ] Target: `SchemaAcceptance`, `ForeachAcceptance`; TCK ~80%
+- [ ] Target: `SchemaAcceptance`; TCK ~90%
 
-**Exit criteria**: ~80% TCK pass estimated; AGE comparison benchmark
-published and passes the 2× gate on IS-3; all write clauses work correctly
+**Exit criteria**: ~90% TCK pass estimated; all write clauses work correctly
 under concurrent access.
 
 ---
 
-### Phase 8 — Performance Hardening and 100% TCK Compliance (v0.15.0–v0.17.0)
+### Phase 8 — Performance Hardening and 100% TCK Compliance (v0.16.0–v0.18.0)
 
-**v0.15.0 — Query optimisation**:
+**v0.16.0 — Query optimisation**:
 - [ ] Cost model for AM scan operators: adjacency-follow O(degree) vs B-tree
       O(log N + degree) using `pg_class.reltuples` for label selectivity
 - [ ] Join order enumeration for multi-hop MATCH patterns
@@ -1491,17 +1576,15 @@ under concurrent access.
 - [ ] `pg_eddy.cypher_explain(analyze := TRUE)` with per-operator timings
 - [ ] Parallel label scan via PostgreSQL parallel worker infrastructure
 
-**v0.16.0 — TCK gap closure**:
-- [ ] Temporal type arithmetic (`src/cypher/temporal.rs`): ISO 8601 duration
-      arithmetic, timezone-aware datetime operations (see §10.7 — the hardest
-      feature group in the entire TCK; budget accordingly)
-- [ ] `LOAD CSV FROM 'path' AS row` (local filesystem only)
+**v0.17.0 — TCK gap closure**:
+- [ ] Remaining temporal type edge cases: timezone-aware datetime operations,
+      `LOAD CSV FROM 'path' AS row` (local filesystem only)
 - [ ] All remaining TCK group failures fixed; target: 100% pass rate
       (document any spec deviations with upstream references)
 - [ ] `null_semantics.sql` regression suite covers all `NullAcceptance`
       scenarios
 
-**v0.17.0 — Production readiness**:
+**v0.18.0 — Production readiness**:
 - [ ] LDBC SNB IS-1 through IS-7 and IC-1 through IC-14 benchmarked in full
       (extending the v0.12.x IS-1/IS-3 baseline to the complete suite);
       published baselines with hardware spec, dataset size, and raw output;
@@ -1522,7 +1605,8 @@ under concurrent access.
 **Exit criteria** (v1.0 readiness): 100% TCK pass (goal; document any
 remaining spec deviations); LDBC SNB full suite published baselines (IS-1
 through IS-7, IC-1 through IC-14); AGE comparison passes 2× gate on IS-3
-(first confirmed at v0.12.x); pg_dump round-trip verified;
+(first confirmed at v0.12.x; IS-1 competitive after property indexes in
+v0.14.0); pg_dump round-trip verified;
 `pg_eddy.health_check()` returns OK; Docker + CNPG images published.
 
 ---
