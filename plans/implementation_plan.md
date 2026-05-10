@@ -1620,22 +1620,37 @@ undefined ORDER BY variables raise SyntaxError ✓; TCK pass rate ≥ 75%
 > access on map values (16 additional scenarios). Zero implementation risk to
 > existing storage.
 
-- [ ] Parser: `{key: expr, ...}` as an `Expr::Map(Vec<(String, Expr)>)` AST
+- [x] Parser: `{key: expr, ...}` as an `Expr::Map(Vec<(String, Expr)>)` AST
       node — already partially parsed for inline node properties; promote to
       a general expression
-- [ ] Executor: `eval_expr` for `Expr::Map` → `Value::Map(HashMap<String,Value>)`
-- [ ] Map as RETURN/WITH column value — serialise as JSON object in result rows
-- [ ] Map property access: `expr.key` where `expr` evaluates to `Value::Map`
-      returns the keyed value (already needed for `Expr::Property`)
-- [ ] Map equality: `{a:1} = {a:1}` — structural equality in `value_eq()`
-- [ ] Map in SET: `SET n = {name: 'Alice', age: 30}` — replace all properties
-- [ ] Map in CREATE/MERGE inline properties: `CREATE (:N {name: 'Alice'})` —
+      *(was already `Expr::MapLiteral` — no change needed)*
+- [x] Executor: `eval_expr` for `Expr::Map` → `Value::Map(HashMap<String,Value>)`
+      *(already evaluated to `Value::Json(Object)` — no change needed)*
+- [x] Map as RETURN/WITH column value — serialise as JSON object in result rows
+- [x] Map property access: `expr.key` where `expr` evaluates to `Value::Map`
+      returns the keyed value — fixed `get_property()` and `Expr::Subscript`
+      to handle `Value::Json(Object)`; `map[stringKey]` also added with
+      TypeError on non-string key
+- [x] Map equality: `{a:1} = {a:1}` — structural equality in `compare_values()`
+      with null propagation; ordering operators return null (maps unordered)
+- [x] Map in SET: `SET n = {name: 'Alice', age: 30}` — replace all properties
+      *(was already implemented via SetItem::Variable — no change needed)*
+- [x] Map in CREATE/MERGE inline properties: `CREATE (:N {name: 'Alice'})` —
       already works for literals; ensure map-expression result also works
-- [ ] TCK harness: remove `unsupported: map literal in RETURN expression` and
-      `unsupported: map literal in WITH expression` skip guards
+      *(already worked — no change needed)*
+- [x] TCK harness: remove `unsupported: map literal in RETURN expression` and
+      `unsupported: map literal in WITH expression` skip guards; also remove
+      `Comparing maps to maps` skip; add `cell_match()` map handler with
+      `parse_map_display()` (depth-aware, handles nested maps); add
+      `cypher_map_to_json()` for map-literal parameter values
 
 **Target**: TCK ≥ 64% (939 skips run; many pass outright; some may expose
 further gaps that become the next release's failures).
+
+**Actual result**: 2002/3880 (51.6%), +221 scenarios. Target missed — the
+939 newly-running tests revealed many pre-existing failures in Temporal9 (322),
+Temporal3 (183), Temporal1 (179), Match6 (96), Match1 (82), Match2 (81) that
+were masked by the skip guards. Map literal feature itself is complete.
 
 **Exit criteria**: no TCK scenarios skipped for map literal reasons;
 `{key: expr}` works in RETURN, WITH, SET n =, and nested positions.

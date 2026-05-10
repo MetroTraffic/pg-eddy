@@ -68,20 +68,24 @@ Replace `NN/NNNN` with the new count (e.g., `82/3881 passed`).
 
 Before releasing a new version:
 
-1. **Update deliverables** — Update `Cargo.toml` version, create migration SQL
+1. **Check deliverables against plan** — ⚠️ **REQUIRED** — Read the
+   `plans/implementation_plan.md` checklist for the version being released.
+   Verify every `[ ]` item is actually implemented before committing. Mark
+   each done item `[x]` in the plan. Note any deferred items with a reason.
+2. **Update version files** — Update `Cargo.toml` version, create migration SQL
    files if needed (`pg_eddy--X.Y.Z--X.Y.W.sql`), and update `pg_eddy.control`.
-2. **Update CHANGELOG.md** — Document all changes, fixes, and features for the
+3. **Update CHANGELOG.md** — Document all changes, fixes, and features for the
    release.
-3. **Run unit tests** — ⚠️ **REQUIRED GATE** — Execute `cargo pgrx test pg18`
+4. **Run unit tests** — ⚠️ **REQUIRED GATE** — Execute `cargo pgrx test pg18`
    and ensure all tests pass (all unit tests in `pg_eddy/src/` must pass).
    Do not proceed to tagging if any tests fail.
-4. **Run clippy** — ⚠️ **REQUIRED GATE** — Execute `cargo clippy --features pg18`
+5. **Run clippy** — ⚠️ **REQUIRED GATE** — Execute `cargo clippy --features pg18`
    and ensure there are zero warnings. Do not proceed to tagging if clippy fails.
-5. **Run TAP tests** — Execute `prove tests/tap/*.pl` to verify crash recovery
+6. **Run TAP tests** — Execute `prove tests/tap/*.pl` to verify crash recovery
    and edge cases work correctly.
-6. **Run TCK tests** — Execute `perl tests/tck/run_tck.pl` and update the badge
+7. **Run TCK tests** — Execute `perl tests/tck/run_tck.pl` and update the badge
    in `README.md` line 6 if the pass rate changes: 
    `[![OpenCypher TCK](https://img.shields.io/badge/OpenCypher%20TCK-NN%2FNNNN%20passed-orange.svg)](tests/tck/)`
    Replace `NN/NNNN` with the new count (e.g., `82/3881 passed`).
-7. **Create git tag** — Tag the release with `git tag vX.Y.Z` and push to
+8. **Create git tag** — Tag the release with `git tag vX.Y.Z` and push to
    repository. (Only after all gates above pass.)
