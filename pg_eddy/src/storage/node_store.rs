@@ -661,7 +661,13 @@ unsafe fn find_or_extend_page(rel: pg_sys::Relation, item_size: usize) -> pg_sys
                 continue;
             }
             let free = unsafe { page_free_space(page) };
-            if free >= item_size + size_of::<pg_sys::ItemIdData>() {
+            // MAXALIGN: PageAddItemExtended aligns items to 8 bytes on all
+            // supported 64-bit platforms.  We must account for the alignment
+            // padding here, otherwise a page with (e.g.) 50 bytes free passes
+            // this check for a 46-byte item (50 >= 46+4) but then
+            // PageAddItemExtended fails because MAXALIGN(46)+4 = 52 > 50.
+            let aligned = (item_size + 7) & !7usize; // MAXALIGN = 8
+            if free >= aligned + size_of::<pg_sys::ItemIdData>() {
                 return buf;
             }
             unsafe { pg_sys::UnlockReleaseBuffer(buf) };

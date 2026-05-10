@@ -1129,6 +1129,44 @@ fn is_write_only_plan(plan: &cypher::planner::LogicalPlan) -> bool {
 /// ```sql
 /// SELECT cypher_explain('MATCH (a:Person)-[:KNOWS]->(b) RETURN a, b');
 /// ```
+/// Clear all graph data — removes every node, edge, and catalog record.
+///
+/// Physically truncates the custom AM storage for both `_pg_eddy.nodes` and
+/// `_pg_eddy.edges` to zero blocks, truncates the three catalog index tables,
+/// and resets both ID sequences to 1.  Label, rel-type, and property-key
+/// registries are intentionally preserved.
+///
+/// This is intended for test harnesses (e.g. the OpenCypher TCK) that need a
+/// clean slate between scenarios.  It must not be called concurrently.
+#[pg_extern]
+fn clear() {
+    // 1. Truncate the catalog index tables (regular heap — TRUNCATE is fast).
+    Spi::run(
+        "TRUNCATE _pg_eddy.label_index, _pg_eddy.edge_type_src, _pg_eddy.edge_type_dst",
+    )
+    .unwrap_or_else(|e| pgrx::error!("pg_eddy clear: catalog truncate failed: {e}"));
+
+    // 2. Reset ID sequences so subsequent inserts start from 1 again.
+    Spi::run("ALTER SEQUENCE _pg_eddy.node_id_seq RESTART WITH 1")
+        .unwrap_or_else(|e| pgrx::error!("pg_eddy clear: node_id_seq reset failed: {e}"));
+    Spi::run("ALTER SEQUENCE _pg_eddy.edge_id_seq RESTART WITH 1")
+        .unwrap_or_else(|e| pgrx::error!("pg_eddy clear: edge_id_seq reset failed: {e}"));
+
+    // 3. Physically truncate the custom AM storage to 0 blocks.
+    //    RelationTruncate is WAL-logged and safe inside a transaction.
+    unsafe {
+        use pgrx::pg_sys;
+
+        let nodes_rel = open_nodes_relation();
+        pg_sys::RelationTruncate(nodes_rel, 0);
+        pg_sys::table_close(nodes_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+
+        let edges_rel = open_edges_relation();
+        pg_sys::RelationTruncate(edges_rel, 0);
+        pg_sys::table_close(edges_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+    }
+}
+
 #[pg_extern]
 fn cypher_explain(query: &str) -> String {
     let ast = match cypher::parser::parse(query) {

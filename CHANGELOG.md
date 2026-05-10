@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.13.0](#0130--2026-05-10--storage-stabilisation-and-parser-hardening) — Storage Stabilisation and Parser Hardening
 - [0.12.1](#0121--2026-05-10--batch-catalog-writes-and-ldbc-is-1is-3-benchmark) — Batch Catalog Writes and LDBC IS-1/IS-3 Benchmark
 - [0.12.0](#0120--2026-05-10--cypher-write-language-create-merge-set-remove-delete) — Cypher Write Language: CREATE, MERGE, SET, REMOVE, DELETE
 - [0.11.0](#0110--2026-05-10--subqueries-exists-call--and-call-procedure-yield) — Subqueries: EXISTS {}, CALL {}, and CALL procedure YIELD
@@ -20,6 +21,79 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 - [0.3.0](#030--2026-05-09--edge-storage--adjacency-lists) — Edge Storage + Adjacency Lists
 - [0.2.0](#020--2026-05-09--node-storage) — Node Storage
 - [0.1.0](#010--2026-05-09--am-skeleton) — AM Skeleton
+
+---
+
+## [0.13.0] — 2026-05-10 — Storage Stabilisation and Parser Hardening
+
+v0.13.0 is a correctness release that dramatically improves OpenCypher TCK
+conformance by fixing two critical storage bugs, three parser gaps, a
+cascading test-harness issue, and two missing error-validation rules.
+
+### Bug Fix: MAXALIGN in Page Free-Space Check (storage/node_store.rs, storage/edge_store.rs)
+
+`find_or_extend_page` and `find_or_extend_edge_page` computed available free
+space correctly but compared it against the raw item size rather than the
+PostgreSQL-aligned size.  On a 64-bit host, PostgreSQL's `PageAddItemExtended`
+requires `MAXALIGN(item_size) + sizeof(ItemIdData)` bytes, where `MAXALIGN`
+rounds up to the nearest 8 bytes.  For a 46-byte item the check passed at 50
+bytes free (`50 >= 46+4`), but `PageAddItemExtended` actually needed 52 bytes
+(`MAXALIGN(46)=48 + 4`), causing silent data-loss or a panic.
+
+Fixed by computing `let aligned = (item_size + 7) & !7` before the comparison
+in both stores.  This bug was responsible for roughly **790 TCK failures**
+(pages silently full, subsequent scans returning wrong row counts).
+
+### Bug Fix: TCK Graph State Leak (tests/tck/run_tck.pl)
+
+The TCK harness wrapped each scenario in `BEGIN` / `ROLLBACK` calls issued as
+separate `psql` invocations.  Because each `$node->psql()` call opens and
+closes its own connection, the BEGIN and ROLLBACK ran in separate
+auto-committed sessions — effectively doing nothing.  Data from prior scenarios
+accumulated across the full test run, producing "expected 0 rows, got 148"-
+style cascading failures.
+
+Fixed by implementing `clear()` (a new `#[pg_extern]` function that physically
+truncates the custom-AM node and edge relations via `RelationTruncate`, truncates
+the catalog index tables via SPI `TRUNCATE`, and restarts both ID sequences) and
+calling it at the start of every scenario via `$node->safe_psql('postgres',
+'SELECT clear()')`.  The original call used the wrong schema prefix
+(`pg_eddy.clear()` — that schema does not exist; all functions are in `public`)
+and silently swallowed the resulting error inside `eval { }`, so every scenario
+ran on top of accumulated data from all prior scenarios.
+
+### Feature: Map Literal Expressions (`{key: expr}`)
+
+Cypher allows map literals in RETURN, WITH, and SET expressions, e.g.
+`RETURN {name: n.name, age: n.age}`.  The lexer, parser, AST, and executor
+now support these fully:
+
+- **Lexer / Parser**: `Token::LBrace` in expression position triggers
+  `parse_property_map()`, producing `Expr::MapLiteral(Vec<(String, Expr)>)`.
+- **Executor**: `eval_expr` evaluates each value expression and wraps the
+  result in a `serde_json::Value::Object`.  `expr_has_aggregate` and
+  `collect_free_var_refs` handle the new variant.
+
+### Feature: Hex and Octal Integer Literals
+
+The lexer now recognises `0x`/`0X` (hexadecimal) and `0o`/`0O` (octal)
+integer prefixes, as required by the openCypher grammar.  Overflow values
+clamp to `i64::MAX` rather than returning a lex error.  Values that overflow
+`i64` during ordinary decimal parsing now fall back to `FloatLit` rather than
+halting lexing.
+
+### Error Validation: Undirected Relationships in CREATE
+
+`CREATE (a)-[r:R]-(b)` (no arrow direction) now raises a `SyntaxError`
+instead of silently choosing an arbitrary direction.  The check is in the
+executor's `create_pattern_in_row` function.
+
+### Error Validation: Re-Creating an Already-Bound Node Variable
+
+`MATCH (n) CREATE (n)` now raises a `SyntaxError`.  A CREATE pattern whose
+sole element is a node variable already present in the current row is
+rejected; using a bound variable as a *relationship endpoint* in CREATE
+remains valid (`MATCH (n) CREATE (n)-[:R]->(b)`).
 
 ---
 

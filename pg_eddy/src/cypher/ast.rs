@@ -276,6 +276,8 @@ pub enum Expr {
     Exists {
         subquery: Box<Query>,
     },
+    /// Map literal: {key: expr, key2: expr2}
+    MapLiteral(Vec<(String, Expr)>),
 }
 
 /// Kind of list predicate function.

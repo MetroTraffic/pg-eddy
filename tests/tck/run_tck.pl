@@ -220,6 +220,13 @@ sub classify_scenario {
 sub run_scenario {
     my ($node, $sc) = @_;
 
+    # Reset graph state before each scenario.  Each $node->psql() call opens a
+    # new connection, so the BEGIN/ROLLBACK pairs below are no-ops (each runs in
+    # its own auto-commit session).  Calling clear() here ensures every scenario
+    # starts with an empty graph regardless of what prior scenarios created.
+    # Note: functions are in the public schema, so call without schema prefix.
+    $node->safe_psql('postgres', 'SELECT clear()');
+
     eval { $node->safe_psql('postgres', 'BEGIN') };
     return ('fail', "BEGIN failed: $@") if $@;
 

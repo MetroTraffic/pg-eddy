@@ -823,7 +823,10 @@ unsafe fn find_or_extend_edge_page(rel: pg_sys::Relation, item_size: usize) -> p
         pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
         let page = pg_sys::BufferGetPage(buf);
         let free = page_free_space(page);
-        if free >= item_size + size_of::<pg_sys::ItemIdData>() {
+        // MAXALIGN: PageAddItemExtended aligns items to 8 bytes; account for
+        // padding to avoid a false "page has space" result.
+        let aligned = (item_size + 7) & !7usize; // MAXALIGN = 8
+        if free >= aligned + size_of::<pg_sys::ItemIdData>() {
             return buf;
         }
         pg_sys::UnlockReleaseBuffer(buf);

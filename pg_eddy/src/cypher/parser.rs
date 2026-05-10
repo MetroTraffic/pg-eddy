@@ -1040,6 +1040,11 @@ impl Parser {
                 self.advance();
                 self.parse_case_expr()?
             }
+            Token::LBrace => {
+                // Map literal expression: {key: expr, key2: expr2}
+                let pairs = self.parse_property_map()?;
+                Expr::MapLiteral(pairs)
+            }
             Token::Ident(name) => {
                 self.advance();
                 // exists { subquery } — existential subquery predicate

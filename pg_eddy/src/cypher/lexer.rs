@@ -233,6 +233,30 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
 
         // Numbers: integers and floats
         if bytes[pos].is_ascii_digit() || (bytes[pos] == b'.' && pos + 1 < len && bytes[pos + 1].is_ascii_digit()) {
+            // Hex literal: 0x1A2B or 0X1a2b
+            if bytes[pos] == b'0' && pos + 1 < len && (bytes[pos + 1] == b'x' || bytes[pos + 1] == b'X') {
+                pos += 2; // consume "0x"
+                let hex_start = pos;
+                while pos < len && bytes[pos].is_ascii_hexdigit() {
+                    pos += 1;
+                }
+                let hex_str = &input[hex_start..pos];
+                let val = i64::from_str_radix(hex_str, 16).unwrap_or(i64::MAX);
+                tokens.push(SpannedToken { token: Token::IntLit(val), offset: start });
+                continue;
+            }
+            // Octal literal: 0o777 or 0O777
+            if bytes[pos] == b'0' && pos + 1 < len && (bytes[pos + 1] == b'o' || bytes[pos + 1] == b'O') {
+                pos += 2; // consume "0o"
+                let oct_start = pos;
+                while pos < len && bytes[pos] >= b'0' && bytes[pos] <= b'7' {
+                    pos += 1;
+                }
+                let oct_str = &input[oct_start..pos];
+                let val = i64::from_str_radix(oct_str, 8).unwrap_or(i64::MAX);
+                tokens.push(SpannedToken { token: Token::IntLit(val), offset: start });
+                continue;
+            }
             let mut num_str = String::new();
             let mut has_dot = false;
             let mut has_e = false;
@@ -268,11 +292,16 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
                 })?;
                 tokens.push(SpannedToken { token: Token::FloatLit(val), offset: start });
             } else {
-                let val: i64 = num_str.parse().map_err(|_| LexError {
-                    message: format!("invalid integer literal: {num_str}"),
-                    offset: start,
-                })?;
-                tokens.push(SpannedToken { token: Token::IntLit(val), offset: start });
+                // Parse as i64; overflow (e.g. 9223372036854775808 = i64::MAX+1)
+                // is stored as FloatLit to avoid a hard parse error.
+                match num_str.parse::<i64>() {
+                    Ok(val) => tokens.push(SpannedToken { token: Token::IntLit(val), offset: start }),
+                    Err(_) => {
+                        // Try as u64 first (for very large positives), then as f64.
+                        let fval: f64 = num_str.parse().unwrap_or(f64::INFINITY);
+                        tokens.push(SpannedToken { token: Token::FloatLit(fval), offset: start });
+                    }
+                }
             }
             continue;
         }

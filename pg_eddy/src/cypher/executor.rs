@@ -1081,6 +1081,7 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
                 || to.as_deref().is_some_and(expr_has_aggregate)
         }
         Expr::List(exprs) => exprs.iter().any(expr_has_aggregate),
+        Expr::MapLiteral(pairs) => pairs.iter().any(|(_, v)| expr_has_aggregate(v)),
         Expr::CaseSearched { branches, else_ } => {
             branches.iter().any(|(c, t)| expr_has_aggregate(c) || expr_has_aggregate(t))
                 || else_.as_deref().is_some_and(expr_has_aggregate)
@@ -1522,6 +1523,9 @@ fn collect_free_var_refs(expr: &Expr, acc: &mut Vec<Expr>) {
         Expr::List(es) => {
             for e in es { collect_free_var_refs(e, acc); }
         }
+        Expr::MapLiteral(pairs) => {
+            for (_, v) in pairs { collect_free_var_refs(v, acc); }
+        }
         Expr::CaseSearched { branches, else_ } => {
             for (c, t) in branches { collect_free_var_refs(c, acc); collect_free_var_refs(t, acc); }
             if let Some(e) = else_ { collect_free_var_refs(e, acc); }
@@ -1957,6 +1961,14 @@ pub fn eval_expr(
                 })
             });
             Ok(Value::Bool(found))
+        }
+        Expr::MapLiteral(pairs) => {
+            let mut m = serde_json::Map::new();
+            for (k, v_expr) in pairs {
+                let v = eval_expr(v_expr, row, params)?;
+                m.insert(k.clone(), v.to_json());
+            }
+            Ok(Value::Json(serde_json::Value::Object(m)))
         }
     }
 }
@@ -3000,6 +3012,17 @@ fn create_pattern_in_row(
                 if let Some(v) = var
                     && let Some(existing) = row.get(v)
                         && let Value::Node { node_id, .. } = existing {
+                            // Using a bound variable as a relationship endpoint is OK.
+                            // But CREATE (n) — a standalone already-bound variable — is a SyntaxError:
+                            // you cannot CREATE a node that is already bound.
+                            if pattern.elements.len() == 1 {
+                                return Err(ExecError {
+                                    message: format!(
+                                        "SyntaxError: variable `{v}` is already bound; \
+                                         cannot CREATE it as a standalone node"
+                                    ),
+                                });
+                            }
                             last_node_id = Some(*node_id);
                             continue;
                         }
@@ -3128,8 +3151,13 @@ fn create_pattern_in_row(
                 }).unwrap_or_default();
 
                 let (actual_src, actual_dst) = match r.direction {
+                    RelDirection::Both => {
+                        return Err(ExecError {
+                            message: "SyntaxError: only directed relationships are supported in CREATE".into(),
+                        });
+                    }
                     RelDirection::In => (dst_id, src_id),
-                    _ => (src_id, dst_id),
+                    RelDirection::Out => (src_id, dst_id),
                 };
 
                 let edge_id = next_edge_id();
