@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.16.0](#0160----map-literal-expressions) — Map Literal Expressions
 - [0.15.0](#0150----storage-correctness-and-error-validation) — Storage Correctness and Error Validation
 - [0.14.0](#0140----temporal-types-and-foreach) — Temporal Types and FOREACH
 - [0.13.0](#0130--2026-05-10--storage-stabilisation-and-parser-hardening) — Storage Stabilisation and Parser Hardening
@@ -23,6 +24,53 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 - [0.3.0](#030--2026-05-09--edge-storage--adjacency-lists) — Edge Storage + Adjacency Lists
 - [0.2.0](#020--2026-05-09--node-storage) — Node Storage
 - [0.1.0](#010--2026-05-09--am-skeleton) — AM Skeleton
+
+---
+
+## [0.16.0] — Map Literal Expressions
+
+v0.16.0 unlocks map literal expressions throughout Cypher. TCK pass rate
+rises from 1781/3880 (45.9%) to **2002/3880 (51.6%)** — +221 scenarios, the
+largest single-release gain to date.
+
+### What's New
+
+**Map literal expressions** — map literals `{key: expr, ...}` now work
+everywhere an expression is valid: `RETURN`, `WITH`, `WHERE`, `CREATE`,
+`MERGE`, and nested inside lists and other maps. The parser and evaluator
+already handled this; the release removes the skip guards that prevented the
+TCK from exercising them and fixes the remaining compliance gaps.
+
+**Map property access** — `expr.key` and `expr[keyExpr]` now work when
+`expr` evaluates to a map value. Previously only Node and Edge supported
+property access; any computed map (from a map literal, parameter, or function
+result) was silently returning `null`. `get_property()` and `Expr::Subscript`
+now both handle `Value::Json(Object)`.
+
+**Map subscript access** — `map[stringKey]` is now supported. Passing a
+non-string key into a map raises `TypeError: map element access requires a
+string key` per the openCypher spec.
+
+**Map equality** — `{a: 1} = {a: 1}` now evaluates correctly. The
+`compare_values()` function now handles `Json(Object)` pairs with key-by-key
+recursive equality, returning `null` if any value comparison is `null`.
+
+**Nested map comparison in the test harness** — `cell_match()` now correctly
+compares arbitrarily nested map values like `{a: {b: {c: 1}}}` against the
+JSON objects returned by the executor, using a depth-aware Cypher map display
+parser.
+
+**Map parameter support** — parameters whose values are Cypher map literals
+(e.g., `| expr | {name: 'Apa'} |`) are now correctly converted to JSON
+objects when building the parameter JSON, instead of being passed as raw
+strings.
+
+### TCK Result
+
+| Release | Pass  | Total | %    | Delta |
+|---------|-------|-------|------|-------|
+| v0.15.0 | 1781  | 3880  | 45.9% | baseline |
+| v0.16.0 | **2002** | 3880 | **51.6%** | **+221** |
 
 ---
 

@@ -47,9 +47,6 @@ my @UNSUPPORTED_QUERY_PATTERNS = (
     [ qr/\bUNION\b/i,              'UNION'             ],
     [ qr/\bFOREACH\b/i,            'FOREACH'           ],
     [ qr/\bexists\b\s*\(/i,        'exists()'          ],
-    # Map literal expressions in queries (not yet supported by parser)
-    [ qr/\bRETURN\b.*\{[a-zA-Z_]\w*\s*:/si, 'map literal in RETURN expression' ],
-    [ qr/\bWITH\b.*\{[a-zA-Z_]\w*\s*:/si,   'map literal in WITH expression'   ],
 );
 
 # ---------------------------------------------------------------------------
@@ -143,10 +140,6 @@ sub classify_scenario {
     # Skip sort order consistency with mixed types
     if ($label =~ /Sort order should be consistent/i) {
         return ('skip', 'cross-type sort order not supported');
-    }
-    # Skip map equality comparisons
-    if ($label =~ /Comparing maps to maps/i) {
-        return ('skip', 'map equality comparison not supported');
     }
     # Skip NaN comparisons
     if ($label =~ /Comparing NaN/i) {
@@ -315,7 +308,7 @@ sub run_scenario {
         my @kv;
         for my $k (sort keys %params) {
             my $v = $params{$k};
-            # Try to determine type: integer, float, or string
+            # Try to determine type: integer, float, boolean, null, list, or map
             if ($v =~ /^-?\d+$/) {
                 push @kv, qq("$k": $v);
             } elsif ($v =~ /^-?\d+\.\d+$/) {
@@ -326,9 +319,16 @@ sub run_scenario {
                 push @kv, qq("$k": false);
             } elsif (lc($v) eq 'null') {
                 push @kv, qq("$k": null);
+            } elsif ($v =~ /^\{/) {
+                # Map literal like {name: 'Apa'} — convert to JSON object
+                my $json_obj = cypher_map_to_json($v);
+                push @kv, qq("$k": $json_obj);
+            } elsif ($v =~ /^\[/) {
+                # List literal — pass as-is (already JSON-compatible for simple cases)
+                push @kv, qq("$k": $v);
             } else {
-                $v =~ s/'/\\'/g;
-                push @kv, qq("$k": "$v");
+                (my $vs = $v) =~ s/"/\\"/g;
+                push @kv, qq("$k": "$vs");
             }
         }
         $params_json = "'{" . join(', ', @kv) . "}'::jsonb";
@@ -504,6 +504,21 @@ sub cell_match {
         return "edge mismatch (expected $exp)";
     }
 
+    if ($exp =~ /^\{/) {
+        # Map literal: expected is Cypher map display like {a: 1, b: 'x', c: {}}
+        # actual is a Perl hashref decoded from JSON
+        return "expected map, got scalar '$act'" unless ref($act) eq 'HASH';
+        my %ep = parse_map_display($exp);
+        return "map key count mismatch: expected " . scalar(keys %ep) . " keys, got " . scalar(keys %$act)
+            if scalar(keys %ep) != scalar(keys %$act);
+        for my $k (keys %ep) {
+            return "map key '$k' missing" unless exists $act->{$k};
+            my $err = cell_match($ep{$k}, $act->{$k});
+            return "map[$k]: $err" if $err;
+        }
+        return undef;
+    }
+
     return undef if ref($act) eq '' && "$act" eq "$exp";
     return "expected '$exp', got '" . _repr($act) . "'";
 }
@@ -554,7 +569,82 @@ sub parse_prop_display {
     return %out;
 }
 
+# Parse a full Cypher map display like {a: 1, b: 'x', c: {d: 2}} into key=>raw_value pairs.
+# Values are returned as raw display strings (to be passed to cell_match recursively).
+sub parse_map_display {
+    my ($str) = @_;
+    $str =~ s/^\s+|\s+$//g;
+    # Strip outer braces
+    $str =~ s/^\{\s*|\s*\}$//g;
+    my %out;
+    my $pos = 0;
+    my $len = length($str);
+    while ($pos < $len) {
+        # Skip whitespace/comma
+        while ($pos < $len && substr($str, $pos, 1) =~ /[\s,]/) { $pos++; }
+        last if $pos >= $len;
+        # Read key (word chars)
+        my $key_start = $pos;
+        while ($pos < $len && substr($str, $pos, 1) =~ /\w/) { $pos++; }
+        my $key = substr($str, $key_start, $pos - $key_start);
+        last unless length($key);
+        # Skip whitespace + colon
+        while ($pos < $len && substr($str, $pos, 1) =~ /\s/) { $pos++; }
+        $pos++ if $pos < $len && substr($str, $pos, 1) eq ':'; # consume ':'
+        while ($pos < $len && substr($str, $pos, 1) =~ /\s/) { $pos++; }
+        # Read value (depth-aware: handles {}, [], strings)
+        my $val_start = $pos;
+        my $depth = 0;
+        my $in_str = 0;
+        while ($pos < $len) {
+            my $ch = substr($str, $pos, 1);
+            if ($in_str) {
+                if ($ch eq '\\') { $pos += 2; next; }
+                if ($ch eq "'")  { $in_str = 0; }
+            } elsif ($ch eq "'") {
+                $in_str = 1;
+            } elsif ($ch =~ /[{\[]/) {
+                $depth++;
+            } elsif ($ch =~ /[}\]]/) {
+                last if $depth == 0;
+                $depth--;
+            } elsif ($ch eq ',' && $depth == 0) {
+                last;
+            }
+            $pos++;
+        }
+        my $val = substr($str, $val_start, $pos - $val_start);
+        $val =~ s/^\s+|\s+$//g;
+        $out{$key} = $val if length($key);
+    }
+    return %out;
+}
+
 sub _repr { defined $_[0] ? (ref($_[0]) ? encode_json($_[0]) : $_[0]) : 'undef' }
+
+# Convert a Cypher map display string like {name: 'Apa', age: 38} to a JSON object string.
+sub cypher_map_to_json {
+    my ($str) = @_;
+    $str =~ s/^\s+|\s+$//g;
+    return '{}' unless $str =~ /^\{/;
+    my %pairs = parse_map_display($str);
+    my @jkv;
+    for my $k (keys %pairs) {
+        my $v = $pairs{$k};
+        my $jv;
+        if    ($v =~ /^-?\d+$/)       { $jv = $v; }
+        elsif ($v =~ /^-?\d+\.\d+$/)  { $jv = $v; }
+        elsif (lc($v) eq 'true')       { $jv = 'true'; }
+        elsif (lc($v) eq 'false')      { $jv = 'false'; }
+        elsif (lc($v) eq 'null')       { $jv = 'null'; }
+        elsif ($v =~ /^\{/)            { $jv = cypher_map_to_json($v); }
+        elsif ($v =~ /^\[/)            { $jv = $v; }
+        elsif ($v =~ /^'(.*)'$/)       { (my $s = $1) =~ s/"/\\"/g; $jv = qq("$s"); }
+        else                           { (my $s = $v) =~ s/"/\\"/g; $jv = qq("$s"); }
+        push @jkv, qq("$k": $jv);
+    }
+    return '{' . join(', ', @jkv) . '}';
+}
 
 # ===========================================================================
 # parse_feature — minimal Gherkin parser

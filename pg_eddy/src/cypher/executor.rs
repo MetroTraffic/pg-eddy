@@ -847,6 +847,10 @@ impl Value {
                 Some(v) => json_to_value(v),
                 None => Value::Null,
             },
+            Value::Json(serde_json::Value::Object(m)) => match m.get(key) {
+                Some(v) => json_to_value(v),
+                None => Value::Null,
+            },
             Value::Temporal(tv) => temporal_get_property(tv, key),
             Value::Duration(dur) => duration_get_property(dur, key),
             _ => Value::Null,
@@ -2690,6 +2694,16 @@ pub fn eval_expr(
         Expr::Subscript(list_expr, index_expr) => {
             let list_val = eval_expr(list_expr, row, params)?;
             let idx_val = eval_expr(index_expr, row, params)?;
+            // Map subscript: map[stringKey]
+            if let Value::Json(serde_json::Value::Object(m)) = &list_val {
+                return match &idx_val {
+                    Value::Null => Ok(Value::Null),
+                    Value::Str(s) => Ok(m.get(s.as_str()).map(|v| json_to_value(v)).unwrap_or(Value::Null)),
+                    _ => Err(ExecError {
+                        message: "TypeError: map element access requires a string key".into(),
+                    }),
+                };
+            }
             let arr = match &list_val {
                 Value::Json(serde_json::Value::Array(a)) => a,
                 Value::Null => return Ok(Value::Null),
@@ -2901,6 +2915,31 @@ fn compare_values(left: &Value, op: &CmpOp, right: &Value) -> Option<bool> {
         // List comparison (lexicographic)
         (Value::Json(serde_json::Value::Array(a)), Value::Json(serde_json::Value::Array(b))) => {
             compare_lists(a, b, op)
+        }
+        // Map equality: two maps are equal iff they have the same keys and equal values.
+        (Value::Json(serde_json::Value::Object(a)), Value::Json(serde_json::Value::Object(b))) => {
+            match op {
+                CmpOp::Eq | CmpOp::Neq => {
+                    if a.len() != b.len() {
+                        return Some(matches!(op, CmpOp::Neq));
+                    }
+                    let mut has_null = false;
+                    for (k, av) in a.iter() {
+                        match b.get(k) {
+                            None => return Some(matches!(op, CmpOp::Neq)),
+                            Some(bv) => {
+                                match compare_values(&json_to_value(av), &CmpOp::Eq, &json_to_value(bv)) {
+                                    None => { has_null = true; }
+                                    Some(false) => return Some(matches!(op, CmpOp::Neq)),
+                                    Some(true) => {}
+                                }
+                            }
+                        }
+                    }
+                    if has_null { None } else { Some(matches!(op, CmpOp::Eq)) }
+                }
+                _ => None, // maps have no ordering
+            }
         }
         // Type mismatch: = and <> are defined (different types are not equal),
         // ordering operators return null.
