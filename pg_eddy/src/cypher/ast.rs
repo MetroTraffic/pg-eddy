@@ -2,6 +2,8 @@
 ///
 /// v0.7.0 scope: MATCH/WHERE/RETURN + ORDER BY/SKIP/LIMIT, string predicates,
 /// IN list membership, list literals, additional built-in functions.
+/// v0.10.0 scope: variable-length paths, named paths, path functions,
+/// shortestPath/allShortestPaths, pattern comprehensions.
 /// A sort key in ORDER BY.
 #[derive(Debug, Clone)]
 pub struct OrderItem {
@@ -50,8 +52,10 @@ pub enum QueryClause {
 
 /// A single pattern: a chain of nodes connected by relationships.
 /// `(a)-[r:KNOWS]->(b)-[:LIKES]->(c)` is one pattern with 3 nodes and 2 rels.
+/// `variable` names the whole path when present: `p = (a)-[r]->(b)`.
 #[derive(Debug, Clone)]
 pub struct Pattern {
+    pub variable: Option<String>, // named path: p = (a)-[r]->(b)
     pub elements: Vec<PatternElement>,
 }
 
@@ -77,6 +81,17 @@ pub struct RelPattern {
     pub rel_types: Vec<String>,
     pub direction: RelDirection,
     pub properties: Vec<(String, Expr)>,
+    /// Variable-length range: `*`, `*3`, `*1..5`, `*..5`, `*3..`.
+    /// `None` = fixed single hop (no `*`).
+    pub length: Option<VarLength>,
+}
+
+/// Variable-length range for `-[*min..max]-`.
+/// Both bounds are optional: `*` = `VarLength { min: 1, max: None }` (unbounded).
+#[derive(Debug, Clone)]
+pub struct VarLength {
+    pub min: u32,          // default 1
+    pub max: Option<u32>,  // None = unbounded
 }
 
 /// Direction of a relationship in a pattern.
@@ -180,6 +195,19 @@ pub enum Expr {
         list_expr: Box<Expr>,
         from: Option<Box<Expr>>,
         to: Option<Box<Expr>>,
+    },
+    /// shortestPath((a)-[r*]->(b)) or allShortestPaths(...)
+    ShortestPath {
+        all: bool,
+        pattern: Pattern,
+    },
+    /// Pattern comprehension: [(n)-[:R]->(m) | expr]
+    PatternComprehension {
+        #[allow(dead_code)]
+        path_variable: Option<String>,
+        pattern: Pattern,
+        predicate: Option<Box<Expr>>,
+        projection: Box<Expr>,
     },
 }
 

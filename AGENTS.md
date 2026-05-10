@@ -72,10 +72,16 @@ Before releasing a new version:
    files if needed (`pg_eddy--X.Y.Z--X.Y.W.sql`), and update `pg_eddy.control`.
 2. **Update CHANGELOG.md** — Document all changes, fixes, and features for the
    release.
-3. **Run tests** — Execute `cargo pgrx test pg18` to ensure all tests pass.
+3. **Run unit tests** — ⚠️ **REQUIRED GATE** — Execute `cargo pgrx test pg18`
+   and ensure all tests pass (all unit tests in `pg_eddy/src/` must pass).
+   Do not proceed to tagging if any tests fail.
 4. **Run clippy** — ⚠️ **REQUIRED GATE** — Execute `cargo clippy --features pg18`
    and ensure there are zero warnings. Do not proceed to tagging if clippy fails.
-5. **Update TCK badge** — If TCK pass rate changed, update `README.md` badge as
-   noted in the Testing section above.
-6. **Create git tag** — Tag the release with `git tag vX.Y.Z` and push to
+5. **Run TAP tests** — Execute `prove tests/tap/*.pl` to verify crash recovery
+   and edge cases work correctly.
+6. **Run TCK tests** — Execute `perl tests/tck/run_tck.pl` and update the badge
+   in `README.md` line 6 if the pass rate changes: 
+   `[![OpenCypher TCK](https://img.shields.io/badge/OpenCypher%20TCK-NN%2FNNNN%20passed-orange.svg)](tests/tck/)`
+   Replace `NN/NNNN` with the new count (e.g., `82/3881 passed`).
+7. **Create git tag** — Tag the release with `git tag vX.Y.Z` and push to
    repository. (Only after all gates above pass.)

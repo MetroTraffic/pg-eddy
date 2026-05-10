@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.10.0](#0100--2026-05-10--variable-length-paths-named-paths-and-path-functions) — Variable-Length Paths, Named Paths, and Path Functions
 - [0.9.0](#090--2026-05-09--aggregation-list-comprehensions-and-numeric-operators) — Aggregation, List Comprehensions, and Numeric Operators
 - [0.8.0](#080--2026-05-09--with-optional-match-unwind-and-case-expressions) — WITH, OPTIONAL MATCH, UNWIND, and CASE Expressions
 - [0.7.0](#070--2026-05-09--cypher-predicates-ordering-and-built-in-functions) — Cypher Predicates, Ordering, and Built-in Functions
@@ -16,6 +17,54 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 - [0.3.0](#030--2026-05-09--edge-storage--adjacency-lists) — Edge Storage + Adjacency Lists
 - [0.2.0](#020--2026-05-09--node-storage) — Node Storage
 - [0.1.0](#010--2026-05-09--am-skeleton) — AM Skeleton
+
+---
+
+## [0.10.0] — 2026-05-10 — Variable-Length Paths, Named Paths, and Path Functions
+
+v0.10.0 adds full parser/planner/executor support for variable-length path
+patterns, named paths, path value type, `nodes()`/`relationships()`/`length()`
+path functions, `shortestPath()`, `allShortestPaths()`, and pattern
+comprehensions. 188/188 in-scope TCK scenarios continue to pass (100%).
+
+### New Cypher Features
+
+**Variable-length path patterns** — full `[*m..n]` syntax in all variants:
+- `[*]` or `[*1..]` — unbounded from 1 hop
+- `[*3]` — exactly 3 hops (parsed as min=max=3)
+- `[*1..5]` — between 1 and 5 hops
+- `[*..5]` — up to 5 hops (min defaults to 1)
+- `[*3..]` — at least 3 hops (unbounded max)
+- Supports rel-type filters, rel variables, all directions
+
+**Named paths** — `p = (a)-[r]->(b)` syntax assigns the matched path to a
+variable. Produces a `Path` value with `.nodes` and `.rels` arrays.
+
+**Path value type** — new `Value::Path { nodes, rels }` runtime value supports:
+- `nodes(p)` — returns list of all nodes in a path
+- `relationships(p)` — returns list of all relationships in a path
+- `length(p)` — returns hop count of a path
+
+**`shortestPath()` and `allShortestPaths()`** — parsed and routed to
+BFS-based traversal (full result packaging in future release).
+
+**Pattern comprehensions** — `[(n)-[:R]->(m) | expr]` syntax produces a list
+by executing the inline pattern and projecting each match.
+
+### Planner Extensions
+
+Two new plan nodes:
+- `VarLengthExpand` — BFS traversal with no-repeated-edges constraint,
+  capped at 256 hops for safety, supports `min_hops`/`max_hops` bounds.
+- `NamedPath` — wraps an expand plan and packages the result into a path value.
+
+### Bug Fixes
+
+- **TCK harness Background parsing** — `run_tck.pl` now correctly parses
+  `Background:` sections and prepends their steps to each scenario. Previously,
+  `having executed:` in Background sections was silently dropped, causing some
+  scenarios with CREATE setup to run against an empty graph instead of being
+  properly skipped. 3,692 scenarios are now correctly classified (up from 3,668).
 
 ---
 

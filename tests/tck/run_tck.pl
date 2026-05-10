@@ -51,11 +51,6 @@ my @UNSUPPORTED_QUERY_PATTERNS = (
     [ qr/\bREMOVE\b/i,             'REMOVE'            ],
     [ qr/\bUNION\b/i,              'UNION'             ],
     [ qr/\bFOREACH\b/i,            'FOREACH'           ],
-    [ qr/-\[.*\*.*\]-/,            'variable-length path' ],
-    [ qr/\bshortestPath\b/i,       'shortestPath'      ],
-    [ qr/\ballShortestPaths\b/i,   'allShortestPaths'  ],
-    [ qr/\bnodes\b\s*\(/i,         'nodes()'           ],
-    [ qr/\brelationships\b\s*\(/i, 'relationships()'   ],
     [ qr/\bexists\b\s*\(/i,        'exists()'          ],
     # Map literal expressions in queries (not yet supported by parser)
     [ qr/\bRETURN\b.*\{[a-zA-Z_]\w*\s*:/si, 'map literal in RETURN expression' ],
@@ -473,13 +468,18 @@ sub parse_feature {
     my ($feature_name, @scenarios) = ('');
     my ($sc, $step, $in_doc, $doc_buf, $in_tbl, @tbl_rows) = (undef, undef, 0, '', 0);
     my ($in_ex, @ex_hdrs, @ex_rows) = (0);
+    my $in_background = 0;
+    my @background_steps;   # steps shared by all scenarios in this feature
 
     my $flush_step = sub {
-        return unless $sc && $step;
-        # Use @tbl_rows directly — $in_tbl may have been reset to 0 before this call
-        # (the elsif($in_tbl) branch clears it before the elsif keyword branch calls us).
+        return unless $step;
         $step->{table} = [@tbl_rows] if @tbl_rows;
-        push @{$sc->{steps}}, $step;
+        if ($in_background) {
+            # Accumulate into background steps, not into a scenario.
+            push @background_steps, $step;
+        } elsif ($sc) {
+            push @{$sc->{steps}}, $step;
+        }
         ($step, $in_tbl, @tbl_rows) = (undef, 0);
     };
 
@@ -503,6 +503,8 @@ sub parse_feature {
     my $flush_sc = sub {
         return unless $sc;
         $flush_step->();
+        # Prepend background steps to each scenario's steps.
+        unshift @{$sc->{steps}}, @background_steps if @background_steps;
         $sc->{is_outline} ? $expand->() : push(@scenarios, $sc);
         ($sc, $in_ex) = (undef, 0);
     };
@@ -523,17 +525,19 @@ sub parse_feature {
         elsif ($in_tbl)                   { $in_tbl = 0; }
 
         if    ($line =~ /^\s*Feature:\s*(.*)/)                  { $feature_name = $1; }
+        elsif ($line =~ /^\s*Background:/)                       { $flush_sc->(); $in_background = 1; @background_steps = (); }
         elsif ($line =~ /^\s*(Scenario Outline|Scenario):\s*(.*)/) {
+            $flush_step->(); $in_background = 0;  # flush last bg step before switching
             $flush_sc->();
             $sc = { label => "$feature_name — $2", file => $file,
                     is_outline => ($1 eq 'Scenario Outline'), steps => [] };
         }
-        elsif ($sc && $line =~ /^\s*Examples:/)                 { $flush_step->(); $in_ex = 1; (@ex_hdrs, @ex_rows) = (); }
-        elsif ($sc && $line =~ /^\s*(Given|When|Then|And|But)\s+(.*)/) {
+        elsif (($sc || $in_background) && $line =~ /^\s*Examples:/) { $flush_step->(); $in_ex = 1; (@ex_hdrs, @ex_rows) = (); }
+        elsif (($sc || $in_background) && $line =~ /^\s*(Given|When|Then|And|But)\s+(.*)/) {
             $flush_step->(); $step = { kw => $1, text => $2 };
         }
-        elsif ($sc && $step && $line =~ /^\s*"""/)              { $in_doc = 1; $doc_buf = ''; }
-        elsif ($sc && $step && $line =~ /^\s*\|/)               { push @tbl_rows, [_split_row($line)]; $in_tbl = 1; }
+        elsif (($sc || $in_background) && $step && $line =~ /^\s*"""/)  { $in_doc = 1; $doc_buf = ''; }
+        elsif (($sc || $in_background) && $step && $line =~ /^\s*\|/)   { push @tbl_rows, [_split_row($line)]; $in_tbl = 1; }
     }
     $flush_sc->();
     return @scenarios;

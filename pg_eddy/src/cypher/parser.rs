@@ -237,7 +237,21 @@ impl Parser {
     }
 
     /// Parse a single pattern chain: (n)-[r:T]->(m)
+    /// Supports named path: `p = (n)-[r:T]->(m)`.
     fn parse_pattern(&mut self) -> Result<Pattern, ParseError> {
+        // Check for named path: `identifier =`
+        let path_variable = if let Token::Ident(_) = self.peek() {
+            if *self.peek_at(1) == Token::Eq {
+                let name = self.eat_ident()?;
+                self.advance(); // consume `=`
+                Some(name)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let mut elements = Vec::new();
 
         // Must start with a node
@@ -260,7 +274,7 @@ impl Parser {
             }
         }
 
-        Ok(Pattern { elements })
+        Ok(Pattern { variable: path_variable, elements })
     }
 
     /// Parse: (variable:Label {key: value})
@@ -297,7 +311,7 @@ impl Parser {
     }
 
     /// Parse a relationship + the following node from a pattern chain.
-    /// Handles: -[r:T]->  <-[r:T]-  -[r:T]-
+    /// Handles: -[r:T]->  <-[r:T]-  -[r:T]-  and variable-length -[r*1..5]->
     fn parse_rel_and_node(&mut self) -> Result<(RelPattern, NodePattern), ParseError> {
         // Determine direction from leading arrow/dash
         let left_arrow = *self.peek() == Token::LArrow;
@@ -308,10 +322,11 @@ impl Parser {
             self.expect(&Token::Dash)?; // consume -
         }
 
-        // Parse relationship detail: [variable:TYPE {props}]
+        // Parse relationship detail: [variable:TYPE *min..max {props}]
         let mut variable = None;
         let mut rel_types = Vec::new();
         let mut properties = Vec::new();
+        let mut length: Option<VarLength> = None;
 
         if *self.peek() == Token::LBracket {
             self.advance(); // [
@@ -329,6 +344,32 @@ impl Parser {
                     self.advance();
                     rel_types.push(self.eat_ident()?);
                 }
+            }
+
+            // Optional variable-length: *  or *3  or *1..5  or *..5  or *3..
+            if *self.peek() == Token::Star {
+                self.advance(); // consume *
+                let min = if let Token::IntLit(n) = self.peek() {
+                    let n = *n as u32;
+                    self.advance();
+                    n
+                } else {
+                    1 // default minimum is 1
+                };
+                let max = if *self.peek() == Token::DotDot {
+                    self.advance(); // consume ..
+                    if let Token::IntLit(n) = self.peek() {
+                        let n = *n as u32;
+                        self.advance();
+                        Some(n)
+                    } else {
+                        None // unbounded: *3..
+                    }
+                } else {
+                    // Just *3 — exact length: min == max
+                    if min != 1 { Some(min) } else { None }
+                };
+                length = Some(VarLength { min, max });
             }
 
             // Optional properties
@@ -366,6 +407,7 @@ impl Parser {
                 rel_types,
                 direction,
                 properties,
+                length,
             },
             node,
         ))
@@ -677,11 +719,13 @@ impl Parser {
                 inner
             }
             Token::LBracket => {
-                // List comprehension: [var IN list WHERE? pred? | proj?]
-                // vs list literal: [expr, expr, ...]
-                // Detect by: Ident followed by Token::In at peek_at(1).
+                // Three cases:
+                // 1. List comprehension: [var IN list WHERE? pred? | proj?]  — Ident followed by IN
+                // 2. Pattern comprehension: [(n)-[r]->(m) | proj]  — starts with (
+                // 3. List literal: [expr, expr, ...]
                 self.advance();
                 if matches!(self.peek(), Token::Ident(_)) && *self.peek_at(1) == Token::In {
+                    // List comprehension
                     let var = self.eat_ident()?;
                     self.advance(); // consume IN
                     let list_expr = self.parse_expr()?;
@@ -703,6 +747,24 @@ impl Parser {
                         list_expr: Box::new(list_expr),
                         predicate,
                         projection,
+                    }
+                } else if *self.peek() == Token::LParen {
+                    // Pattern comprehension: [(n)-[:R]->(m) WHERE pred | expr]
+                    let pattern = self.parse_pattern()?;
+                    let predicate = if *self.peek() == Token::Where {
+                        self.advance();
+                        Some(Box::new(self.parse_expr()?))
+                    } else {
+                        None
+                    };
+                    self.expect(&Token::Pipe)?;
+                    let projection = self.parse_expr()?;
+                    self.expect(&Token::RBracket)?;
+                    Expr::PatternComprehension {
+                        path_variable: None,
+                        pattern,
+                        predicate,
+                        projection: Box::new(projection),
                     }
                 } else {
                     // List literal: [expr, expr, ...]
@@ -803,6 +865,17 @@ impl Parser {
 
                     // Aggregate functions: handle DISTINCT prefix
                     let is_agg = is_aggregate_fn_name(&lc);
+
+                    // shortestPath(pattern) / allShortestPaths(pattern)
+                    if lc == "shortestpath" || lc == "allshortestpaths" {
+                        let pattern = self.parse_pattern()?;
+                        self.expect(&Token::RParen)?;
+                        return Ok(Expr::ShortestPath {
+                            all: lc == "allshortestpaths",
+                            pattern,
+                        });
+                    }
+
                     let (fn_name, args) = if *self.peek() == Token::RParen {
                         (name.clone(), vec![])
                     } else if is_agg && *self.peek() == Token::Distinct {

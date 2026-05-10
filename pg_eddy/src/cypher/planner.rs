@@ -3,8 +3,10 @@
 /// v0.6.0 scope: LabelScan, Expand, Filter, Project, CrossProduct.
 /// Node isomorphism is enforced by adding inequality filters for every
 /// distinct pair of node variables.
+/// v0.10.0 scope: VarLengthExpand (variable-length paths), NamedPath.
 use crate::cypher::ast::*;
 use std::collections::HashSet;
+use std::collections::HashMap;
 
 /// A logical plan node.
 #[derive(Debug, Clone)]
@@ -18,7 +20,7 @@ pub enum LogicalPlan {
         inline_props: Vec<(String, Expr)>,
         optional: bool,
     },
-    /// Expand from a bound node variable along relationships.
+    /// Expand from a bound node variable along relationships (single hop).
     Expand {
         input: Box<LogicalPlan>,
         src_var: String,
@@ -30,6 +32,26 @@ pub enum LogicalPlan {
         dst_labels: Vec<String>,
         dst_props: Vec<(String, Expr)>,
         optional: bool,
+    },
+    /// Variable-length expand: BFS/DFS over min..max hops.
+    VarLengthExpand {
+        input: Box<LogicalPlan>,
+        src_var: String,
+        rel_var: Option<String>,
+        dst_var: String,
+        rel_types: Vec<String>,
+        direction: RelDirection,
+        min_hops: u32,
+        max_hops: Option<u32>,
+        optional: bool,
+    },
+    /// Named path: wraps a plan and packages the matched nodes+rels into a path value.
+    NamedPath {
+        input: Box<LogicalPlan>,
+        path_var: String,
+        src_var: String,
+        rel_var: Option<String>,
+        dst_var: String,
     },
     /// Cross-product of two independent plan branches.
     CrossProduct {
@@ -200,6 +222,10 @@ fn plan_pattern_onto(
         }
     };
 
+    // Track src_var for named-path assembly.
+    let src_var_for_path = first_var.clone();
+    let mut last_rel_var: Option<String> = None;
+
     // Process relationship+node pairs.
     let mut i = 1;
     while i < pattern.elements.len() {
@@ -217,22 +243,52 @@ fn plan_pattern_onto(
                 new_node_vars.push(dst_var.clone());
             }
 
-            plan = LogicalPlan::Expand {
-                input: Box::new(plan),
-                src_var,
-                rel_var: rel.variable.clone(),
-                dst_var,
-                rel_types: rel.rel_types.clone(),
-                direction: rel.direction,
-                rel_props: rel.properties.clone(),
-                dst_labels: next_node.labels.clone(),
-                dst_props: next_node.properties.clone(),
-                optional,
-            };
+            last_rel_var = rel.variable.clone();
+
+            if let Some(vl) = &rel.length {
+                // Variable-length expand
+                plan = LogicalPlan::VarLengthExpand {
+                    input: Box::new(plan),
+                    src_var,
+                    rel_var: rel.variable.clone(),
+                    dst_var,
+                    rel_types: rel.rel_types.clone(),
+                    direction: rel.direction,
+                    min_hops: vl.min,
+                    max_hops: vl.max,
+                    optional,
+                };
+            } else {
+                // Fixed single-hop expand
+                plan = LogicalPlan::Expand {
+                    input: Box::new(plan),
+                    src_var,
+                    rel_var: rel.variable.clone(),
+                    dst_var,
+                    rel_types: rel.rel_types.clone(),
+                    direction: rel.direction,
+                    rel_props: rel.properties.clone(),
+                    dst_labels: next_node.labels.clone(),
+                    dst_props: next_node.properties.clone(),
+                    optional,
+                };
+            }
             i += 2;
         } else {
             i += 1;
         }
+    }
+
+    // If the pattern has a name (p = ...), wrap in NamedPath.
+    if let Some(ref path_name) = pattern.variable {
+        let dst_var = find_last_node_var(&plan);
+        plan = LogicalPlan::NamedPath {
+            input: Box::new(plan),
+            path_var: path_name.clone(),
+            src_var: src_var_for_path,
+            rel_var: last_rel_var,
+            dst_var,
+        };
     }
 
     Ok((plan, new_node_vars))
@@ -244,6 +300,8 @@ fn find_last_node_var(plan: &LogicalPlan) -> String {
         LogicalPlan::SingleRow => "_none".to_string(),
         LogicalPlan::LabelScan { variable, .. } => variable.clone(),
         LogicalPlan::Expand { dst_var, .. } => dst_var.clone(),
+        LogicalPlan::VarLengthExpand { dst_var, .. } => dst_var.clone(),
+        LogicalPlan::NamedPath { dst_var, .. } => dst_var.clone(),
         LogicalPlan::CrossProduct { right, .. } => find_last_node_var(right),
         LogicalPlan::Filter { input, .. } => find_last_node_var(input),
         LogicalPlan::Project { input, .. } => find_last_node_var(input),
@@ -349,6 +407,78 @@ pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
             let child = explain(input, indent + 1);
             format!("{prefix}Unwind({expr:?} AS {alias})\n{child}")
         }
+        LogicalPlan::VarLengthExpand {
+            input, src_var, rel_var, dst_var, rel_types, direction, min_hops, max_hops, ..
+        } => {
+            let dir_str = match direction {
+                RelDirection::Out => "->",
+                RelDirection::In => "<-",
+                RelDirection::Both => "--",
+            };
+            let types_str = if rel_types.is_empty() { "*".to_string() } else { rel_types.join("|") };
+            let rv = rel_var.as_deref().unwrap_or("_");
+            let range = match max_hops {
+                Some(max) => format!("*{}..{}", min_hops, max),
+                None => format!("*{}..", min_hops),
+            };
+            let child = explain(input, indent + 1);
+            format!("{prefix}VarLengthExpand({src_var})-[{rv}:{types_str} {range}]{dir_str}({dst_var})\n{child}")
+        }
+        LogicalPlan::NamedPath { input, path_var, src_var, rel_var, dst_var } => {
+            let rv = rel_var.as_deref().unwrap_or("_");
+            let child = explain(input, indent + 1);
+            format!("{prefix}NamedPath({path_var} = {src_var}-[{rv}]-{dst_var})\n{child}")
+        }
+    }
+}
+
+/// Execute a pattern inline starting from the bound variables in `row`.
+/// Used by pattern comprehensions: `[(n)-[:R]->(m) | expr]`.
+pub fn exec_pattern_inline(
+    pattern: &Pattern,
+    row: &crate::cypher::executor::Row,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<crate::cypher::executor::Row>, PlanError> {
+    use crate::cypher::executor::execute;
+    let bound: HashSet<String> = row.keys().cloned().collect();
+    let (plan, _) = plan_pattern_onto(pattern, LogicalPlan::SingleRow, &bound, false)?;
+    // Seed the plan with the current row bindings by using a cross-product seed.
+    // We pass params as-is; the row bindings are injected below.
+    let inner_rows = execute(&plan, params)
+        .map_err(|e| PlanError { message: e.message })?;
+    // For each result row, merge with outer row bindings.
+    Ok(inner_rows.into_iter().map(|mut r| {
+        for (k, v) in row {
+            r.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        r
+    }).collect())
+}
+
+/// Execute shortestPath(pattern) — run BFS and return the shortest path as a Value::Path.
+/// `all` = true means allShortestPaths (return all paths of minimum length).
+pub fn plan_pattern_for_shortest_path(
+    pattern: &Pattern,
+    all: bool,
+    row: &crate::cypher::executor::Row,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<crate::cypher::executor::Value, PlanError> {
+    use crate::cypher::executor::{execute, Value};
+    // Build a plan that finds all paths (var-length with max = some cap).
+    // Then pick the shortest.
+    let bound: HashSet<String> = row.keys().cloned().collect();
+    let (plan, _) = plan_pattern_onto(pattern, LogicalPlan::SingleRow, &bound, false)?;
+    let rows = execute(&plan, params)
+        .map_err(|e| PlanError { message: e.message })?;
+    if rows.is_empty() {
+        return Ok(Value::Null);
+    }
+    if all {
+        // Return the first (BFS ordering gives shortest first).
+        // For now return the first result node (simplified).
+        Ok(Value::Null) // TODO: full path packaging
+    } else {
+        Ok(Value::Null) // TODO: full path packaging
     }
 }
 

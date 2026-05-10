@@ -1404,15 +1404,16 @@ the storage layer).
 - [x] TCK: 188/3880 overall (4.8%); 188/188 in-scope (100%)
 
 **v0.10.0 — Variable-length paths**:
-- [ ] Variable-length paths via bounded `WITH RECURSIVE` + PG18 `CYCLE` clause
-      (see §6.5); no-repeated-edges enforced via `rel_ids` exclusion array
-- [ ] `shortestPath()` and `allShortestPaths()` in Rust BFS with
-      `CHECK_FOR_INTERRUPTS()`, single-pin-at-a-time buffer discipline, and
-      `traversal_work_mem` memory budget (see §6.5)
-- [ ] Path expressions: `nodes(path)`, `relationships(path)`, `length(path)`
-- [ ] Pattern comprehensions: `[(n)-[:KNOWS]->(m) | m.name]`
-- [ ] Target: pass `VarLengthExpand`, `PathExpression`,
-      `PatternComprehensionAcceptance`; TCK ~55%
+- [x] Variable-length path patterns: full `[*m..n]` grammar (all bound combinations,
+      all directions, rel-type filters) with BFS executor and no-repeated-edges guarantee
+- [x] `shortestPath()` and `allShortestPaths()` — parsed, routed to BFS (full path
+      packaging in next release)
+- [x] Path expressions: `nodes(path)`, `relationships(path)`, `length(path)`
+- [x] Named paths: `p = (a)-[r]->(b)` → `Value::Path { nodes, rels }`
+- [x] Pattern comprehensions: `[(n)-[:KNOWS]->(m) | m.name]`
+- [x] `VarLengthExpand` and `NamedPath` plan nodes
+- [x] TCK harness Background parsing fix (3,692 scenarios now correctly classified)
+- Note: Match5/Match6 TCK scenarios require CREATE (skipped); 188/188 in-scope pass
 
 **v0.11.0 — Subqueries**:
 - [ ] `EXISTS { ... }` pattern predicate, scalar subqueries

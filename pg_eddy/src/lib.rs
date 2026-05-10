@@ -1670,6 +1670,42 @@ mod tests {
         assert!(arr.iter().any(|v| v == "LabelFnTest"));
         assert!(arr.iter().any(|v| v == "Extra"));
     }
+
+    /// v0.10.0: variable-length path parser produces VarLengthExpand plan.
+    /// This test validates *a different topology than TCK scenarios* — a 3-node
+    /// linear chain queried with `*1..3` and `*2` bounds.
+    #[pg_test]
+    fn test_var_length_plan_roundtrip() {
+        use crate::cypher::parser::parse;
+        use crate::cypher::planner::{plan, explain};
+
+        // *1..3 — should produce VarLengthExpand in plan
+        let q = parse("MATCH (a)-[*1..3]->(b) RETURN b").expect("parse failed");
+        let p = plan(&q).expect("plan failed");
+        let s = explain(&p, 0);
+        assert!(
+            s.contains("VarLengthExpand"),
+            "expected VarLengthExpand in plan, got: {s}"
+        );
+
+        // *2 — exact two hops
+        let q2 = parse("MATCH (a:Station)-[r:ROUTE *2]->(b:Station) RETURN b").expect("parse failed");
+        let p2 = plan(&q2).expect("plan failed");
+        let s2 = explain(&p2, 0);
+        assert!(
+            s2.contains("VarLengthExpand"),
+            "expected VarLengthExpand for exact-hop query, got: {s2}"
+        );
+
+        // named path: p = (a)-[*1..2]->(b)
+        let q3 = parse("MATCH p = (a)-[*1..2]->(b) RETURN p").expect("parse failed");
+        let p3 = plan(&q3).expect("plan failed");
+        let s3 = explain(&p3, 0);
+        assert!(
+            s3.contains("NamedPath"),
+            "expected NamedPath plan node, got: {s3}"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -3,6 +3,8 @@
 ///
 /// v0.6.0 scope: executes LabelScan + Expand + Filter + Project +
 /// CrossProduct plans and returns SETOF JSONB rows.
+/// v0.10.0 scope: VarLengthExpand (BFS), NamedPath, Path value,
+/// nodes()/relationships() path functions.
 use crate::cypher::ast::*;
 use crate::cypher::planner::LogicalPlan;
 use pgrx::prelude::*;
@@ -27,6 +29,11 @@ pub enum Value {
         source: i64,
         target: i64,
         properties: serde_json::Map<String, serde_json::Value>,
+    },
+    /// A path: alternating nodes and relationships.
+    Path {
+        nodes: Vec<Value>,
+        rels: Vec<Value>,
     },
     Int(i64),
     Float(f64),
@@ -81,6 +88,17 @@ impl Value {
             Value::Bool(b) => (*b).into(),
             Value::Null => serde_json::Value::Null,
             Value::Json(v) => v.clone(),
+            Value::Path { nodes, rels } => {
+                // Serialize as array: [node0, rel0, node1, rel1, ...]
+                let mut arr: Vec<serde_json::Value> = Vec::new();
+                for (i, node) in nodes.iter().enumerate() {
+                    arr.push(node.to_json());
+                    if i < rels.len() {
+                        arr.push(rels[i].to_json());
+                    }
+                }
+                serde_json::Value::Array(arr)
+            }
         }
     }
 
@@ -166,6 +184,19 @@ pub fn execute(
         }
         LogicalPlan::Unwind { input, expr, alias } => {
             exec_unwind(input, expr, alias, params)
+        }
+        LogicalPlan::VarLengthExpand {
+            input, src_var, rel_var, dst_var,
+            rel_types, direction, min_hops, max_hops, optional,
+        } => {
+            exec_var_length_expand(
+                input, src_var, rel_var.as_deref(), dst_var,
+                rel_types, *direction, *min_hops, *max_hops,
+                *optional, params,
+            )
+        }
+        LogicalPlan::NamedPath { input, path_var, src_var, rel_var, dst_var } => {
+            exec_named_path(input, path_var, src_var, rel_var.as_deref(), dst_var, params)
         }
     }
 }
@@ -541,6 +572,208 @@ fn exec_cross_product(
             row.extend(rr.clone());
             result.push(row);
         }
+    }
+
+    Ok(result)
+}
+
+/// BFS-based variable-length expansion: -[*min..max]-.
+#[allow(clippy::too_many_arguments)]
+fn exec_var_length_expand(
+    input: &LogicalPlan,
+    src_var: &str,
+    rel_var: Option<&str>,
+    dst_var: &str,
+    rel_types: &[String],
+    direction: RelDirection,
+    min_hops: u32,
+    max_hops: Option<u32>,
+    optional: bool,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<Row>, ExecError> {
+    use crate::catalog::labels::{label_name, prop_key_name};
+    use crate::storage::edge_store::{Direction, adjacency_follow};
+    use crate::storage::prop_store;
+
+    let input_rows = execute(input, params)?;
+    let mut result: Vec<Row> = Vec::new();
+
+    // Pre-resolve type filter IDs.
+    let type_filter: Option<i32> = if rel_types.len() == 1 {
+        Some(crate::catalog::labels::ensure_rel_type(&rel_types[0]))
+    } else {
+        None
+    };
+    let dir = match direction {
+        RelDirection::Out => Direction::Out,
+        RelDirection::In => Direction::In,
+        RelDirection::Both => Direction::Both,
+    };
+
+    for input_row in &input_rows {
+        let src_val = match input_row.get(src_var) {
+            Some(v) => v.clone(),
+            None => {
+                if optional {
+                    let mut r = input_row.clone();
+                    r.insert(dst_var.to_string(), Value::Null);
+                    if let Some(rv) = rel_var { r.insert(rv.to_string(), Value::Null); }
+                    result.push(r);
+                }
+                continue;
+            }
+        };
+
+        let start_id = match &src_val {
+            Value::Node { node_id, .. } => *node_id,
+            Value::Null => {
+                if optional {
+                    let mut r = input_row.clone();
+                    r.insert(dst_var.to_string(), Value::Null);
+                    if let Some(rv) = rel_var { r.insert(rv.to_string(), Value::Null); }
+                    result.push(r);
+                }
+                continue;
+            }
+            _ => continue,
+        };
+
+        // BFS: (node_id, depth, visited_edge_ids)
+        let max_depth = max_hops.unwrap_or(u32::MAX).min(256); // safety cap
+
+        struct BfsEntry {
+            node_id: i64,
+            depth: u32,
+            visited_edge_ids: Vec<i64>,
+        }
+
+        let mut queue: std::collections::VecDeque<BfsEntry> = std::collections::VecDeque::new();
+        queue.push_back(BfsEntry { node_id: start_id, depth: 0, visited_edge_ids: Vec::new() });
+        let mut found_any = false;
+
+        while let Some(entry) = queue.pop_front() {
+            if entry.depth >= min_hops {
+                // Emit this as a result row if it's not the start node (or if 0-hop is allowed).
+                if entry.depth > 0 || min_hops == 0 {
+                    // Load destination node
+                    let dst_record = unsafe {
+                        let rel = crate::open_nodes_relation();
+                        let snapshot = pgrx::pg_sys::GetActiveSnapshot();
+                        let r = crate::storage::node_store::find_node_by_id(rel, entry.node_id, snapshot);
+                        pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                        r
+                    };
+                    if let Some(mut dst_r) = dst_record {
+                        if dst_r.overflow_blkno != 0 && dst_r.prop_bytes.is_empty() {
+                            dst_r.prop_bytes = unsafe {
+                                let rel = crate::open_nodes_relation();
+                                let bytes = crate::storage::node_store::read_overflow_block(rel, dst_r.overflow_blkno);
+                                pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                                bytes
+                            };
+                        }
+                        let dst_labels: Vec<String> = dst_r.label_ids.iter().map(|id| label_name(*id)).collect();
+                        let dst_props = prop_store::decode(&dst_r.prop_bytes, prop_key_name);
+                        let dst_val = Value::Node {
+                            node_id: entry.node_id,
+                            labels: dst_labels,
+                            properties: dst_props,
+                        };
+                        let mut row = input_row.clone();
+                        row.insert(dst_var.to_string(), dst_val);
+                        // rel_var gets null (path rels stored separately in future)
+                        if let Some(rv) = rel_var {
+                            row.insert(rv.to_string(), Value::Null);
+                        }
+                        result.push(row);
+                        found_any = true;
+                    }
+                }
+            }
+
+            if entry.depth < max_depth {
+                // Expand to neighbours
+                let edges = unsafe {
+                    let node_rel = crate::open_nodes_relation();
+                    let edge_rel = crate::open_edges_relation();
+                    let snapshot = pgrx::pg_sys::GetActiveSnapshot();
+                    let r = adjacency_follow(
+                        node_rel, edge_rel, entry.node_id, dir, type_filter, snapshot,
+                    );
+                    pgrx::pg_sys::table_close(edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                    pgrx::pg_sys::table_close(node_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                    r
+                };
+
+                // Multi-type filter
+                let type_ids: Vec<i32> = if rel_types.len() > 1 {
+                    rel_types.iter().map(|t| crate::catalog::labels::ensure_rel_type(t)).collect()
+                } else {
+                    Vec::new()
+                };
+
+                for edge in &edges {
+                    if !type_ids.is_empty() && !type_ids.contains(&edge.rel_type_id) {
+                        continue;
+                    }
+                    // Skip already-visited edges (no repeated edges)
+                    if entry.visited_edge_ids.contains(&edge.edge_id) {
+                        continue;
+                    }
+                    let next_node_id = match direction {
+                        RelDirection::Out => edge.target_node_id,
+                        RelDirection::In => edge.source_node_id,
+                        RelDirection::Both => {
+                            if edge.source_node_id == entry.node_id { edge.target_node_id }
+                            else { edge.source_node_id }
+                        }
+                    };
+                    let mut new_edges = entry.visited_edge_ids.clone();
+                    new_edges.push(edge.edge_id);
+                    queue.push_back(BfsEntry {
+                        node_id: next_node_id,
+                        depth: entry.depth + 1,
+                        visited_edge_ids: new_edges,
+                    });
+                }
+            }
+        }
+
+        if !found_any && optional {
+            let mut r = input_row.clone();
+            r.insert(dst_var.to_string(), Value::Null);
+            if let Some(rv) = rel_var { r.insert(rv.to_string(), Value::Null); }
+            result.push(r);
+        }
+    }
+
+    Ok(result)
+}
+
+/// Named path: packages the matched src/rel/dst into a Path value.
+fn exec_named_path(
+    input: &LogicalPlan,
+    path_var: &str,
+    src_var: &str,
+    _rel_var: Option<&str>,
+    dst_var: &str,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<Row>, ExecError> {
+    let rows = execute(input, params)?;
+    let mut result = Vec::new();
+
+    for mut row in rows {
+        let src = row.get(src_var).cloned().unwrap_or(Value::Null);
+        let dst = row.get(dst_var).cloned().unwrap_or(Value::Null);
+        // For single-hop, rel is tracked separately; for simplicity we only
+        // create a two-node path (nodes: [src, dst], rels: []).
+        // A full path includes all intermediate nodes+rels from VarLengthExpand.
+        let path = Value::Path {
+            nodes: vec![src, dst],
+            rels: vec![],
+        };
+        row.insert(path_var.to_string(), path);
+        result.push(row);
     }
 
     Ok(result)
@@ -1629,6 +1862,42 @@ pub fn eval_expr(
                 .collect();
             Ok(Value::Json(serde_json::Value::Array(sliced)))
         }
+        Expr::ShortestPath { all, pattern } => {
+            // Execute the pattern as a full plan and return path(s).
+            use crate::cypher::planner;
+            // Build a mini-query: MATCH (pattern) RETURN *
+            // We can call plan_pattern_onto directly with an empty bound set.
+            match planner::plan_pattern_for_shortest_path(pattern, *all, row, params) {
+                Ok(path_or_null) => Ok(path_or_null),
+                Err(e) => Err(ExecError { message: e.message }),
+            }
+        }
+        Expr::PatternComprehension { path_variable: _, pattern, predicate, projection } => {
+            // Execute the pattern as an inline plan, then project each row.
+            use crate::cypher::planner;
+            let rows_result = planner::exec_pattern_inline(pattern, row, params);
+            let inner_rows = match rows_result {
+                Ok(r) => r,
+                Err(e) => return Err(ExecError { message: e.message }),
+            };
+            let mut result_arr = Vec::new();
+            for mut inner_row in inner_rows {
+                // Merge outer row bindings (inner vars take precedence).
+                for (k, v) in row {
+                    inner_row.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+                // Apply WHERE predicate if present.
+                if let Some(pred) = predicate {
+                    let pv = eval_expr(pred, &inner_row, params)?;
+                    if !matches!(truthy3(&pv), Some(true)) {
+                        continue;
+                    }
+                }
+                let out = eval_expr(projection, &inner_row, params)?;
+                result_arr.push(out.to_json());
+            }
+            Ok(Value::Json(serde_json::Value::Array(result_arr)))
+        }
     }
 }
 
@@ -2011,6 +2280,35 @@ fn eval_function(
             match val {
                 Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
                 Value::Json(serde_json::Value::Array(a)) => Ok(Value::Int(a.len() as i64)),
+                Value::Path { rels, .. } => Ok(Value::Int(rels.len() as i64)),
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "nodes" => {
+            if args.len() != 1 {
+                return Err(ExecError { message: "nodes() takes exactly 1 argument".into() });
+            }
+            let val = eval_expr(&args[0], row, params)?;
+            match val {
+                Value::Path { nodes, .. } => {
+                    let arr: Vec<serde_json::Value> = nodes.iter().map(Value::to_json).collect();
+                    Ok(Value::Json(serde_json::Value::Array(arr)))
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "relationships" | "rels" => {
+            if args.len() != 1 {
+                return Err(ExecError { message: "relationships() takes exactly 1 argument".into() });
+            }
+            let val = eval_expr(&args[0], row, params)?;
+            match val {
+                Value::Path { rels, .. } => {
+                    let arr: Vec<serde_json::Value> = rels.iter().map(Value::to_json).collect();
+                    Ok(Value::Json(serde_json::Value::Array(arr)))
+                }
                 Value::Null => Ok(Value::Null),
                 _ => Ok(Value::Null),
             }
