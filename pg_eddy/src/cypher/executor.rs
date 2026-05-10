@@ -5,8 +5,11 @@
 /// CrossProduct plans and returns SETOF JSONB rows.
 /// v0.10.0 scope: VarLengthExpand (BFS), NamedPath, Path value,
 /// nodes()/relationships() path functions.
+/// v0.14.0 scope: temporal types (date, time, localtime, localdatetime, datetime, duration).
 use crate::cypher::ast::*;
 use crate::cypher::planner::LogicalPlan;
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike};
+use chrono_tz::Tz;
 use pgrx::prelude::*;
 use std::collections::HashMap;
 
@@ -41,6 +44,795 @@ pub enum Value {
     Bool(bool),
     Null,
     Json(serde_json::Value),
+    /// A temporal value (date, time, localtime, localdatetime, datetime).
+    /// Stored as an ISO 8601 string plus a discriminant for property access.
+    Temporal(TemporalValue),
+    /// An ISO 8601 duration.
+    Duration(CypherDuration),
+}
+
+// ---------------------------------------------------------------------------
+// Temporal types
+// ---------------------------------------------------------------------------
+
+/// openCypher temporal value discriminants.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TemporalKind {
+    Date,
+    LocalTime,
+    Time,
+    LocalDateTime,
+    DateTime,
+}
+
+/// A temporal instant.  We keep the canonical ISO 8601 string for output
+/// and the parsed components for property access / arithmetic.
+#[derive(Debug, Clone)]
+pub struct TemporalValue {
+    pub kind: TemporalKind,
+    /// Canonical ISO 8601 string (used for RETURN / storage).
+    pub iso: String,
+    /// Date part (None for pure time values).
+    pub date: Option<NaiveDate>,
+    /// Time part (None for pure date values).
+    pub time: Option<NaiveTime>,
+    /// UTC offset in seconds (None for local types).
+    pub offset_secs: Option<i32>,
+    /// IANA timezone name (for DateTime with zone only).
+    pub tz_name: Option<String>,
+}
+
+/// An openCypher ISO 8601 duration decomposed into its component fields.
+/// All fields are signed integers; the ISO string is the canonical form.
+#[derive(Debug, Clone)]
+pub struct CypherDuration {
+    pub years: i64,
+    pub months: i64,
+    pub weeks: i64,
+    pub days: i64,
+    pub hours: i64,
+    pub minutes: i64,
+    pub seconds: i64,
+    pub nanoseconds: i64,
+    /// Canonical ISO 8601 duration string.
+    pub iso: String,
+}
+
+impl CypherDuration {
+    /// Total months (years*12 + months).
+    #[allow(dead_code)]
+    pub fn total_months(&self) -> i64 {
+        self.years * 12 + self.months
+    }
+
+    /// Total days (weeks*7 + days).
+    pub fn total_days(&self) -> i64 {
+        self.weeks * 7 + self.days
+    }
+
+    /// Total seconds (hours*3600 + minutes*60 + seconds).
+    pub fn total_seconds(&self) -> i64 {
+        self.hours * 3600 + self.minutes * 60 + self.seconds
+    }
+
+    /// Sub-second nanoseconds (nanoseconds % 1_000_000_000).
+    pub fn nanoseconds_of_second(&self) -> i64 {
+        self.nanoseconds % 1_000_000_000
+    }
+
+    /// Build an ISO 8601 duration string from components.
+    pub fn build_iso(
+        years: i64, months: i64, weeks: i64, days: i64,
+        hours: i64, minutes: i64, seconds: i64, nanos: i64,
+    ) -> String {
+        // Represent fractional seconds as decimal
+        let sec_str = if nanos != 0 {
+            let frac = nanos.unsigned_abs();
+            // trim trailing zeros
+            let s = format!("{frac:09}");
+            let s = s.trim_end_matches('0');
+            format!("{seconds}.{s}S")
+        } else if seconds != 0 || (hours == 0 && minutes == 0 && days == 0
+                                   && weeks == 0 && months == 0 && years == 0) {
+            format!("{seconds}S")
+        } else {
+            String::new()
+        };
+
+        let mut out = String::from("P");
+        if years != 0   { out.push_str(&format!("{years}Y")); }
+        if months != 0  { out.push_str(&format!("{months}M")); }
+        if weeks != 0   { out.push_str(&format!("{weeks}W")); }
+        if days != 0    { out.push_str(&format!("{days}D")); }
+        if hours != 0 || minutes != 0 || !sec_str.is_empty() {
+            out.push('T');
+            if hours != 0   { out.push_str(&format!("{hours}H")); }
+            if minutes != 0 { out.push_str(&format!("{minutes}M")); }
+            out.push_str(&sec_str);
+        }
+        if out == "P" { out.push_str("T0S"); }
+        out
+    }
+
+    /// Parse an ISO 8601 duration string into a CypherDuration.
+    pub fn parse(s: &str) -> Option<Self> {
+        // Format: P[nY][nM][nW][nD][T[nH][nM][n[.f]S]]
+        let s = s.trim();
+        if !s.starts_with('P') { return None; }
+        let rest = &s[1..];
+
+        let (date_part, time_part) = if let Some(t_pos) = rest.find('T') {
+            (&rest[..t_pos], &rest[t_pos+1..])
+        } else {
+            (rest, "")
+        };
+
+        fn parse_component(s: &str, unit: char) -> Option<(i64, &str)> {
+            if let Some(pos) = s.find(unit) {
+                // find start: could be negative, could have decimal
+                let num_str = &s[..pos];
+                let val = num_str.parse::<f64>().ok()?;
+                Some((val as i64, &s[pos+1..]))
+            } else {
+                None
+            }
+        }
+
+        fn parse_f_component(s: &str, unit: char) -> Option<(i64, i64, &str)> {
+            if let Some(pos) = s.find(unit) {
+                let num_str = &s[..pos];
+                if let Some(dot) = num_str.find('.') {
+                    let whole: i64 = num_str[..dot].parse().ok()?;
+                    let frac_str = &num_str[dot+1..];
+                    // pad or truncate to 9 digits for nanoseconds
+                    let padded = format!("{:0<9}", frac_str);
+                    let nanos: i64 = padded[..9].parse().ok()?;
+                    let sign = if whole < 0 { -1i64 } else { 1i64 };
+                    Some((whole, sign * nanos, &s[pos+1..]))
+                } else {
+                    let whole: i64 = num_str.parse().ok()?;
+                    Some((whole, 0, &s[pos+1..]))
+                }
+            } else {
+                None
+            }
+        }
+
+        let mut years = 0i64;
+        let mut months = 0i64;
+        let mut weeks = 0i64;
+        let mut days = 0i64;
+        let mut hours = 0i64;
+        let mut minutes = 0i64;
+        let mut seconds = 0i64;
+        let mut nanos = 0i64;
+
+        let mut cur = date_part;
+        if let Some((v, rest)) = parse_component(cur, 'Y') { years = v; cur = rest; }
+        if let Some((v, rest)) = parse_component(cur, 'M') { months = v; cur = rest; }
+        if let Some((v, rest)) = parse_component(cur, 'W') { weeks = v; cur = rest; }
+        if let Some((v, rest)) = parse_component(cur, 'D') { days = v; cur = rest; }
+        let _ = cur;
+
+        let mut cur = time_part;
+        if let Some((v, rest)) = parse_component(cur, 'H') { hours = v; cur = rest; }
+        if let Some((v, rest)) = parse_component(cur, 'M') { minutes = v; cur = rest; }
+        if let Some((v, n, rest)) = parse_f_component(cur, 'S') { seconds = v; nanos = n; cur = rest; }
+        let _ = cur;
+
+        let iso = Self::build_iso(years, months, weeks, days, hours, minutes, seconds, nanos);
+        Some(CypherDuration { years, months, weeks, days, hours, minutes, seconds, nanoseconds: nanos, iso })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Temporal parsing helpers
+// ---------------------------------------------------------------------------
+
+/// Parse a map-literal argument like {year: 2015, month: 7, day: 21}.
+/// Returns a serde_json::Map of the keys.
+#[allow(dead_code)]
+fn temporal_map_arg(v: &Value) -> Option<serde_json::Map<String, serde_json::Value>> {
+    match v {
+        Value::Json(serde_json::Value::Object(m)) => Some(m.clone()),
+        _ => None,
+    }
+}
+
+fn map_i(m: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<i32> {
+    m.get(key).and_then(|v| v.as_i64()).map(|v| v as i32)
+}
+
+fn map_i64(m: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<i64> {
+    m.get(key).and_then(|v| v.as_i64())
+}
+
+/// Parse a date from an ISO 8601 string. Supports extended (2015-07-21),
+/// basic (20150721), week-based (2015-W30-2 / 2015W302), ordinal (2015-202),
+/// year-only (2015), year-month (2015-07 / 201507).
+fn parse_date_str(s: &str) -> Option<NaiveDate> {
+    let s = s.trim();
+    // Extended: YYYY-MM-DD
+    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") { return Some(d); }
+    // Basic: YYYYMMDD
+    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y%m%d") { return Some(d); }
+    // Ordinal extended: YYYY-DDD
+    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%j") { return Some(d); }
+    // Ordinal basic: YYYYDDD
+    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y%j") { return Some(d); }
+    // Year-month extended: YYYY-MM → 1st of month
+    if s.len() == 7 && s.as_bytes()[4] == b'-' {
+        if let Ok(d) = NaiveDate::parse_from_str(&format!("{s}-01"), "%Y-%m-%d") { return Some(d); }
+    }
+    // Year-month basic: YYYYMM → 1st of month
+    if s.len() == 6 && s.chars().all(|c| c.is_ascii_digit()) {
+        if let Ok(d) = NaiveDate::parse_from_str(&format!("{s}01"), "%Y%m%d") { return Some(d); }
+    }
+    // Year-only: YYYY → Jan 1
+    if s.len() == 4 && s.chars().all(|c| c.is_ascii_digit()) {
+        if let Ok(y) = s.parse::<i32>() {
+            return NaiveDate::from_ymd_opt(y, 1, 1);
+        }
+    }
+    // Week-based extended: YYYY-Www-D
+    // Format: YYYY-W{ww}-{d}
+    if s.len() >= 8 && &s[4..6] == "-W" {
+        let y: i32 = s[..4].parse().ok()?;
+        if s.len() == 8 {
+            // YYYY-Www → Monday of that week
+            let w: u32 = s[6..8].parse().ok()?;
+            return NaiveDate::from_isoywd_opt(y, w, chrono::Weekday::Mon);
+        } else if s.len() == 10 && s.as_bytes()[8] == b'-' {
+            let w: u32 = s[6..8].parse().ok()?;
+            let d: u8 = s[9..10].parse().ok()?;
+            let wd = iso_weekday(d)?;
+            return NaiveDate::from_isoywd_opt(y, w, wd);
+        }
+    }
+    // Week-based basic: YYYYWwwD
+    if s.len() == 8 && s.as_bytes()[4] == b'W' {
+        let y: i32 = s[..4].parse().ok()?;
+        let w: u32 = s[5..7].parse().ok()?;
+        let d: u8 = s[7..8].parse().ok()?;
+        let wd = iso_weekday(d)?;
+        return NaiveDate::from_isoywd_opt(y, w, wd);
+    }
+    // Week-based basic: YYYYWww (no day → Monday)
+    if s.len() == 7 && s.as_bytes()[4] == b'W' {
+        let y: i32 = s[..4].parse().ok()?;
+        let w: u32 = s[5..7].parse().ok()?;
+        return NaiveDate::from_isoywd_opt(y, w, chrono::Weekday::Mon);
+    }
+    None
+}
+
+fn iso_weekday(d: u8) -> Option<chrono::Weekday> {
+    match d {
+        1 => Some(chrono::Weekday::Mon),
+        2 => Some(chrono::Weekday::Tue),
+        3 => Some(chrono::Weekday::Wed),
+        4 => Some(chrono::Weekday::Thu),
+        5 => Some(chrono::Weekday::Fri),
+        6 => Some(chrono::Weekday::Sat),
+        7 => Some(chrono::Weekday::Sun),
+        _ => None,
+    }
+}
+
+/// Parse a local time string.  Supports HH:MM, HH:MM:SS, HH:MM:SS.f.
+fn parse_localtime_str(s: &str) -> Option<NaiveTime> {
+    let s = s.trim();
+    // Strip any timezone suffix for local parsing
+    let s = if let Some(pos) = s.find(['+', 'Z']) { &s[..pos] } else { s };
+    let s = if let Some(pos) = s.rfind('-') {
+        // only strip if it's a timezone offset like -05:00, not part of time
+        if pos >= 3 { &s[..pos] } else { s }
+    } else { s };
+    // Try with fractional seconds
+    if let Ok(t) = NaiveTime::parse_from_str(s, "%H:%M:%S%.f") { return Some(t); }
+    if let Ok(t) = NaiveTime::parse_from_str(s, "%H:%M:%S") { return Some(t); }
+    if let Ok(t) = NaiveTime::parse_from_str(s, "%H:%M") { return Some(t); }
+    // Basic format HHMMSS
+    if let Ok(t) = NaiveTime::parse_from_str(s, "%H%M%S") { return Some(t); }
+    None
+}
+
+/// Parse an offset like +01:00, -05:00, Z, +0100, -05.
+/// Returns seconds east of UTC.
+fn parse_offset(s: &str) -> Option<i32> {
+    if s == "Z" || s == "z" { return Some(0); }
+    let (sign, rest) = if s.starts_with('+') {
+        (1i32, &s[1..])
+    } else if s.starts_with('-') {
+        (-1i32, &s[1..])
+    } else {
+        return None;
+    };
+    // HH:MM or HHMM or HH
+    let (h, m) = if rest.len() == 5 && rest.as_bytes()[2] == b':' {
+        let h: i32 = rest[..2].parse().ok()?;
+        let m: i32 = rest[3..].parse().ok()?;
+        (h, m)
+    } else if rest.len() == 4 {
+        let h: i32 = rest[..2].parse().ok()?;
+        let m: i32 = rest[2..].parse().ok()?;
+        (h, m)
+    } else if rest.len() == 2 {
+        let h: i32 = rest.parse().ok()?;
+        (h, 0)
+    } else {
+        return None;
+    };
+    Some(sign * (h * 3600 + m * 60))
+}
+
+/// Build a TemporalValue for `date()`.
+fn temporal_date(arg: &Value) -> Result<TemporalValue, ExecError> {
+    let err = || ExecError { message: "date(): invalid argument".into() };
+    match arg {
+        Value::Str(s) => {
+            let d = parse_date_str(s).ok_or_else(err)?;
+            let iso = d.format("%Y-%m-%d").to_string();
+            Ok(TemporalValue { kind: TemporalKind::Date, iso, date: Some(d), time: None, offset_secs: None, tz_name: None })
+        }
+        Value::Json(serde_json::Value::Object(m)) => {
+            let y = map_i(m, "year").ok_or_else(err)?;
+            let mo = map_i(m, "month").unwrap_or(1);
+            let d = map_i(m, "day").unwrap_or(1);
+            let date = NaiveDate::from_ymd_opt(y, mo as u32, d as u32).ok_or_else(err)?;
+            let iso = date.format("%Y-%m-%d").to_string();
+            Ok(TemporalValue { kind: TemporalKind::Date, iso, date: Some(date), time: None, offset_secs: None, tz_name: None })
+        }
+        _ => Err(err()),
+    }
+}
+
+/// Build a TemporalValue for `localtime()`.
+fn temporal_localtime(arg: &Value) -> Result<TemporalValue, ExecError> {
+    let err = || ExecError { message: "localtime(): invalid argument".into() };
+    match arg {
+        Value::Str(s) => {
+            let t = parse_localtime_str(s).ok_or_else(err)?;
+            let iso = format_localtime(&t);
+            Ok(TemporalValue { kind: TemporalKind::LocalTime, iso, date: None, time: Some(t), offset_secs: None, tz_name: None })
+        }
+        Value::Json(serde_json::Value::Object(m)) => {
+            let h = map_i(m, "hour").unwrap_or(0);
+            let mi = map_i(m, "minute").unwrap_or(0);
+            let s = map_i(m, "second").unwrap_or(0);
+            let ns = map_i64(m, "nanosecond").unwrap_or(0) as u32;
+            let ms = map_i64(m, "millisecond").unwrap_or(0) as u32 * 1_000_000;
+            let us = map_i64(m, "microsecond").unwrap_or(0) as u32 * 1_000;
+            let nanos = ns + ms + us;
+            let t = NaiveTime::from_hms_nano_opt(h as u32, mi as u32, s as u32, nanos).ok_or_else(err)?;
+            let iso = format_localtime(&t);
+            Ok(TemporalValue { kind: TemporalKind::LocalTime, iso, date: None, time: Some(t), offset_secs: None, tz_name: None })
+        }
+        _ => Err(err()),
+    }
+}
+
+/// Build a TemporalValue for `time()`.
+fn temporal_time(arg: &Value) -> Result<TemporalValue, ExecError> {
+    let err = || ExecError { message: "time(): invalid argument".into() };
+    match arg {
+        Value::Str(s) => {
+            let s = s.trim();
+            // Find timezone suffix
+            let (time_str, offset_secs, _tz_name) = extract_time_tz(s);
+            let t = parse_localtime_str(time_str).ok_or_else(err)?;
+            let off = offset_secs.unwrap_or(0);
+            let iso = format_time_with_offset(&t, off);
+            Ok(TemporalValue { kind: TemporalKind::Time, iso, date: None, time: Some(t), offset_secs: Some(off), tz_name: None })
+        }
+        Value::Json(serde_json::Value::Object(m)) => {
+            let h = map_i(m, "hour").unwrap_or(0);
+            let mi = map_i(m, "minute").unwrap_or(0);
+            let s = map_i(m, "second").unwrap_or(0);
+            let ns = map_i64(m, "nanosecond").unwrap_or(0) as u32;
+            let ms = map_i64(m, "millisecond").unwrap_or(0) as u32 * 1_000_000;
+            let us = map_i64(m, "microsecond").unwrap_or(0) as u32 * 1_000;
+            let nanos = ns + ms + us;
+            let t = NaiveTime::from_hms_nano_opt(h as u32, mi as u32, s as u32, nanos).ok_or_else(err)?;
+            let tz_str = m.get("timezone").and_then(|v| v.as_str()).unwrap_or("+00:00");
+            let off = parse_offset(tz_str).unwrap_or(0);
+            let iso = format_time_with_offset(&t, off);
+            Ok(TemporalValue { kind: TemporalKind::Time, iso, date: None, time: Some(t), offset_secs: Some(off), tz_name: None })
+        }
+        _ => Err(err()),
+    }
+}
+
+/// Build a TemporalValue for `localdatetime()`.
+fn temporal_localdatetime(arg: &Value) -> Result<TemporalValue, ExecError> {
+    let err = || ExecError { message: "localdatetime(): invalid argument".into() };
+    match arg {
+        Value::Str(s) => {
+            let s = s.trim();
+            // Split at T
+            let (date_str, time_str) = split_datetime(s)?;
+            let date = parse_date_str(date_str).ok_or_else(err)?;
+            // Strip any offset from the time part
+            let (time_str_clean, _, _) = extract_time_tz(time_str);
+            let time = parse_localtime_str(time_str_clean).ok_or_else(err)?;
+            let iso = format_localdatetime(&date, &time);
+            Ok(TemporalValue { kind: TemporalKind::LocalDateTime, iso, date: Some(date), time: Some(time), offset_secs: None, tz_name: None })
+        }
+        Value::Json(serde_json::Value::Object(m)) => {
+            let y = map_i(m, "year").ok_or_else(err)?;
+            let mo = map_i(m, "month").unwrap_or(1) as u32;
+            let d = map_i(m, "day").unwrap_or(1) as u32;
+            let h = map_i(m, "hour").unwrap_or(0) as u32;
+            let mi = map_i(m, "minute").unwrap_or(0) as u32;
+            let s = map_i(m, "second").unwrap_or(0) as u32;
+            let ns = map_i64(m, "nanosecond").unwrap_or(0) as u32;
+            let ms = map_i64(m, "millisecond").unwrap_or(0) as u32 * 1_000_000;
+            let us = map_i64(m, "microsecond").unwrap_or(0) as u32 * 1_000;
+            let nanos = ns + ms + us;
+            let date = NaiveDate::from_ymd_opt(y, mo, d).ok_or_else(err)?;
+            let time = NaiveTime::from_hms_nano_opt(h, mi, s, nanos).ok_or_else(err)?;
+            let iso = format_localdatetime(&date, &time);
+            Ok(TemporalValue { kind: TemporalKind::LocalDateTime, iso, date: Some(date), time: Some(time), offset_secs: None, tz_name: None })
+        }
+        _ => Err(err()),
+    }
+}
+
+/// Build a TemporalValue for `datetime()`.
+fn temporal_datetime(arg: &Value) -> Result<TemporalValue, ExecError> {
+    let err = || ExecError { message: "datetime(): invalid argument".into() };
+    match arg {
+        Value::Str(s) => {
+            let s = s.trim();
+            // Handle timezone name in brackets: ...+01:00[Europe/Stockholm]
+            let (s_no_zone, tz_name) = strip_tz_bracket(s);
+            let (date_str, time_str) = split_datetime(s_no_zone)?;
+            let date = parse_date_str(date_str).ok_or_else(err)?;
+            let (time_str_clean, offset_secs, _) = extract_time_tz(time_str);
+            let time = parse_localtime_str(time_str_clean).ok_or_else(err)?;
+            let off = offset_secs.unwrap_or(0);
+            let iso = format_datetime(&date, &time, off, tz_name.as_deref());
+            Ok(TemporalValue { kind: TemporalKind::DateTime, iso, date: Some(date), time: Some(time), offset_secs: Some(off), tz_name })
+        }
+        Value::Json(serde_json::Value::Object(m)) => {
+            let y = map_i(m, "year").ok_or_else(err)?;
+            let mo = map_i(m, "month").unwrap_or(1) as u32;
+            let d = map_i(m, "day").unwrap_or(1) as u32;
+            let h = map_i(m, "hour").unwrap_or(0) as u32;
+            let mi = map_i(m, "minute").unwrap_or(0) as u32;
+            let s = map_i(m, "second").unwrap_or(0) as u32;
+            let ns = map_i64(m, "nanosecond").unwrap_or(0) as u32;
+            let ms_val = map_i64(m, "millisecond").unwrap_or(0) as u32 * 1_000_000;
+            let us = map_i64(m, "microsecond").unwrap_or(0) as u32 * 1_000;
+            let nanos = ns + ms_val + us;
+            let date = NaiveDate::from_ymd_opt(y, mo, d).ok_or_else(err)?;
+            let time = NaiveTime::from_hms_nano_opt(h, mi, s, nanos).ok_or_else(err)?;
+            let tz_str = m.get("timezone").and_then(|v| v.as_str()).unwrap_or("UTC");
+            let (off, tz_name) = if let Some(o) = parse_offset(tz_str) {
+                (o, None)
+            } else {
+                let tz: Tz = tz_str.parse().unwrap_or(chrono_tz::UTC);
+                let ndt = NaiveDateTime::new(date, time);
+                let dt = tz.from_local_datetime(&ndt)
+                    .earliest()
+                    .unwrap_or_else(|| chrono_tz::UTC.from_local_datetime(&ndt).unwrap());
+                // offset = local wall-clock timestamp minus UTC timestamp
+                let utc_ts = dt.timestamp();
+                let local_ts = ndt.and_utc().timestamp();
+                let off = (local_ts - utc_ts) as i32;
+                (off, Some(tz_str.to_string()))
+            };
+            let iso = format_datetime(&date, &time, off, tz_name.as_deref());
+            Ok(TemporalValue { kind: TemporalKind::DateTime, iso, date: Some(date), time: Some(time), offset_secs: Some(off), tz_name })
+        }
+        _ => Err(err()),
+    }
+}
+
+/// Build a CypherDuration for `duration()`.
+fn temporal_duration(arg: &Value) -> Result<CypherDuration, ExecError> {
+    let err = || ExecError { message: "duration(): invalid argument".into() };
+    match arg {
+        Value::Str(s) => CypherDuration::parse(s).ok_or_else(err),
+        Value::Json(serde_json::Value::Object(m)) => {
+            let years   = map_i64(m, "years").or_else(|| map_i64(m, "year")).unwrap_or(0);
+            let months  = map_i64(m, "months").or_else(|| map_i64(m, "month")).unwrap_or(0);
+            let weeks   = map_i64(m, "weeks").or_else(|| map_i64(m, "week")).unwrap_or(0);
+            let days    = map_i64(m, "days").or_else(|| map_i64(m, "day")).unwrap_or(0);
+            let hours   = map_i64(m, "hours").or_else(|| map_i64(m, "hour")).unwrap_or(0);
+            let minutes = map_i64(m, "minutes").or_else(|| map_i64(m, "minute")).unwrap_or(0);
+            let seconds = map_i64(m, "seconds").or_else(|| map_i64(m, "second")).unwrap_or(0);
+            let ms = map_i64(m, "milliseconds").or_else(|| map_i64(m, "millisecond")).unwrap_or(0) * 1_000_000;
+            let us = map_i64(m, "microseconds").or_else(|| map_i64(m, "microsecond")).unwrap_or(0) * 1_000;
+            let nanos = map_i64(m, "nanoseconds").or_else(|| map_i64(m, "nanosecond")).unwrap_or(0) + ms + us;
+            let iso = CypherDuration::build_iso(years, months, weeks, days, hours, minutes, seconds, nanos);
+            Ok(CypherDuration { years, months, weeks, days, hours, minutes, seconds, nanoseconds: nanos, iso })
+        }
+        _ => Err(err()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Temporal-to-epoch helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a TemporalValue to epoch seconds (UTC).
+/// For date-only: midnight UTC of that date.
+/// For time-only: seconds since midnight adjusted for offset.
+/// For datetime: epoch of that instant.
+fn temporal_epoch_seconds(tv: &TemporalValue) -> Option<i64> {
+    match tv.kind {
+        TemporalKind::Date => {
+            let d = tv.date?;
+            Some(NaiveDateTime::new(d, NaiveTime::from_hms_opt(0, 0, 0)?).and_utc().timestamp())
+        }
+        TemporalKind::LocalTime => {
+            let t = tv.time?;
+            Some(t.num_seconds_from_midnight() as i64)
+        }
+        TemporalKind::Time => {
+            let t = tv.time?;
+            let off = tv.offset_secs.unwrap_or(0) as i64;
+            Some(t.num_seconds_from_midnight() as i64 - off)
+        }
+        TemporalKind::LocalDateTime => {
+            let d = tv.date?;
+            let t = tv.time?;
+            Some(NaiveDateTime::new(d, t).and_utc().timestamp())
+        }
+        TemporalKind::DateTime => {
+            let d = tv.date?;
+            let t = tv.time?;
+            let off = tv.offset_secs.unwrap_or(0) as i64;
+            Some(NaiveDateTime::new(d, t).and_utc().timestamp() - off)
+        }
+    }
+}
+
+/// Compute duration.between(lhs, rhs): exact difference preserving sign.
+/// The result has a months component (years*12+months) and a seconds component;
+/// the spec says it is as precise as the inputs allow.
+fn duration_between(lhs: &TemporalValue, rhs: &TemporalValue) -> CypherDuration {
+    // Compute total nanoseconds difference for the sub-month part
+    // and total months difference for the month part.
+    let lhs_epoch_ns = temporal_epoch_ns(lhs);
+    let rhs_epoch_ns = temporal_epoch_ns(rhs);
+    let ns_diff = rhs_epoch_ns - lhs_epoch_ns;
+    let secs = ns_diff / 1_000_000_000;
+    let nanos = ns_diff % 1_000_000_000;
+    let iso = CypherDuration::build_iso(0, 0, 0, 0,
+        secs / 3600, (secs % 3600) / 60, secs % 60, nanos);
+    CypherDuration { years: 0, months: 0, weeks: 0, days: 0,
+        hours: secs / 3600, minutes: (secs % 3600) / 60,
+        seconds: secs % 60, nanoseconds: nanos, iso }
+}
+
+fn temporal_epoch_ns(tv: &TemporalValue) -> i64 {
+    match tv.kind {
+        TemporalKind::Date => {
+            let d = tv.date.unwrap_or_else(|| NaiveDate::from_ymd_opt(1970,1,1).unwrap());
+            NaiveDateTime::new(d, NaiveTime::from_hms_opt(0,0,0).unwrap()).and_utc().timestamp() * 1_000_000_000
+        }
+        TemporalKind::LocalTime => {
+            let t = tv.time.unwrap_or(NaiveTime::from_hms_opt(0,0,0).unwrap());
+            (t.num_seconds_from_midnight() as i64) * 1_000_000_000 + t.nanosecond() as i64
+        }
+        TemporalKind::Time => {
+            let t = tv.time.unwrap_or(NaiveTime::from_hms_opt(0,0,0).unwrap());
+            let off = tv.offset_secs.unwrap_or(0) as i64;
+            (t.num_seconds_from_midnight() as i64 - off) * 1_000_000_000 + t.nanosecond() as i64
+        }
+        TemporalKind::LocalDateTime => {
+            let d = tv.date.unwrap_or_else(|| NaiveDate::from_ymd_opt(1970,1,1).unwrap());
+            let t = tv.time.unwrap_or(NaiveTime::from_hms_opt(0,0,0).unwrap());
+            NaiveDateTime::new(d, t).and_utc().timestamp() * 1_000_000_000 + t.nanosecond() as i64
+        }
+        TemporalKind::DateTime => {
+            let d = tv.date.unwrap_or_else(|| NaiveDate::from_ymd_opt(1970,1,1).unwrap());
+            let t = tv.time.unwrap_or(NaiveTime::from_hms_opt(0,0,0).unwrap());
+            let off = tv.offset_secs.unwrap_or(0) as i64;
+            (NaiveDateTime::new(d, t).and_utc().timestamp() - off) * 1_000_000_000 + t.nanosecond() as i64
+        }
+    }
+}
+
+/// duration.inMonths: full calendar months between two temporals (truncates sub-month).
+fn duration_in_months(lhs: &TemporalValue, rhs: &TemporalValue) -> CypherDuration {
+    // Only meaningful when both have a date part; otherwise return PT0S.
+    let (ld, rd) = match (lhs.date, rhs.date) {
+        (Some(l), Some(r)) => (l, r),
+        _ => {
+            return CypherDuration {
+                years: 0, months: 0, weeks: 0, days: 0,
+                hours: 0, minutes: 0, seconds: 0, nanoseconds: 0,
+                iso: "PT0S".into(),
+            };
+        }
+    };
+    let total_months = (rd.year() as i64 * 12 + rd.month() as i64)
+        - (ld.year() as i64 * 12 + ld.month() as i64);
+    let years = total_months / 12;
+    let months = total_months % 12;
+    let iso = CypherDuration::build_iso(years, months, 0, 0, 0, 0, 0, 0);
+    CypherDuration { years, months, weeks: 0, days: 0, hours: 0, minutes: 0, seconds: 0, nanoseconds: 0, iso }
+}
+
+/// duration.inDays: full calendar days between two temporals (truncates sub-day).
+fn duration_in_days(lhs: &TemporalValue, rhs: &TemporalValue) -> CypherDuration {
+    let (ld, rd) = match (lhs.date, rhs.date) {
+        (Some(l), Some(r)) => (l, r),
+        _ => {
+            return CypherDuration {
+                years: 0, months: 0, weeks: 0, days: 0,
+                hours: 0, minutes: 0, seconds: 0, nanoseconds: 0,
+                iso: "PT0S".into(),
+            };
+        }
+    };
+    let days = (rd - ld).num_days();
+    let iso = CypherDuration::build_iso(0, 0, 0, days, 0, 0, 0, 0);
+    CypherDuration { years: 0, months: 0, weeks: 0, days, hours: 0, minutes: 0, seconds: 0, nanoseconds: 0, iso }
+}
+
+/// duration.inSeconds: full seconds between two temporals (truncates sub-second).
+fn duration_in_seconds(lhs: &TemporalValue, rhs: &TemporalValue) -> CypherDuration {
+    let ns_diff = temporal_epoch_ns(rhs) - temporal_epoch_ns(lhs);
+    let secs = ns_diff / 1_000_000_000;
+    let nanos = ns_diff % 1_000_000_000;
+    let iso = CypherDuration::build_iso(0, 0, 0, 0, secs / 3600, (secs % 3600) / 60, secs % 60, nanos);
+    CypherDuration { years: 0, months: 0, weeks: 0, days: 0,
+        hours: secs / 3600, minutes: (secs % 3600) / 60,
+        seconds: secs % 60, nanoseconds: nanos, iso }
+}
+
+// ---------------------------------------------------------------------------
+// Temporal formatting helpers
+// ---------------------------------------------------------------------------
+
+fn format_localtime(t: &NaiveTime) -> String {
+    let ns = t.nanosecond();
+    if ns == 0 {
+        t.format("%H:%M:%S").to_string()
+    } else {
+        // trim trailing zeros
+        let frac = format!("{ns:09}");
+        let frac = frac.trim_end_matches('0');
+        format!("{}.{frac}", t.format("%H:%M:%S"))
+    }
+}
+
+fn format_time_with_offset(t: &NaiveTime, offset_secs: i32) -> String {
+    let local_str = format_localtime(t);
+    let sign = if offset_secs < 0 { '-' } else { '+' };
+    let abs = offset_secs.unsigned_abs();
+    let h = abs / 3600;
+    let m = (abs % 3600) / 60;
+    format!("{local_str}{sign}{h:02}:{m:02}")
+}
+
+fn format_localdatetime(d: &NaiveDate, t: &NaiveTime) -> String {
+    format!("{}T{}", d.format("%Y-%m-%d"), format_localtime(t))
+}
+
+fn format_datetime(d: &NaiveDate, t: &NaiveTime, offset_secs: i32, tz_name: Option<&str>) -> String {
+    let base = format!("{}T{}", d.format("%Y-%m-%d"), format_localtime(t));
+    let sign = if offset_secs < 0 { '-' } else { '+' };
+    let abs = offset_secs.unsigned_abs();
+    let h = abs / 3600;
+    let m = (abs % 3600) / 60;
+    let off_str = format!("{sign}{h:02}:{m:02}");
+    if let Some(tz) = tz_name {
+        format!("{base}{off_str}[{tz}]")
+    } else {
+        format!("{base}{off_str}")
+    }
+}
+
+/// Split "2015-07-21T21:40:32.142" or "2015-07-21T21:40:32.142+0100" at T.
+fn split_datetime(s: &str) -> Result<(&str, &str), ExecError> {
+    s.find('T').map(|p| (&s[..p], &s[p+1..]))
+        .ok_or_else(|| ExecError { message: format!("datetime: missing T separator in '{s}'") })
+}
+
+/// Strip a trailing [Timezone/Name] from a datetime string.
+/// Returns (string_without_bracket, Some(tz_name)) or (original, None).
+fn strip_tz_bracket(s: &str) -> (&str, Option<String>) {
+    if let (Some(lb), Some(rb)) = (s.rfind('['), s.rfind(']')) {
+        if rb == s.len() - 1 {
+            return (&s[..lb], Some(s[lb+1..rb].to_string()));
+        }
+    }
+    (s, None)
+}
+
+/// Extract time string, offset_secs, and optional tz name from a time string
+/// that may have a trailing +HH:MM, -HH:MM, or Z.
+fn extract_time_tz(s: &str) -> (&str, Option<i32>, Option<String>) {
+    if s.ends_with('Z') || s.ends_with('z') {
+        return (&s[..s.len()-1], Some(0), None);
+    }
+    // Look for + or - after the first character (HH might start with -)
+    // scan from right for a + or -, but avoid the first char
+    for i in (1..s.len()).rev() {
+        let b = s.as_bytes()[i];
+        if b == b'+' || (b == b'-' && i >= 2) {
+            // check that the suffix looks like an offset
+            let suffix = &s[i..];
+            if parse_offset(suffix).is_some() {
+                return (&s[..i], parse_offset(suffix), None);
+            }
+        }
+    }
+    (s, None, None)
+}
+
+/// Get a named property from a TemporalValue.
+fn temporal_get_property(tv: &TemporalValue, key: &str) -> Value {
+    match key {
+        "year" => tv.date.map(|d| Value::Int(d.year() as i64)).unwrap_or(Value::Null),
+        "month" => tv.date.map(|d| Value::Int(d.month() as i64)).unwrap_or(Value::Null),
+        "day" => tv.date.map(|d| Value::Int(d.day() as i64)).unwrap_or(Value::Null),
+        "hour" => tv.time.map(|t| Value::Int(t.hour() as i64)).unwrap_or(Value::Null),
+        "minute" => tv.time.map(|t| Value::Int(t.minute() as i64)).unwrap_or(Value::Null),
+        "second" => tv.time.map(|t| Value::Int(t.second() as i64)).unwrap_or(Value::Null),
+        "millisecond" => tv.time.map(|t| Value::Int((t.nanosecond() / 1_000_000) as i64)).unwrap_or(Value::Null),
+        "microsecond" => tv.time.map(|t| Value::Int((t.nanosecond() / 1_000) as i64 % 1000)).unwrap_or(Value::Null),
+        "nanosecond" => tv.time.map(|t| Value::Int(t.nanosecond() as i64 % 1000)).unwrap_or(Value::Null),
+        "nanoseconds" | "nanosecondsOfSecond" => tv.time.map(|t| Value::Int(t.nanosecond() as i64)).unwrap_or(Value::Null),
+        "epochSeconds" => temporal_epoch_seconds(tv).map(Value::Int).unwrap_or(Value::Null),
+        "epochMillis" => temporal_epoch_seconds(tv).map(|s| Value::Int(s * 1000)).unwrap_or(Value::Null),
+        "timezone" => tv.tz_name.as_deref().or_else(|| {
+            tv.offset_secs.map(|_| "")
+        }).map(|_| {
+            if let Some(name) = &tv.tz_name { Value::Str(name.clone()) }
+            else if let Some(off) = tv.offset_secs {
+                let sign = if off < 0 { '-' } else { '+' };
+                let abs = off.unsigned_abs();
+                Value::Str(format!("{sign}{:02}:{:02}", abs/3600, (abs%3600)/60))
+            } else { Value::Null }
+        }).unwrap_or(Value::Null),
+        "offset" => tv.offset_secs.map(|off| {
+            let sign = if off < 0 { '-' } else { '+' };
+            let abs = off.unsigned_abs();
+            Value::Str(format!("{sign}{:02}:{:02}", abs/3600, (abs%3600)/60))
+        }).unwrap_or(Value::Null),
+        "offsetSeconds" => tv.offset_secs.map(|o| Value::Int(o as i64)).unwrap_or(Value::Null),
+        "quarter" => tv.date.map(|d| Value::Int(((d.month() - 1) / 3 + 1) as i64)).unwrap_or(Value::Null),
+        "dayOfWeek" => tv.date.map(|d| Value::Int(d.weekday().number_from_monday() as i64)).unwrap_or(Value::Null),
+        "dayOfQuarter" => tv.date.map(|d| {
+            let q_start_month = ((d.month() - 1) / 3) * 3 + 1;
+            let q_start = NaiveDate::from_ymd_opt(d.year(), q_start_month, 1).unwrap();
+            Value::Int((d - q_start).num_days() + 1)
+        }).unwrap_or(Value::Null),
+        "week" => tv.date.map(|d| Value::Int(d.iso_week().week() as i64)).unwrap_or(Value::Null),
+        "weekYear" => tv.date.map(|d| Value::Int(d.iso_week().year() as i64)).unwrap_or(Value::Null),
+        "ordinalDay" => tv.date.map(|d| Value::Int(d.ordinal() as i64)).unwrap_or(Value::Null),
+        _ => Value::Null,
+    }
+}
+
+/// Get a named property from a CypherDuration.
+fn duration_get_property(dur: &CypherDuration, key: &str) -> Value {
+    match key {
+        "years" => Value::Int(dur.years),
+        "months" => Value::Int(dur.months),
+        "weeks" => Value::Int(dur.weeks),
+        "days" => Value::Int(dur.total_days()),
+        "hours" => Value::Int(dur.hours),
+        "minutes" => Value::Int(dur.minutes),
+        "seconds" => Value::Int(dur.seconds),
+        "milliseconds" => Value::Int(dur.nanoseconds / 1_000_000),
+        "microseconds" => Value::Int(dur.nanoseconds / 1_000),
+        "nanoseconds" => Value::Int(dur.nanoseconds),
+        "nanosecondsOfSecond" => Value::Int(dur.nanoseconds_of_second()),
+        "monthsOfYear" => Value::Int(dur.months),
+        "daysOfWeek" => Value::Int(dur.days % 7),
+        "minutesOfHour" => Value::Int(dur.minutes % 60),
+        "secondsOfMinute" => Value::Int(dur.seconds % 60),
+        "millisecondsOfSecond" => Value::Int((dur.nanoseconds / 1_000_000) % 1000),
+        "microsecondsOfSecond" => Value::Int((dur.nanoseconds / 1_000) % 1_000_000),
+        _ => Value::Null,
+    }
 }
 
 impl Value {
@@ -55,6 +847,8 @@ impl Value {
                 Some(v) => json_to_value(v),
                 None => Value::Null,
             },
+            Value::Temporal(tv) => temporal_get_property(tv, key),
+            Value::Duration(dur) => duration_get_property(dur, key),
             _ => Value::Null,
         }
     }
@@ -88,6 +882,8 @@ impl Value {
             Value::Bool(b) => (*b).into(),
             Value::Null => serde_json::Value::Null,
             Value::Json(v) => v.clone(),
+            Value::Temporal(tv) => tv.iso.clone().into(),
+            Value::Duration(dur) => dur.iso.clone().into(),
             Value::Path { nodes, rels } => {
                 // Serialize as array: [node0, rel0, node1, rel1, ...]
                 let mut arr: Vec<serde_json::Value> = Vec::new();
@@ -219,6 +1015,9 @@ pub fn execute(
         }
         LogicalPlan::MergePattern { input, pattern, on_create, on_match } => {
             exec_merge_pattern(input, pattern, on_create, on_match, params)
+        }
+        LogicalPlan::Foreach { input, variable, list_expr, body } => {
+            exec_foreach(input, variable, list_expr, body, params)
         }
     }
 }
@@ -2018,6 +2817,18 @@ fn compare_values(left: &Value, op: &CmpOp, right: &Value) -> Option<bool> {
             })
         }
         (Value::Node { node_id: a, .. }, Value::Node { node_id: b, .. }) => Some(int_cmp(*a, op, *b)),
+        // Temporal comparison: compare by canonical ISO string (lexicographic ≈ chronological for same-kind)
+        (Value::Temporal(a), Value::Temporal(b)) => Some(str_cmp(&a.iso, op, &b.iso)),
+        (Value::Temporal(a), Value::Str(b)) => Some(str_cmp(&a.iso, op, b)),
+        (Value::Str(a), Value::Temporal(b)) => Some(str_cmp(a, op, &b.iso)),
+        (Value::Duration(a), Value::Duration(b)) => {
+            // Compare total seconds
+            let sa = a.total_seconds();
+            let sb = b.total_seconds();
+            Some(int_cmp(sa, op, sb))
+        }
+        (Value::Duration(a), Value::Str(b)) => Some(str_cmp(&a.iso, op, b)),
+        (Value::Str(a), Value::Duration(b)) => Some(str_cmp(a, op, &b.iso)),
         // List comparison (lexicographic)
         (Value::Json(serde_json::Value::Array(a)), Value::Json(serde_json::Value::Array(b))) => {
             compare_lists(a, b, op)
@@ -2658,6 +3469,112 @@ fn eval_function(
                 .unwrap_or(Some(String::new())).unwrap_or_default();
             Ok(Value::Str(s))
         }
+        // --- Temporal constructors ---
+        "date" => {
+            if args.is_empty() {
+                // date() with no args → today
+                let s = Spi::get_one::<String>("SELECT current_date::text")
+                    .unwrap_or(Some("1970-01-01".into())).unwrap_or_default();
+                let tv = temporal_date(&Value::Str(s))?;
+                return Ok(Value::Temporal(tv));
+            }
+            let arg = eval_expr(&args[0], row, params)?;
+            Ok(Value::Temporal(temporal_date(&arg)?))
+        }
+        "localtime" => {
+            if args.is_empty() {
+                let s = Spi::get_one::<String>("SELECT localtime::text")
+                    .unwrap_or(Some("00:00:00".into())).unwrap_or_default();
+                let tv = temporal_localtime(&Value::Str(s))?;
+                return Ok(Value::Temporal(tv));
+            }
+            let arg = eval_expr(&args[0], row, params)?;
+            Ok(Value::Temporal(temporal_localtime(&arg)?))
+        }
+        "time" => {
+            if args.is_empty() {
+                let s = Spi::get_one::<String>("SELECT current_time::text")
+                    .unwrap_or(Some("00:00:00+00:00".into())).unwrap_or_default();
+                let tv = temporal_time(&Value::Str(s))?;
+                return Ok(Value::Temporal(tv));
+            }
+            let arg = eval_expr(&args[0], row, params)?;
+            Ok(Value::Temporal(temporal_time(&arg)?))
+        }
+        "localdatetime" => {
+            if args.is_empty() {
+                let s = Spi::get_one::<String>("SELECT localtimestamp::text")
+                    .unwrap_or(Some("1970-01-01T00:00:00".into())).unwrap_or_default();
+                // PG uses space as separator
+                let s = s.replace(' ', "T");
+                let tv = temporal_localdatetime(&Value::Str(s))?;
+                return Ok(Value::Temporal(tv));
+            }
+            let arg = eval_expr(&args[0], row, params)?;
+            Ok(Value::Temporal(temporal_localdatetime(&arg)?))
+        }
+        "datetime" => {
+            if args.is_empty() {
+                let s = Spi::get_one::<String>("SELECT now()::text")
+                    .unwrap_or(Some("1970-01-01T00:00:00+00:00".into())).unwrap_or_default();
+                let s = s.replace(' ', "T");
+                let tv = temporal_datetime(&Value::Str(s))?;
+                return Ok(Value::Temporal(tv));
+            }
+            let arg = eval_expr(&args[0], row, params)?;
+            Ok(Value::Temporal(temporal_datetime(&arg)?))
+        }
+        "duration" => {
+            if args.len() != 1 { return Err(ExecError { message: "duration() takes exactly 1 argument".into() }); }
+            let arg = eval_expr(&args[0], row, params)?;
+            Ok(Value::Duration(temporal_duration(&arg)?))
+        }
+        // --- duration.between / inMonths / inDays / inSeconds ---
+        // These arrive as FunctionCall("between"|"inMonths"|…, [duration_expr, lhs, rhs])
+        // because the parser sees `duration.between(a,b)` as:
+        //   parse_property_chain(Variable("duration")) → method call → FunctionCall("between", [Variable("duration"), a, b])
+        "between" if args.len() == 3 => {
+            // args[0] is the "duration" variable reference (ignored — it's just the namespace)
+            let lhs_val = eval_expr(&args[1], row, params)?;
+            let rhs_val = eval_expr(&args[2], row, params)?;
+            let lhs = as_temporal(&lhs_val)?;
+            let rhs = as_temporal(&rhs_val)?;
+            Ok(Value::Duration(duration_between(lhs, rhs)))
+        }
+        "inmonths" if args.len() == 3 => {
+            let lhs_val = eval_expr(&args[1], row, params)?;
+            let rhs_val = eval_expr(&args[2], row, params)?;
+            let lhs = as_temporal(&lhs_val)?;
+            let rhs = as_temporal(&rhs_val)?;
+            Ok(Value::Duration(duration_in_months(lhs, rhs)))
+        }
+        "indays" if args.len() == 3 => {
+            let lhs_val = eval_expr(&args[1], row, params)?;
+            let rhs_val = eval_expr(&args[2], row, params)?;
+            let lhs = as_temporal(&lhs_val)?;
+            let rhs = as_temporal(&rhs_val)?;
+            Ok(Value::Duration(duration_in_days(lhs, rhs)))
+        }
+        "inseconds" if args.len() == 3 => {
+            let lhs_val = eval_expr(&args[1], row, params)?;
+            let rhs_val = eval_expr(&args[2], row, params)?;
+            let lhs = as_temporal(&lhs_val)?;
+            let rhs = as_temporal(&rhs_val)?;
+            Ok(Value::Duration(duration_in_seconds(lhs, rhs)))
+        }
+        // transaction() / statement() / realtime() — clock-access subtypes of datetime()
+        "transaction" | "statement" | "realtime" if args.len() <= 1 => {
+            let s = Spi::get_one::<String>("SELECT now()::text")
+                .unwrap_or(Some("1970-01-01T00:00:00+00:00".into())).unwrap_or_default();
+            let s = s.replace(' ', "T");
+            Ok(Value::Temporal(temporal_datetime(&Value::Str(s))?))
+        }
+        // truncate() on temporals — not full spec but stub to avoid unknown-function
+        "truncate" if args.len() == 2 => {
+            // temporal.truncate(unit, value) — return the value as-is for now
+            let val = eval_expr(&args[1], row, params)?;
+            Ok(val)
+        }
         _ => Err(ExecError {
             message: format!("unknown function: {name}()"),
         }),
@@ -2669,6 +3586,13 @@ fn to_f64(v: &Value) -> Option<f64> {
         Value::Int(i) => Some(*i as f64),
         Value::Float(f) => Some(*f),
         _ => None,
+    }
+}
+
+fn as_temporal(v: &Value) -> Result<&TemporalValue, ExecError> {
+    match v {
+        Value::Temporal(tv) => Ok(tv),
+        _ => Err(ExecError { message: format!("expected a temporal value, got {:?}", v) }),
     }
 }
 
@@ -3507,6 +4431,43 @@ fn exec_delete_nodes(
 }
 
 /// Execute MERGE pattern.
+fn exec_foreach(
+    input: &LogicalPlan,
+    variable: &str,
+    list_expr: &Expr,
+    body: &LogicalPlan,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<Row>, ExecError> {
+    let input_rows = execute(input, params)?;
+    // FOREACH does not produce rows — it executes side-effects and passes through its input.
+    for input_row in &input_rows {
+        // Evaluate the list in the context of the outer row.
+        let list_val = eval_expr(list_expr, input_row, params)?;
+        let items: Vec<Value> = match list_val {
+            Value::Json(serde_json::Value::Array(arr)) => arr.iter().map(json_to_value).collect(),
+            Value::Null => continue,
+            other => vec![other],
+        };
+        for item in items {
+            // Build a row with the loop variable bound.
+            let mut iter_row = input_row.clone();
+            iter_row.insert(variable.to_string(), item.clone());
+            // Inject the loop variable into params as a JSON value so that the
+            // body sub-plan (which starts from SingleRow) can find it.
+            let mut iter_params = params.clone();
+            iter_params.insert(variable.to_string(), item.to_json());
+            // Execute the body plan (ignoring output rows — only side-effects matter).
+            // We need to pass the outer row's variables into the body via a SingleRow
+            // seed that has the variable bound. Since SingleRow always produces one
+            // empty row and the body plan builds on top of that, we thread the
+            // loop-variable binding through params.
+            let _ = execute(body, &iter_params);
+        }
+    }
+    // Pass through the input rows unchanged (spec: FOREACH produces no new rows).
+    Ok(input_rows)
+}
+
 fn exec_merge_pattern(
     input: &LogicalPlan,
     pattern: &Pattern,

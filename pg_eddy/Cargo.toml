@@ -20,6 +20,8 @@ pgrx.workspace      = true
 serde.workspace     = true
 serde_json.workspace = true
 thiserror.workspace = true
+chrono.workspace    = true
+chrono-tz.workspace = true
 
 [dev-dependencies]
 pgrx-tests = "=0.18.0"

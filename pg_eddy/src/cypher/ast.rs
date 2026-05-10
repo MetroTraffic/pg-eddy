@@ -88,6 +88,14 @@ pub enum QueryClause {
         exprs: Vec<Expr>,
         detach: bool,
     },
+    /// FOREACH (variable IN list | clauses)
+    Foreach {
+        variable: String,
+        list_expr: Expr,
+        /// The clauses inside the FOREACH body (only write clauses are valid
+        /// per spec: CREATE, SET, REMOVE, DELETE, MERGE, FOREACH).
+        clauses: Vec<QueryClause>,
+    },
 }
 
 /// A SET item: one of four forms.

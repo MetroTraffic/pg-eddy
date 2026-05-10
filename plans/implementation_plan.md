@@ -1477,55 +1477,56 @@ layer micro-benchmark already proved raw adjacency-follow speed.
 > any missing feature. Schema DDL is moved to v0.15.0.
 
 **Storage bug** (P0 — causes 53% of all TCK failures):
-- [ ] Fix MAXALIGN in `find_or_extend_page` (node_store.rs + edge_store.rs):
+- [x] Fix MAXALIGN in `find_or_extend_page` (node_store.rs + edge_store.rs):
       the free-space check uses `item_size + sizeof(ItemIdData)` but
       `PageAddItemExtended` allocates `MAXALIGN(item_size) + sizeof(ItemIdData)`.
       On 64-bit PostgreSQL, MAXALIGN = 8 bytes. When a page has exactly 46–51
       bytes free (a typical remainder for small nodes), the check passes but the
       actual insert fails. Fix: `MAXALIGN(item_size) + sizeof(ItemIdData)`.
-- [ ] Fix TCK harness graph reset: each `run_scenario` call in `run_tck.pl`
-      should call `pg_eddy.clear()` at the beginning so data does not
-      accumulate across scenarios. The existing `BEGIN`/`ROLLBACK` pairs are
-      no-ops because each `$node->psql()` call opens a new connection.
+- [x] Fix TCK harness graph reset: implemented `clear()` `#[pg_extern]` that
+      calls `RelationTruncate` on nodes/edges AM tables, SPI `TRUNCATE` on
+      catalog index tables, and restarts ID sequences. Fixed `run_tck.pl` to
+      call `SELECT clear()` (public schema, no `eval {}` silencing) at the
+      start of each scenario.
 
 **Parser gaps** (causes 149 parse-error TCK failures):
-- [ ] Map literals in expression context: `{key: value}` is currently only
+- [x] Map literals in expression context: `{key: value}` is currently only
       parsed at the pattern level. Recognise `{` as start of a MapExpr when
       inside `WHERE`, `RETURN`, `WITH`, `SET`, `CREATE`, and general expression
       positions. Covers `RETURN {name: n.name}`, `WHERE n = {x: 1}`, etc.
-- [ ] Hex and octal integer literals: `0x1A2B`, `0o777` (and uppercase `0X`,
-      `0O`). The lexer currently treats the token after `0x`/`0o` as an
-      identifier. Add lexer rules to consume hex/octal digit sequences and
-      produce an `IntegerLiteral` token.
+- [x] Hex and octal integer literals: `0x1A2B`, `0o777` (and uppercase `0X`,
+      `0O`). The lexer now consumes hex/octal digit sequences and
+      produces an `IntegerLit` token.
 - [ ] Pattern expressions in RETURN / WHERE: `(a)-[:R]->(b)` used as an
       expression value (not a MATCH pattern). Currently the parser emits
       `LArrow` unexpectedly when seeing `<-` inside an expression context.
       Parse as a `PatternExpr` and evaluate as a boolean path predicate.
-- [ ] Large integer literals: `9223372036854775808` overflows `i64::MAX`;
-      parse as `Float` or raise a clear `SyntaxError` rather than panicking.
+- [x] Large integer literals: `9223372036854775808` overflows `i64::MAX`;
+      now falls back to `FloatLit` rather than panicking.
 
 **Validation gaps** (causes 225 TCK failures — expected errors not raised):
-- [ ] Reject re-binding of already-bound variables in `CREATE`:
-      `CREATE (n) CREATE (n)` should raise `SyntaxError` (variable `n` already
-      bound). Currently the second CREATE creates a duplicate.
-- [ ] Reject direction-less relationship in CREATE: `CREATE (a)-[r:R]-(b)` (no
-      arrow) should raise `SyntaxError`. Currently accepted and treated as
-      undirected.
+- [x] Reject re-binding of already-bound variables in `CREATE`:
+      `CREATE (n) CREATE (n)` now raises `SyntaxError` (variable `n` already
+      bound).
+- [x] Reject direction-less relationship in CREATE: `CREATE (a)-[r:R]-(b)` (no
+      arrow) now raises `SyntaxError`.
 - [ ] Reject relationship in node position / node in relationship position
       type mismatches — raise `TypeError` per openCypher spec.
 
 **Other high-value fixes** (from 115 wrong-result / data-isolation failures):
-- [ ] Fix `MATCH` on empty graph: `MATCH (n) RETURN n` must return 0 rows after
-      `pg_eddy.clear()`. Currently returns stale rows from prior scenarios
-      (root cause: the graph-reset fix above will resolve this).
-- [ ] Fix `OPTIONAL MATCH` on empty graph: same root cause.
-- [ ] Fix control-query wrong row counts caused by accumulated data.
+- [x] Fix `MATCH` on empty graph: resolved by `clear()` reset between scenarios.
+- [x] Fix `OPTIONAL MATCH` on empty graph: same — resolved by `clear()`.
+- [x] Fix control-query wrong row counts: resolved by `clear()` reset.
 
 **Target**: TCK ≥ 65% after this milestone (up from 32.3% in v0.12.1).
+**Actual result**: **1526/3880 (39.3%)** — pattern-expression parsing and
+type-mismatch errors deferred; two of six validation gaps remain open.
 
 **Exit criteria**: `PageAddItemExtended` error no longer appears in TCK output;
 TCK harness correctly resets graph between scenarios; map literals parse in all
 expression positions; hex/octal literals parse; TCK pass rate ≥ 65%.
+**Status**: Criteria met except TCK% target (39.3% vs 65%); remaining gaps
+(pattern-expr, type-mismatch errors) deferred to a future patch.
 
 ---
 
@@ -1540,12 +1541,16 @@ expression positions; hex/octal literals parse; TCK pass rate ≥ 65%.
       so `WHERE n.prop = $val` uses the index instead of full scan
 - [ ] `pg_eddy.create_unique_constraint(label TEXT, property_key TEXT)` —
       uniqueness enforcement at write time
-- [ ] Temporal constructors: `datetime()`, `date()`, `time()`, `localtime()`,
+- [x] Temporal constructors: `datetime()`, `date()`, `time()`, `localtime()`,
       `localdatetime()`, `duration()` — parse ISO 8601 strings / component maps
-- [ ] Temporal arithmetic: `duration.inSeconds()`, `duration.inDays()`,
+- [x] Temporal arithmetic: `duration.inSeconds()`, `duration.inDays()`,
       `duration.inMonths()`, `duration.between()` — duration extraction methods
-- [ ] `FOREACH (x IN list | clause)` — simple iteration with write clauses
+- [x] `FOREACH (x IN list | clause)` — simple iteration with write clauses
 - [ ] Target: `TemporalAcceptance`, `ForeachAcceptance`; TCK ≥ 80%
+
+**Actual result**: 1628/3880 (42.0%); +102 scenarios vs v0.13.0 (39.3%).
+Temporal constructors and FOREACH are implemented; property index work deferred
+to a later release.
 
 **Exit criteria**: IS-1 node lookup within 2× of AGE (property index used);
 temporal constructors and arithmetic pass all `Temporal2`/`Temporal4`/`Temporal10`

@@ -116,6 +116,13 @@ pub enum LogicalPlan {
         on_create: Vec<SetItem>,
         on_match: Vec<SetItem>,
     },
+    /// FOREACH (variable IN list | clauses): iterate a list and execute write clauses per element.
+    Foreach {
+        input: Box<LogicalPlan>,
+        variable: String,
+        list_expr: Expr,
+        body: Box<LogicalPlan>,
+    },
 }
 
 /// A plan error.
@@ -132,13 +139,20 @@ impl std::fmt::Display for PlanError {
 
 /// Build a logical plan from a parsed Query pipeline.
 pub fn plan(query: &Query) -> Result<LogicalPlan, PlanError> {
-    let mut current: LogicalPlan = LogicalPlan::SingleRow;
     let mut bound_vars: HashSet<String> = HashSet::new();
+    plan_clauses(&query.clauses, LogicalPlan::SingleRow, &mut bound_vars)
+}
 
-    for clause in &query.clauses {
+fn plan_clauses(
+    clauses: &[QueryClause],
+    seed: LogicalPlan,
+    bound_vars: &mut HashSet<String>,
+) -> Result<LogicalPlan, PlanError> {
+    let mut current = seed;
+    for clause in clauses {
         match clause {
             QueryClause::Match { optional, patterns, where_clause } => {
-                current = plan_match_clause(current, patterns, where_clause, *optional, &mut bound_vars)?;
+                current = plan_match_clause(current, patterns, where_clause, *optional, bound_vars)?;
             }
             QueryClause::Unwind { expr, alias } => {
                 bound_vars.insert(alias.clone());
@@ -151,7 +165,7 @@ pub fn plan(query: &Query) -> Result<LogicalPlan, PlanError> {
             QueryClause::CallSubquery { subquery } => {
                 let inner_plan = plan(subquery)?;
                 // Collect variables exposed by inner plan's Project if any
-                collect_projected_vars(&inner_plan, &mut bound_vars);
+                collect_projected_vars(&inner_plan, bound_vars);
                 current = LogicalPlan::Apply {
                     outer: Box::new(current),
                     inner: Box::new(inner_plan),
@@ -256,6 +270,20 @@ pub fn plan(query: &Query) -> Result<LogicalPlan, PlanError> {
                     pattern: pattern.clone(),
                     on_create: on_create.clone(),
                     on_match: on_match.clone(),
+                };
+            }
+            QueryClause::Foreach { variable, list_expr, clauses } => {
+                // Plan the body: SingleRow → chain of write clauses.
+                let body_seed = LogicalPlan::SingleRow;
+                let mut body_vars: HashSet<String> = bound_vars.clone();
+                // The loop variable is bound inside the body.
+                body_vars.insert(variable.clone());
+                let body_plan = plan_clauses(clauses, body_seed, &mut body_vars)?;
+                current = LogicalPlan::Foreach {
+                    input: Box::new(current),
+                    variable: variable.clone(),
+                    list_expr: list_expr.clone(),
+                    body: Box::new(body_plan),
                 };
             }
         }
@@ -430,6 +458,7 @@ fn find_last_node_var(plan: &LogicalPlan) -> String {
         LogicalPlan::RemoveProp { input, .. } => find_last_node_var(input),
         LogicalPlan::DeleteNodes { input, .. } => find_last_node_var(input),
         LogicalPlan::MergePattern { input, .. } => find_last_node_var(input),
+        LogicalPlan::Foreach { input, .. } => find_last_node_var(input),
     }
 }
 
@@ -591,6 +620,10 @@ pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
         LogicalPlan::MergePattern { input, .. } => {
             let child = explain(input, indent + 1);
             format!("{prefix}MergePattern\n{child}")
+        }
+        LogicalPlan::Foreach { input, variable, .. } => {
+            let child = explain(input, indent + 1);
+            format!("{prefix}Foreach({variable} IN list)\n{child}")
         }
     }
 }

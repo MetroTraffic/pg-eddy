@@ -32,6 +32,7 @@ pub enum Token {
     Set,      // v0.12.0 write clause
     Merge,    // v0.12.0 write clause
     Remove,   // v0.12.0 write clause
+    Foreach,  // FOREACH clause (v0.14.0)
     On,       // ON CREATE / ON MATCH in MERGE (v0.12.0)
     Call,     // CALL clause (v0.11.0)
     Yield,    // YIELD in CALL (v0.11.0)
@@ -384,6 +385,7 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
                 "SET" => Token::Set,
                 "MERGE" => Token::Merge,
                 "REMOVE" => Token::Remove,
+                "FOREACH" => Token::Foreach,
                 "ON" => Token::On,
                 "CALL" => Token::Call,
                 "YIELD" => Token::Yield,

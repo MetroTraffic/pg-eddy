@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.14.0](#0140----temporal-types-and-foreach) — Temporal Types and FOREACH
 - [0.13.0](#0130--2026-05-10--storage-stabilisation-and-parser-hardening) — Storage Stabilisation and Parser Hardening
 - [0.12.1](#0121--2026-05-10--batch-catalog-writes-and-ldbc-is-1is-3-benchmark) — Batch Catalog Writes and LDBC IS-1/IS-3 Benchmark
 - [0.12.0](#0120--2026-05-10--cypher-write-language-create-merge-set-remove-delete) — Cypher Write Language: CREATE, MERGE, SET, REMOVE, DELETE
@@ -21,6 +22,63 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 - [0.3.0](#030--2026-05-09--edge-storage--adjacency-lists) — Edge Storage + Adjacency Lists
 - [0.2.0](#020--2026-05-09--node-storage) — Node Storage
 - [0.1.0](#010--2026-05-09--am-skeleton) — AM Skeleton
+
+---
+
+## [0.14.0] — Temporal Types and FOREACH
+
+v0.14.0 adds full openCypher temporal type support and the `FOREACH` iteration
+clause. TCK pass rate rises from 1526/3880 (39.3%) to **1628/3880 (42.0%)**.
+
+### What's New
+
+**Temporal types** — all six openCypher temporal constructors are now supported:
+- `date("2015-07-21")` / `date({year: 2015, month: 7, day: 21})`
+- `localtime("12:00:00")` / `time("12:00:00+01:00")`
+- `localdatetime("2015-07-21T12:00:00")` / `datetime("2015-07-21T12:00:00Z")`
+- `duration("P1Y2M3DT4H5M6S")` / `duration({years: 1, months: 2, days: 3})`
+
+**Temporal arithmetic**:
+- `duration.between(t1, t2)` — full duration between two temporal values
+- `duration.inMonths(t1, t2)` — month-resolution duration
+- `duration.inDays(t1, t2)` — day-resolution duration
+- `duration.inSeconds(t1, t2)` — second-resolution duration
+
+**Temporal property access**: `.year`, `.month`, `.day`, `.hour`, `.minute`,
+`.second`, `.millisecond`, `.microsecond`, `.nanosecond`, `.epochSeconds`,
+`.epochMillis`, `.timezone`, `.offset`, `.quarter`, `.dayOfWeek`, `.week`,
+`.ordinalDay`; for duration: `.years`, `.months`, `.weeks`, `.days`, `.hours`,
+`.minutes`, `.seconds`, `.milliseconds`, `.microseconds`, `.nanoseconds`,
+`.nanosecondsOfSecond`
+
+**ISO 8601 date/time parsing** — extended and basic formats supported:
+- Dates: `YYYY-MM-DD`, `YYYYMMDD`, `YYYY-Www-D`, `YYYY-DDD`, `YYYY-MM`, `YYYY`
+- Times: `HH:MM:SS[.nnnnnnnnn][±HH:MM|Z|[TZ-name]]`
+- Duration: `P[nY][nM][nW][nD][T[nH][nM][nS]]`
+
+**FOREACH clause** — write clauses can now iterate over a list:
+```cypher
+FOREACH (x IN [1, 2, 3] | CREATE (:N {v: x}))
+FOREACH (n IN nodes | SET n.processed = true)
+```
+
+**Comparison** — temporal values can be compared with `=`, `<>`, `<`, `>`,
+`<=`, `>=` for ordering and equality checks in `WHERE` clauses.
+
+**Clock functions** — `datetime.transaction()`, `datetime.statement()`,
+`datetime.realtime()` all return the current UTC datetime.
+
+### Dependencies Added
+
+- `chrono = "0.4"` — date/time parsing and arithmetic
+- `chrono-tz = "0.9"` — IANA timezone name resolution for `datetime("...Z[America/New_York]")`
+
+### TCK Result
+
+| Release | Pass  | Total | %    | Delta |
+|---------|-------|-------|------|-------|
+| v0.13.0 | 1526  | 3880  | 39.3% | baseline |
+| v0.14.0 | **1628** | 3880 | **42.0%** | +102 |
 
 ---
 

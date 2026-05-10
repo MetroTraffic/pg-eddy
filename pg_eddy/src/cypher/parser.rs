@@ -229,8 +229,7 @@ impl Parser {
                 }
                 Token::Merge => {
                     self.advance();
-                    let pattern = self.parse_pattern()?;
-                    let mut on_create = Vec::new();
+                    let pattern = self.parse_pattern()?;                    let mut on_create = Vec::new();
                     let mut on_match = Vec::new();
                     // Optional ON CREATE SET / ON MATCH SET
                     loop {
@@ -269,6 +268,102 @@ impl Parser {
                         }
                     }
                     clauses.push(QueryClause::Merge { pattern, on_create, on_match });
+                }
+                Token::Foreach => {
+                    // FOREACH (variable IN list_expr | clause*)
+                    self.advance();
+                    self.expect(&Token::LParen)?;
+                    let variable = match self.peek().clone() {
+                        Token::Ident(s) => { self.advance(); s }
+                        other => return Err(ParseError {
+                            message: format!("expected variable name in FOREACH, got {:?}", other),
+                            offset: self.offset(),
+                        }),
+                    };
+                    self.expect(&Token::In)?;
+                    let list_expr = self.parse_expr()?;
+                    self.expect(&Token::Pipe)?;
+                    // Parse inner clauses until `)`
+                    let mut body: Vec<QueryClause> = Vec::new();
+                    loop {
+                        match self.peek().clone() {
+                            Token::RParen => { self.advance(); break; }
+                            Token::Create => {
+                                self.advance();
+                                let patterns = self.parse_patterns()?;
+                                body.push(QueryClause::Create { patterns });
+                            }
+                            Token::Delete => {
+                                self.advance();
+                                let exprs = self.parse_expr_list()?;
+                                body.push(QueryClause::Delete { exprs, detach: false });
+                            }
+                            Token::Detach => {
+                                self.advance();
+                                self.expect(&Token::Delete)?;
+                                let exprs = self.parse_expr_list()?;
+                                body.push(QueryClause::Delete { exprs, detach: true });
+                            }
+                            Token::Set => {
+                                self.advance();
+                                let items = self.parse_set_items()?;
+                                body.push(QueryClause::Set { items });
+                            }
+                            Token::Remove => {
+                                self.advance();
+                                let items = self.parse_remove_items()?;
+                                body.push(QueryClause::Remove { items });
+                            }
+                            Token::Merge => {
+                                self.advance();
+                                let pattern = self.parse_pattern()?;
+                                body.push(QueryClause::Merge { pattern, on_create: vec![], on_match: vec![] });
+                            }
+                            Token::Foreach => {
+                                // nested FOREACH — parse recursively by re-using outer loop
+                                // (tail-call by continuing outer parse loop after pushing)
+                                // For simplicity, handle nesting by recursion via re-entry:
+                                // just parse as if we encountered FOREACH again by duplicating logic
+                                self.advance();
+                                self.expect(&Token::LParen)?;
+                                let inner_var = match self.peek().clone() {
+                                    Token::Ident(s) => { self.advance(); s }
+                                    other => return Err(ParseError {
+                                        message: format!("expected variable in nested FOREACH, got {:?}", other),
+                                        offset: self.offset(),
+                                    }),
+                                };
+                                self.expect(&Token::In)?;
+                                let inner_list = self.parse_expr()?;
+                                self.expect(&Token::Pipe)?;
+                                let mut inner_body: Vec<QueryClause> = Vec::new();
+                                loop {
+                                    if *self.peek() == Token::RParen { self.advance(); break; }
+                                    if *self.peek() == Token::Eof { break; }
+                                    // Only SET/CREATE/SET supported in deeply nested FOREACH
+                                    match self.peek().clone() {
+                                        Token::Create => {
+                                            self.advance();
+                                            let patterns = self.parse_patterns()?;
+                                            inner_body.push(QueryClause::Create { patterns });
+                                        }
+                                        Token::Set => {
+                                            self.advance();
+                                            let items = self.parse_set_items()?;
+                                            inner_body.push(QueryClause::Set { items });
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                                body.push(QueryClause::Foreach { variable: inner_var, list_expr: inner_list, clauses: inner_body });
+                            }
+                            other => return Err(ParseError {
+                                message: format!("unexpected token in FOREACH body: {:?}", other),
+                                offset: self.offset(),
+                            }),
+                        }
+                    }
+                    clauses.push(QueryClause::Foreach { variable, list_expr, clauses: body });
                 }
                 other => {
                     return Err(ParseError {
