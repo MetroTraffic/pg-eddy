@@ -1154,16 +1154,34 @@ fn clear() {
 
     // 3. Physically truncate the custom AM storage to 0 blocks.
     //    RelationTruncate is WAL-logged and safe inside a transaction.
+    //    We must hold AccessExclusiveLock to prevent races with autovacuum
+    //    or concurrent readers that may have cached the old nblocks and try
+    //    to read blocks that no longer exist after truncation.
     unsafe {
         use pgrx::pg_sys;
 
-        let nodes_rel = open_nodes_relation();
-        pg_sys::RelationTruncate(nodes_rel, 0);
-        pg_sys::table_close(nodes_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        let schema_name = std::ffi::CString::new("_pg_eddy").unwrap();
+        let schema_oid = pg_sys::get_namespace_oid(schema_name.as_ptr(), false);
 
-        let edges_rel = open_edges_relation();
+        let nodes_name = std::ffi::CString::new("nodes").unwrap();
+        let nodes_oid = pg_sys::get_relname_relid(nodes_name.as_ptr(), schema_oid);
+        if nodes_oid == pg_sys::Oid::INVALID {
+            pgrx::error!("pg_eddy clear: _pg_eddy.nodes not found");
+        }
+        let nodes_rel =
+            pg_sys::table_open(nodes_oid, pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE);
+        pg_sys::RelationTruncate(nodes_rel, 0);
+        pg_sys::table_close(nodes_rel, pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE);
+
+        let edges_name = std::ffi::CString::new("edges").unwrap();
+        let edges_oid = pg_sys::get_relname_relid(edges_name.as_ptr(), schema_oid);
+        if edges_oid == pg_sys::Oid::INVALID {
+            pgrx::error!("pg_eddy clear: _pg_eddy.edges not found");
+        }
+        let edges_rel =
+            pg_sys::table_open(edges_oid, pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE);
         pg_sys::RelationTruncate(edges_rel, 0);
-        pg_sys::table_close(edges_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        pg_sys::table_close(edges_rel, pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE);
     }
 }
 

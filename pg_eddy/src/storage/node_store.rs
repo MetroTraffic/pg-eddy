@@ -991,14 +991,62 @@ pub unsafe fn update_node(
 
     // Check that the new item fits on this page.
     let free = page_free_space(page);
-    if free < new_item.len() + size_of::<pg_sys::ItemIdData>() {
+    let aligned = (new_item.len() + 7) & !7usize; // MAXALIGN = 8
+    if free < aligned + size_of::<pg_sys::ItemIdData>() {
+        // Cross-page update: the page is too full to hold both the old and
+        // new records simultaneously.  Delete the old record in-place,
+        // release this buffer, and insert the new record on a different
+        // page via find_or_extend_page.
+        pg_sys::CritSectionCount += 1;
+
+        // Logically delete the old record.
+        let old_iid = pg_sys::PageGetItemId(page, old_off);
+        let old_hdr = pg_sys::PageGetItem(page as *const _, old_iid)
+            as *mut pg_sys::HeapTupleHeaderData;
+        let xmax = pg_sys::GetCurrentTransactionId();
+        pg_sys::HeapTupleHeaderSetXmax(old_hdr, xmax);
+        (*old_hdr).t_infomask &= !(pg_sys::HEAP_XMAX_INVALID as u16);
+
+        let lsn_del = log_node_delete(buf, page, old_off, xmax);
+        pg_sys::PageSetLSN(page, lsn_del);
+        pg_sys::MarkBufferDirty(buf);
+        pg_sys::CritSectionCount -= 1;
         pg_sys::UnlockReleaseBuffer(buf);
-        pgrx::error!(
-            "pg_eddy PE201: updated node properties too large to fit on same page (need {} B free, have {}); \
-             shrink properties or wait for Phase 4 cross-page update support",
-            new_item.len() + size_of::<pg_sys::ItemIdData>(),
-            free,
+
+        // Insert on a page with space (may extend the relation).
+        let buf2 = find_or_extend_page(rel, new_item.len());
+        let page2 = pg_sys::BufferGetPage(buf2);
+
+        pg_sys::CritSectionCount += 1;
+        let new_off = pg_sys::PageAddItemExtended(
+            page2,
+            new_item.as_ptr() as pg_sys::Item,
+            new_item.len() as pg_sys::Size,
+            pg_sys::InvalidOffsetNumber,
+            0,
         );
+        if new_off == pg_sys::InvalidOffsetNumber {
+            pg_sys::CritSectionCount -= 1;
+            pg_sys::UnlockReleaseBuffer(buf2);
+            pgrx::error!("pg_eddy: PageAddItemExtended failed for cross-page node update");
+        }
+
+        // Fix t_ctid.
+        {
+            let new_iid = pg_sys::PageGetItemId(page2, new_off);
+            let new_hdr = pg_sys::PageGetItem(page2 as *const _, new_iid)
+                as *mut pg_sys::HeapTupleHeaderData;
+            let new_blkno = pg_sys::BufferGetBlockNumber(buf2);
+            pg_sys::ItemPointerSet(&mut (*new_hdr).t_ctid, new_blkno, new_off);
+        }
+
+        let lsn_ins = log_node_insert(buf2, page2, new_off, &new_item, None);
+        pg_sys::PageSetLSN(page2, lsn_ins);
+        pg_sys::MarkBufferDirty(buf2);
+        pg_sys::CritSectionCount -= 1;
+        pg_sys::UnlockReleaseBuffer(buf2);
+
+        return true;
     }
 
     pg_sys::CritSectionCount += 1;

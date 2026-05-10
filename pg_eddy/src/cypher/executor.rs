@@ -1663,7 +1663,21 @@ fn exec_project(
     }
 
     // ORDER BY — sort before DISTINCT/SKIP/LIMIT
-    if !order_by.is_empty() {
+    // Pre-validate: if ORDER BY references an unbound variable on the first
+    // row, it will fail on every row — raise immediately.
+    if !order_by.is_empty() && !projected.is_empty() {
+        let (ref first_proj, ref first_in) = projected[0];
+        for item in order_by {
+            let res = eval_expr(&item.expr, first_proj, params)
+                .or_else(|_| eval_expr(&item.expr, first_in, params));
+            if let Err(e) = res
+                && e.message.starts_with("unbound variable")
+            {
+                return Err(ExecError {
+                    message: format!("SyntaxError: {}", e.message),
+                });
+            }
+        }
         projected.sort_by(|(proj_a, in_a), (proj_b, in_b)| {
             for item in order_by {
                 let av = eval_expr(&item.expr, proj_a, params)
@@ -1821,7 +1835,21 @@ fn exec_project_aggregate(
     }
 
     // ORDER BY
-    if !order_by.is_empty() {
+    // Pre-validate: if ORDER BY references an unbound variable on the first
+    // row, it will fail on every row — raise immediately.
+    if !order_by.is_empty() && !projected.is_empty() {
+        let (ref first_proj, ref first_in) = projected[0];
+        for item in order_by {
+            let res = eval_expr(&item.expr, first_proj, params)
+                .or_else(|_| eval_expr(&item.expr, first_in, params));
+            if let Err(e) = res
+                && e.message.starts_with("unbound variable")
+            {
+                return Err(ExecError {
+                    message: format!("SyntaxError: {}", e.message),
+                });
+            }
+        }
         projected.sort_by(|(proj_a, in_a), (proj_b, in_b)| {
             for item in order_by {
                 let av = eval_expr(&item.expr, proj_a, params)
@@ -1958,43 +1986,43 @@ fn eval_with_agg(
         }
         Expr::And(l, r) => {
             let lv = eval_with_agg(l, group_rows, fallback_row, params)?;
-            match truthy3(&lv) {
+            match require_bool(&lv)? {
                 Some(false) => Ok(Value::Bool(false)),
                 Some(true) => {
                     let rv = eval_with_agg(r, group_rows, fallback_row, params)?;
-                    Ok(match truthy3(&rv) { Some(b) => Value::Bool(b), None => Value::Null })
+                    Ok(match require_bool(&rv)? { Some(b) => Value::Bool(b), None => Value::Null })
                 }
                 None => {
                     let rv = eval_with_agg(r, group_rows, fallback_row, params)?;
-                    Ok(match truthy3(&rv) { Some(false) => Value::Bool(false), _ => Value::Null })
+                    Ok(match require_bool(&rv)? { Some(false) => Value::Bool(false), _ => Value::Null })
                 }
             }
         }
         Expr::Or(l, r) => {
             let lv = eval_with_agg(l, group_rows, fallback_row, params)?;
-            match truthy3(&lv) {
+            match require_bool(&lv)? {
                 Some(true) => Ok(Value::Bool(true)),
                 Some(false) => {
                     let rv = eval_with_agg(r, group_rows, fallback_row, params)?;
-                    Ok(match truthy3(&rv) { Some(b) => Value::Bool(b), None => Value::Null })
+                    Ok(match require_bool(&rv)? { Some(b) => Value::Bool(b), None => Value::Null })
                 }
                 None => {
                     let rv = eval_with_agg(r, group_rows, fallback_row, params)?;
-                    Ok(match truthy3(&rv) { Some(true) => Value::Bool(true), _ => Value::Null })
+                    Ok(match require_bool(&rv)? { Some(true) => Value::Bool(true), _ => Value::Null })
                 }
             }
         }
         Expr::Xor(l, r) => {
             let lv = eval_with_agg(l, group_rows, fallback_row, params)?;
             let rv = eval_with_agg(r, group_rows, fallback_row, params)?;
-            Ok(match (truthy3(&lv), truthy3(&rv)) {
+            Ok(match (require_bool(&lv)?, require_bool(&rv)?) {
                 (Some(a), Some(b)) => Value::Bool(a ^ b),
                 _ => Value::Null,
             })
         }
         Expr::Not(e) => {
             let v = eval_with_agg(e, group_rows, fallback_row, params)?;
-            Ok(match truthy3(&v) { Some(b) => Value::Bool(!b), None => Value::Null })
+            Ok(match require_bool(&v)? { Some(b) => Value::Bool(!b), None => Value::Null })
         }
         Expr::IsNull(e) => {
             let v = eval_with_agg(e, group_rows, fallback_row, params)?;
@@ -2365,7 +2393,17 @@ pub fn eval_expr(
         }
         Expr::Property(base_expr, key) => {
             let base = eval_expr(base_expr, row, params)?;
-            Ok(base.get_property(key))
+            match &base {
+                Value::Node { .. } | Value::Edge { .. } | Value::Null
+                | Value::Temporal(_) | Value::Duration(_)
+                | Value::Json(serde_json::Value::Object(_)) => Ok(base.get_property(key)),
+                _ => Err(ExecError {
+                    message: format!(
+                        "TypeError: {} has no property `{}`",
+                        value_type_name(&base), key
+                    ),
+                }),
+            }
         }
         Expr::IntLit(v) => Ok(Value::Int(*v)),
         Expr::FloatLit(v) => Ok(Value::Float(*v)),
@@ -2389,20 +2427,20 @@ pub fn eval_expr(
             }
         }
         Expr::And(left, right) => {
-            // openCypher 3-valued logic: null AND false = false; null AND true = null
+            // openCypher 3-valued logic with strict boolean type checking.
             let l = eval_expr(left, row, params)?;
-            match truthy3(&l) {
+            match require_bool(&l)? {
                 Some(false) => Ok(Value::Bool(false)),
                 Some(true) => {
                     let r = eval_expr(right, row, params)?;
-                    match truthy3(&r) {
+                    match require_bool(&r)? {
                         Some(b) => Ok(Value::Bool(b)),
                         None => Ok(Value::Null),
                     }
                 }
                 None => {
                     let r = eval_expr(right, row, params)?;
-                    match truthy3(&r) {
+                    match require_bool(&r)? {
                         Some(false) => Ok(Value::Bool(false)),
                         _ => Ok(Value::Null),
                     }
@@ -2410,20 +2448,20 @@ pub fn eval_expr(
             }
         }
         Expr::Or(left, right) => {
-            // openCypher 3-valued logic: null OR true = true; null OR false = null
+            // openCypher 3-valued logic with strict boolean type checking.
             let l = eval_expr(left, row, params)?;
-            match truthy3(&l) {
+            match require_bool(&l)? {
                 Some(true) => Ok(Value::Bool(true)),
                 Some(false) => {
                     let r = eval_expr(right, row, params)?;
-                    match truthy3(&r) {
+                    match require_bool(&r)? {
                         Some(b) => Ok(Value::Bool(b)),
                         None => Ok(Value::Null),
                     }
                 }
                 None => {
                     let r = eval_expr(right, row, params)?;
-                    match truthy3(&r) {
+                    match require_bool(&r)? {
                         Some(true) => Ok(Value::Bool(true)),
                         _ => Ok(Value::Null),
                     }
@@ -2432,7 +2470,7 @@ pub fn eval_expr(
         }
         Expr::Not(inner) => {
             let v = eval_expr(inner, row, params)?;
-            match truthy3(&v) {
+            match require_bool(&v)? {
                 Some(b) => Ok(Value::Bool(!b)),
                 None => Ok(Value::Null),
             }
@@ -2644,7 +2682,7 @@ pub fn eval_expr(
         Expr::Xor(left, right) => {
             let l = eval_expr(left, row, params)?;
             let r = eval_expr(right, row, params)?;
-            Ok(match (truthy3(&l), truthy3(&r)) {
+            Ok(match (require_bool(&l)?, require_bool(&r)?) {
                 (Some(a), Some(b)) => Value::Bool(a ^ b),
                 _ => Value::Null,
             })
@@ -2789,6 +2827,37 @@ fn truthy3(v: &Value) -> Option<bool> {
     match v {
         Value::Null => None,
         other => Some(other.is_truthy()),
+    }
+}
+
+/// Strict three-valued logic for openCypher boolean operators (AND/OR/NOT/XOR).
+/// Returns Err(TypeError) if the value is not a Bool or Null.
+fn require_bool(v: &Value) -> Result<Option<bool>, ExecError> {
+    match v {
+        Value::Bool(b) => Ok(Some(*b)),
+        Value::Null => Ok(None),
+        other => Err(ExecError {
+            message: format!("TypeError: expected Boolean but got {}", value_type_name(other)),
+        }),
+    }
+}
+
+/// Returns the openCypher type name of a value for error messages.
+fn value_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Bool(_) => "Boolean",
+        Value::Int(_) => "Integer",
+        Value::Float(_) => "Float",
+        Value::Str(_) => "String",
+        Value::Null => "Null",
+        Value::Node { .. } => "Node",
+        Value::Edge { .. } => "Relationship",
+        Value::Path { .. } => "Path",
+        Value::Json(serde_json::Value::Array(_)) => "List",
+        Value::Json(serde_json::Value::Object(_)) => "Map",
+        Value::Json(_) => "Any",
+        Value::Temporal(_) => "DateTime",
+        Value::Duration(_) => "Duration",
     }
 }
 
@@ -3273,9 +3342,15 @@ fn eval_function(
                 }
                 _ => return Err(ExecError { message: "range() takes 2 or 3 arguments".into() }),
             };
-            let (s, e, st) = match (start, end, step) {
-                (Value::Int(s), Value::Int(e), Value::Int(st)) => (s, e, st),
-                _ => return Ok(Value::Null),
+            let (s, e, st) = match (&start, &end, &step) {
+                (Value::Int(s), Value::Int(e), Value::Int(st)) => (*s, *e, *st),
+                (Value::Null, _, _) | (_, Value::Null, _) | (_, _, Value::Null) => return Ok(Value::Null),
+                _ => return Err(ExecError {
+                    message: format!(
+                        "TypeError: expected Integer arguments for range(), got ({}, {}, {})",
+                        value_type_name(&start), value_type_name(&end), value_type_name(&step)
+                    ),
+                }),
             };
             if st == 0 {
                 return Err(ExecError { message: "range() step cannot be 0".into() });

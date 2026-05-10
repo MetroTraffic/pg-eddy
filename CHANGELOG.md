@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.15.0](#0150----storage-correctness-and-error-validation) — Storage Correctness and Error Validation
 - [0.14.0](#0140----temporal-types-and-foreach) — Temporal Types and FOREACH
 - [0.13.0](#0130--2026-05-10--storage-stabilisation-and-parser-hardening) — Storage Stabilisation and Parser Hardening
 - [0.12.1](#0121--2026-05-10--batch-catalog-writes-and-ldbc-is-1is-3-benchmark) — Batch Catalog Writes and LDBC IS-1/IS-3 Benchmark
@@ -22,6 +23,49 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 - [0.3.0](#030--2026-05-09--edge-storage--adjacency-lists) — Edge Storage + Adjacency Lists
 - [0.2.0](#020--2026-05-09--node-storage) — Node Storage
 - [0.1.0](#010--2026-05-09--am-skeleton) — AM Skeleton
+
+---
+
+## [0.15.0] — Storage Correctness and Error Validation
+
+v0.15.0 eliminates all storage corruption errors and adds strict openCypher
+type checking. TCK pass rate rises from 1628/3880 (42.0%) to **1781/3880
+(45.9%)** — the largest single-release improvement (+153 scenarios).
+
+### What's New
+
+**Storage corruption fix** — `clear()` (used by the TCK harness between tests)
+now acquires `AccessExclusiveLock` before calling `RelationTruncate`. Previously
+it used `NoLock`, which raced with autovacuum's cached `nblocks`, causing
+`could not read blocks` errors that cascaded into ~732 test failures. This was
+the single largest source of TCK noise.
+
+**Cross-page node update** — `update_node()` now handles records that grow
+beyond the current page's free space. Instead of raising PE201, it logically
+deletes the old record in-place and re-inserts on a new page via
+`find_or_extend_page`. Also fixed a MAXALIGN bug where the free-space check
+used raw item length instead of 8-byte-aligned length.
+
+**Strict boolean type checking** — `AND`, `OR`, `NOT`, `XOR` now raise
+`TypeError` for non-boolean operands (e.g., `1 AND true`). Filter contexts
+(`WHERE`, `CASE WHEN`) still use truthiness coercion per openCypher spec.
+
+**Property access type checking** — accessing `.prop` on a non-graph-element
+(integer, string, boolean, list) now raises `TypeError` instead of returning
+`null`.
+
+**range() type checking** — `range()` now raises `TypeError` for non-integer
+arguments instead of silently returning `null`.
+
+**ORDER BY validation** — `ORDER BY` on an undefined variable now raises
+`SyntaxError` instead of silently producing null-ordered results.
+
+### TCK Result
+
+| Release | Pass  | Total | %    | Delta |
+|---------|-------|-------|------|-------|
+| v0.14.0 | 1628  | 3880  | 42.0% | baseline |
+| v0.15.0 | **1781** | 3880 | **45.9%** | **+153** |
 
 ---
 
