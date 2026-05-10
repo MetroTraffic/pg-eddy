@@ -1589,7 +1589,8 @@ mod tests {
             None,
         ).collect();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, serde_json::json!("Charlie"));
+        // cypher() returns one JSONB object per row: {"n.name": "Charlie"}
+        assert_eq!(results[0].0, serde_json::json!({"n.name": "Charlie"}));
     }
 
     #[pg_test]
@@ -1604,7 +1605,8 @@ mod tests {
             None,
         ).collect();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, serde_json::json!(nid));
+        // cypher() returns one JSONB object per row: {"id(n)": <id>}
+        assert_eq!(results[0].0, serde_json::json!({"id(n)": nid}));
     }
 
     #[pg_test]
@@ -1633,7 +1635,8 @@ mod tests {
             None,
         ).collect();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, serde_json::json!("X"));
+        // cypher() returns one JSONB object per row: {"n.name": "X"}
+        assert_eq!(results[0].0, serde_json::json!({"n.name": "X"}));
     }
 
     #[pg_test]
@@ -1666,7 +1669,9 @@ mod tests {
             None,
         ).collect();
         assert_eq!(results.len(), 1);
-        let arr = results[0].0.as_array().unwrap();
+        // cypher() returns one JSONB object per row: {"labels(n)": [...]}
+        let row = results[0].0.as_object().expect("expected JSONB object row");
+        let arr = row.get("labels(n)").and_then(|v| v.as_array()).expect("expected labels array");
         assert!(arr.iter().any(|v| v == "LabelFnTest"));
         assert!(arr.iter().any(|v| v == "Extra"));
     }
