@@ -1318,6 +1318,23 @@ fn exec_expand(
 
     // Pre-resolve dst label IDs for filtering.
     let dst_label_ids: Vec<i32> = dst_labels.iter().filter_map(|l| label_id_by_name(l)).collect();
+    // If any requested dst label does not exist in the catalog, no node can
+    // satisfy the predicate. Short-circuit to an empty (or optional null-row)
+    // result without scanning the graph.
+    let dst_label_unsatisfiable = !dst_labels.is_empty() && dst_label_ids.len() != dst_labels.len();
+    if dst_label_unsatisfiable {
+        if optional {
+            let mut out = Vec::new();
+            for input_row in &input_rows {
+                let mut nr = input_row.clone();
+                if let Some(rv) = rel_var { nr.insert(rv.to_string(), Value::Null); }
+                nr.insert(dst_var.to_string(), Value::Null);
+                out.push(nr);
+            }
+            return Ok(out);
+        }
+        return Ok(Vec::new());
+    }
 
     for input_row in &input_rows {
         // Look up the source variable in the row, or fall back to params (for correlated subqueries
