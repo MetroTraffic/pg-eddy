@@ -711,12 +711,12 @@ impl Parser {
             // Optional variable-length: *  or *3  or *1..5  or *..5  or *3..
             if *self.peek() == Token::Star {
                 self.advance(); // consume *
-                let min = if let Token::IntLit(n) = self.peek() {
+                let (min, min_explicit) = if let Token::IntLit(n) = self.peek() {
                     let n = *n as u32;
                     self.advance();
-                    n
+                    (n, true)
                 } else {
-                    1 // default minimum is 1
+                    (1, false) // default minimum is 1
                 };
                 let max = if *self.peek() == Token::DotDot {
                     self.advance(); // consume ..
@@ -727,9 +727,11 @@ impl Parser {
                     } else {
                         None // unbounded: *3..
                     }
+                } else if min_explicit {
+                    // Exact length: *N means N..N (including *1 -> 1..1).
+                    Some(min)
                 } else {
-                    // Just *3 — exact length: min == max
-                    if min != 1 { Some(min) } else { None }
+                    None // bare *: unbounded
                 };
                 length = Some(VarLength { min, max });
             }

@@ -62,7 +62,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ### TCK
 
-- Pass rate: 3006 → 3022 / 3880 (77.5% → 77.9%, +16).
+- Pass rate: 3006 → 3025 / 3880 (77.5% → 78.0%, +19).
 
 ---
 
