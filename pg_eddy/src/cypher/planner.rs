@@ -1327,6 +1327,27 @@ fn plan_pattern_onto(
                     optional,
                     path_carry_var: path_carry,
                 };
+                // Var-length expand does not apply dst node label/property predicates.
+                // Emit explicit filter expressions on the bound destination so they
+                // are enforced post-traversal.
+                for label in &next_node.labels {
+                    let filt = Expr::HasLabel(
+                        Box::new(Expr::Variable(dst_var.clone())),
+                        vec![label.clone()],
+                    );
+                    plan = LogicalPlan::Filter { input: Box::new(plan), predicate: filt };
+                }
+                for (key, val_expr) in &next_node.properties {
+                    let filt = Expr::Compare(
+                        Box::new(Expr::Property(
+                            Box::new(Expr::Variable(dst_var.clone())),
+                            key.clone(),
+                        )),
+                        CmpOp::Eq,
+                        Box::new(val_expr.clone()),
+                    );
+                    plan = LogicalPlan::Filter { input: Box::new(plan), predicate: filt };
+                }
             } else {
                 // Fixed single-hop expand.
                 plan = LogicalPlan::Expand {
