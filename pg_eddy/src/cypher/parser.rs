@@ -30,11 +30,12 @@ impl From<LexError> for ParseError {
 struct Parser {
     tokens: Vec<SpannedToken>,
     pos: usize,
+    source: String,
 }
 
 impl Parser {
-    fn new(tokens: Vec<SpannedToken>) -> Self {
-        Parser { tokens, pos: 0 }
+    fn new(tokens: Vec<SpannedToken>, source: String) -> Self {
+        Parser { tokens, pos: 0, source }
     }
 
     fn peek(&self) -> &Token {
@@ -776,14 +777,14 @@ impl Parser {
         let mut props = Vec::new();
 
         if *self.peek() != Token::RBrace {
-            let key = self.eat_ident_flexible()?;
+            let key = self.eat_map_key()?;
             self.expect(&Token::Colon)?;
             let val = self.parse_expr()?;
             props.push((key, val));
 
             while *self.peek() == Token::Comma {
                 self.advance();
-                let key = self.eat_ident_flexible()?;
+                let key = self.eat_map_key()?;
                 self.expect(&Token::Colon)?;
                 let val = self.parse_expr()?;
                 props.push((key, val));
@@ -847,6 +848,33 @@ impl Parser {
             }),
         }
     }
+
+    /// Like eat_ident_flexible but preserves the ORIGINAL CASE of the token text.
+    /// Used for map literal keys where `{null: v1, NULL: v2}` must produce
+    /// case-sensitive keys "null" and "NULL" respectively.
+    fn eat_map_key(&mut self) -> Result<String, ParseError> {
+        // For backtick-quoted identifiers and regular identifiers, the token already
+        // stores the original case in Token::Ident(name).
+        if let Token::Ident(name) = self.peek().clone() {
+            self.advance();
+            return Ok(name);
+        }
+        // For keyword tokens (null, true, false, etc.), recover original case from source.
+        let start = self.tokens[self.pos].offset;
+        let end = self.tokens.get(self.pos + 1).map_or(self.source.len(), |t| t.offset);
+        let original = self.source[start..end].trim_end().to_string();
+        // Verify it's a valid identifier character sequence.
+        if original.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+            && original.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
+            self.advance();
+            Ok(original)
+        } else {
+            // Fall back to the standard handling (handles non-identifier keywords).
+            self.eat_ident_flexible()
+        }
+    }
+
 
     /// Parse a comma-separated list of expressions (for DELETE).
     fn parse_expr_list(&mut self) -> Result<Vec<Expr>, ParseError> {
@@ -1666,7 +1694,7 @@ fn is_aggregate_fn_name(name: &str) -> bool {
 /// Parse a Cypher query string into an AST.
 pub fn parse(input: &str) -> Result<Query, ParseError> {
     let tokens = crate::cypher::lexer::lex(input)?;
-    let mut parser = Parser::new(tokens);
+    let mut parser = Parser::new(tokens, input.to_string());
     parser.parse_query()
 }
 

@@ -597,6 +597,15 @@ fn plan_clauses(
                         crate::cypher::ast::SetItem::Property(target, value) => {
                             check_expr_vars(target, bound_vars)?;
                             check_expr_vars(value, bound_vars)?;
+                            // Pattern predicates (inline pattern expressions) cannot appear
+                            // in the right-hand side of a SET clause.
+                            if expr_has_inline_pattern(value) {
+                                return Err(PlanError {
+                                    message: "SyntaxError: UnexpectedSyntax — pattern \
+                                              predicates cannot be used in the right-hand \
+                                              side of a SET clause".into(),
+                                });
+                            }
                         }
                         crate::cypher::ast::SetItem::Variable(var, value) => {
                             if !bound_vars.contains(var) {
@@ -661,10 +670,9 @@ fn plan_clauses(
                         // that might yield nodes/rels are evaluated at runtime.
                         Expr::Property(_, _) | Expr::FunctionCall(_, _)
                         | Expr::Subscript(_, _) => {}
-                        // Arithmetic, comparisons, literals — definitely not a node/rel.
-                        Expr::Arith(_, _, _) | Expr::IntLit(_) | Expr::FloatLit(_)
-                        | Expr::StringLit(_) | Expr::BoolLit(_) | Expr::NullLit
-                        | Expr::List(_) | Expr::MapLiteral(_)
+                        // Arithmetic, comparisons, and other non-node/rel expressions
+                        // that weren't caught by the literal arm above.
+                        Expr::Arith(_, _, _)
                         | Expr::Compare(_, _, _) | Expr::And(_, _) | Expr::Or(_, _)
                         | Expr::Not(_) | Expr::Neg(_) => {
                             return Err(PlanError {
@@ -879,6 +887,24 @@ fn expr_has_inline_pattern(expr: &Expr) -> bool {
             expr_has_inline_pattern(e)
         }
         Expr::FunctionCall(_, args) => args.iter().any(expr_has_inline_pattern),
+        // Property access: expr.prop — recurse into base expression
+        Expr::Property(base, _) => expr_has_inline_pattern(base),
+        // Subscript / slice
+        Expr::Subscript(base, idx) => expr_has_inline_pattern(base) || expr_has_inline_pattern(idx),
+        Expr::ListSlice { list_expr, from, to } => {
+            expr_has_inline_pattern(list_expr)
+                || from.as_deref().map_or(false, expr_has_inline_pattern)
+                || to.as_deref().map_or(false, expr_has_inline_pattern)
+        }
+        // Comparison chains
+        Expr::Compare(base, _, rhs) => {
+            expr_has_inline_pattern(base) || expr_has_inline_pattern(rhs)
+        }
+        // Binary arithmetic / string ops
+        Expr::Arith(a, _, b)
+        | Expr::InList(a, b)
+        | Expr::StartsWith(a, b) | Expr::EndsWith(a, b) | Expr::Contains(a, b)
+        | Expr::Regex(a, b) => expr_has_inline_pattern(a) || expr_has_inline_pattern(b),
         _ => false,
     }
 }
@@ -1000,8 +1026,16 @@ fn plan_match_clause(
     // Also use LeftJoin when there is a WHERE clause on the OPTIONAL MATCH. Even if
     // the first node is bound, the WHERE could filter out ALL expanded rows, in which
     // case the outer row must be preserved with nulls — not discarded.
+    //
+    // Also use LeftJoin for multi-hop patterns (more than one relationship step) so
+    // that if any intermediate hop fails, ALL new variables are consistently null'd
+    // rather than partially set by the per-hop optional expand logic.
     if optional {
-        let needs_left_join = where_clause.is_some() || patterns.iter().any(|pat| {
+        // Count relationship hops across all patterns in this OPTIONAL MATCH.
+        let hop_count: usize = patterns.iter()
+            .map(|pat| pat.elements.iter().filter(|e| matches!(e, crate::cypher::ast::PatternElement::Relationship(_))).count())
+            .sum();
+        let needs_left_join = where_clause.is_some() || hop_count > 1 || patterns.iter().any(|pat| {
             if let Some(crate::cypher::ast::PatternElement::Node(n)) = pat.elements.first() {
                 // First node is unbound if it has no variable OR its variable is not in bound_vars.
                 match &n.variable {
@@ -1673,6 +1707,14 @@ fn check_nested_aggregation(expr: &Expr, inside_agg: bool) -> Result<(), PlanErr
                 return Err(PlanError {
                     message: "SyntaxError: NestedAggregation — \
                               aggregation functions cannot be nested".to_string(),
+                });
+            }
+            // Non-deterministic functions (rand()) inside aggregates are forbidden.
+            if inside_agg && name.to_ascii_lowercase() == "rand" {
+                return Err(PlanError {
+                    message: "SyntaxError: NonConstantExpression — \
+                              non-deterministic function rand() cannot be used inside \
+                              an aggregation function".to_string(),
                 });
             }
             for a in args {

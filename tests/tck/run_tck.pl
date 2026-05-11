@@ -517,10 +517,14 @@ sub cell_match {
             (my $inner = $exp) =~ s/^\[\s*|\s*\]$//g;
             my @exp_elems;
             if (length($inner) > 0) {
-                # Split by comma, being careful about nested structures
-                my @parts; my $depth = 0; my $cur = '';
+                # Split by comma, being careful about nested structures and strings
+                my @parts; my $depth = 0; my $cur = ''; my $in_str = 0;
                 for my $ch (split //, $inner) {
-                    if    ($ch eq '(' || $ch eq '[' || $ch eq '{') { $depth++; $cur .= $ch; }
+                    if ($in_str) {
+                        $cur .= $ch;
+                        $in_str = 0 if $ch eq "'";
+                    } elsif ($ch eq "'") { $in_str = 1; $cur .= $ch; }
+                    elsif ($ch eq '(' || $ch eq '[' || $ch eq '{') { $depth++; $cur .= $ch; }
                     elsif ($ch eq ')' || $ch eq ']' || $ch eq '}') { $depth--; $cur .= $ch; }
                     elsif ($ch eq ',' && $depth == 0)              { push @parts, $cur; $cur = ''; }
                     else                                           { $cur .= $ch; }
@@ -710,9 +714,54 @@ sub _repr { defined $_[0] ? (ref($_[0]) ? encode_json($_[0]) : $_[0]) : 'undef' 
 sub cypher_list_to_json {
     my ($str) = @_;
     $str =~ s/^\s+|\s+$//g;
-    # Replace Cypher single-quoted strings with JSON double-quoted strings
-    $str =~ s/'([^']*)'/'"' . $1 . '"'/ge;
-    return $str;
+    # Strip outer brackets.
+    return '[]' unless $str =~ /^\[(.*)]\s*$/s;
+    my $inner = $1;
+    $inner =~ s/^\s+|\s+$//g;
+    return '[]' unless length($inner);
+
+    # Split elements respecting nested braces/brackets.
+    my @elems;
+    my ($depth, $buf, $in_sq) = (0, '', 0);
+    for my $ch (split //, $inner) {
+        if ($in_sq) {
+            $buf .= $ch;
+            $in_sq = 0 if $ch eq "'";
+        } elsif ($ch eq "'") {
+            $buf .= $ch; $in_sq = 1;
+        } elsif ($ch =~ /[{\[]/) {
+            $depth++; $buf .= $ch;
+        } elsif ($ch =~ /[}\]]/) {
+            $depth--; $buf .= $ch;
+        } elsif ($ch eq ',' && $depth == 0) {
+            push @elems, $buf; $buf = '';
+        } else {
+            $buf .= $ch;
+        }
+    }
+    push @elems, $buf if length($buf);
+
+    my @json_elems;
+    for my $elem (@elems) {
+        $elem =~ s/^\s+|\s+$//g;
+        if ($elem =~ /^\{/) {
+            push @json_elems, cypher_map_to_json($elem);
+        } elsif ($elem =~ /^\[/) {
+            push @json_elems, cypher_list_to_json($elem);
+        } elsif ($elem =~ /^-?\d+$/ || $elem =~ /^-?\d+\.\d+$/) {
+            push @json_elems, $elem;
+        } elsif (lc($elem) eq 'true' || lc($elem) eq 'false' || lc($elem) eq 'null') {
+            push @json_elems, lc($elem);
+        } elsif ($elem =~ /^'(.*)'$/s) {
+            (my $s = $1) =~ s/"/\\"/g;
+            push @json_elems, qq("$s");
+        } else {
+            # Fallback: quote it
+            (my $s = $elem) =~ s/"/\\"/g;
+            push @json_elems, qq("$s");
+        }
+    }
+    return '[' . join(', ', @json_elems) . ']';
 }
 
 # Convert a Cypher map display string like {name: 'Apa', age: 38} to a JSON object string.
@@ -827,4 +876,4 @@ sub parse_feature {
 }
 
 sub _subst { my ($t, $b) = @_; return $t unless defined $t; $t =~ s/<(\w[\w ]*)>/defined($b->{$1}) ? $b->{$1} : "<$1>"/ge; $t }
-sub _split_row { my ($l) = @_; $l =~ s/^\s*\|\s*//; $l =~ s/\s*\|\s*$//; map { my $c=$_; $c=~s/^\s+|\s+$//g; $c } split /\s*\|\s*/, $l }
+sub _split_row { my ($l) = @_; $l =~ s/^\s*\|\s*//; $l =~ s/\s*\|\s*$//; map { my $c=$_; $c=~s/^\s+|\s+$//g; $c =~ s/\\\\/\x00/g; $c =~ s/\\\|/|/g; $c =~ s/\x00/\\/g; $c } split /\s*\|\s*/, $l, -1 }

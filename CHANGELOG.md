@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.20.0](#0200----engine-correctness-and-tcl-harness-improvements) — Engine Correctness and TCK Harness Improvements
 - [0.19.0](#0190----cypher-correctness-and-ordering-improvements) — Cypher Correctness and Ordering Improvements
 - [0.18.0](#0180----quantifiers-pattern-comprehension-and-union) — Quantifiers, Pattern Comprehension, and UNION
 - [0.17.0](#0170----error-validation--named-paths) — Error Validation + Named Paths
@@ -27,6 +28,88 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 - [0.3.0](#030--2026-05-09--edge-storage--adjacency-lists) — Edge Storage + Adjacency Lists
 - [0.2.0](#020--2026-05-09--node-storage) — Node Storage
 - [0.1.0](#010--2026-05-09--am-skeleton) — AM Skeleton
+
+---
+
+## [0.20.0] — Engine Correctness and TCK Harness Improvements
+
+v0.20.0 is a focused correctness and test-harness release. TCK pass rate rises
+from **2974/3880 (76.6%)** to **3006/3880 (77.5%)** — +32 scenarios.
+
+### What's New
+
+**NaN round-trip through JSON** — `Value::Float(NaN)` now serialises to the
+JSON string `"NaN"` and deserialises back correctly, fixing
+`ReturnOrderBy1[11,12]` (NaN sort ordering).
+
+**Relationship isomorphism in named paths** — the `exec_named_path` step now
+checks that all relationship slots in a named path `p = ...` are distinct,
+enforcing openCypher relationship uniqueness within each bound path. Fixes
+`Match6[8-14]` and `Match8[3]`.
+
+**Optional MATCH null-row preservation** — when an OPTIONAL MATCH with a
+WHERE produces no matching rows, the null row now correctly preserves any
+variables that were already bound in the input row (e.g. a relationship
+variable forwarded from an earlier WITH). Fixes `Match7[4,8,9,17]`.
+
+**Multi-hop OPTIONAL MATCH uses LeftJoin** — patterns with more than one hop
+(e.g. `OPTIONAL MATCH (a)-[r1]->(b)-[r2]->(c)`) now generate LeftJoin plans
+instead of InnerJoin plans, ensuring null rows are produced when no match
+exists. Fixes `Match7[8,9]`.
+
+**Correlated variable fallback in eval_expr** — `Expr::Variable` lookups now
+fall back to the `params` map when the variable is not in the current row.
+This enables correlated variable references in MERGE and EXISTS sub-queries.
+Fixes `Merge5[14]` and `WithWhere1[3]`.
+
+**Nested EXISTS scope** — when evaluating an `EXISTS { ... }` sub-query, the
+outer row's variable names now include both `row.keys()` and `params.keys()`,
+enabling nested EXISTS patterns to correctly resolve outer variables. Fixes
+`ExistentialSubquery3[1,3]`.
+
+**SET clause rejects pattern predicates** — the planner now detects inline
+pattern expressions (e.g. `(n)-[:R]->()` embedded inside function calls) in
+the right-hand side of a `SET` clause and raises `SyntaxError: UnexpectedSyntax`.
+Fixes `Pattern1[24]`. The `expr_has_inline_pattern` helper now recursively
+inspects `Property`, `Subscript`, `ListSlice`, `Compare`, and `Arith`
+sub-expressions, catching patterns nested inside wrappers like
+`head(nodes(head((n)-[:REL]->())))`.
+
+**rand() forbidden inside aggregate** — `rand()` called inside an aggregate
+expression (e.g. `count(rand())`) now raises
+`SyntaxError: NonConstantExpression` at plan time. Fixes `Return6[15]`.
+
+**Property type validation in SET** — assigning a map or list-of-maps as a
+scalar property value (e.g. `SET n.prop = {k: v}`) now raises
+`TypeError: InvalidArgumentType` rather than silently storing the wrong type.
+Fixes `Set1[10]`.
+
+**Aggregate ORDER BY via projected column lookup** — when sorting after
+aggregation (`ORDER BY count(*) DESC`), the sort key is now resolved by
+looking up the projected column name (e.g. `"count(*)"`) in the output row
+before falling back to `eval_expr`. Fixes `ReturnOrderBy3[1]`.
+
+**Map literal key case preservation** — the parser now uses the original
+source text (via token offset) to recover the exact case of keyword-tokens
+used as map property keys (e.g. `{null: 'a', NULL: 'b'}` produces two
+distinct keys `"null"` and `"NULL"`). Fixes `Map1[5]` and `Map2[5]`.
+
+**UNWIND list-of-maps parameter parsing** — the `cypher_list_to_json` helper
+in the TCK harness was rewritten to handle nested maps and lists with proper
+depth-aware splitting. Fixes `Unwind1[6,14]`.
+
+**Trailing empty cell preservation** — `_split_row` in the TCK harness now
+passes `-1` as the limit to Perl's `split`, preserving trailing empty cells in
+Gherkin table rows. Fixes `List2[9]`.
+
+**Gherkin table backslash unescaping** — `_split_row` now unescapes `\\` → `\`
+and `\|` → `|` in table cells, matching standard Gherkin table escaping rules.
+Fixes `Literals6[5]`.
+
+**String-aware list depth tracking** — the list-element splitter in
+`cell_match` now enters a "string mode" when it sees a single-quote, so `[`
+and `]` characters inside string literals do not affect the nesting depth.
+Fixes `Literals7[17]`.
 
 ---
 

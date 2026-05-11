@@ -984,7 +984,16 @@ fn json_to_value(v: &serde_json::Value) -> Value {
                 Value::Float(n.as_f64().unwrap_or(0.0))
             }
         }
-        serde_json::Value::String(s) => Value::Str(s.clone()),
+        serde_json::Value::String(s) => {
+            // The special string "NaN" represents IEEE 754 NaN (produced by to_json() for
+            // Value::Float(NaN)). Treat it as float NaN so it round-trips correctly through
+            // lists and UNWIND, and sorts at the correct position in value_ordering.
+            if s == "NaN" {
+                Value::Float(f64::NAN)
+            } else {
+                Value::Str(s.clone())
+            }
+        }
         serde_json::Value::Object(m) => {
             // Detect serialized Node: {"node_id": i64, "labels": [...], "properties": {...}}
             if let (Some(serde_json::Value::Number(nid)), Some(serde_json::Value::Array(lbls)), Some(serde_json::Value::Object(props)))
@@ -1465,14 +1474,13 @@ fn exec_expand(
 
             // If rel_var is already bound in the input row (forwarded from a previous WITH),
             // only keep edges whose edge_id matches the existing binding.
-            if let Some(rv) = rel_var {
-                if let Some(existing_rel) = input_row.get(rv) {
-                    if !matches!(existing_rel, Value::Null) {
-                        match (existing_rel.edge_id(), edge_val.edge_id()) {
-                            (Some(e1), Some(e2)) if e1 == e2 => { /* edge matches */ }
-                            _ => continue, // edge doesn't match the bound rel_var
-                        }
-                    }
+            if let Some(rv) = rel_var
+                && let Some(existing_rel) = input_row.get(rv)
+                && !matches!(existing_rel, Value::Null)
+            {
+                match (existing_rel.edge_id(), edge_val.edge_id()) {
+                    (Some(e1), Some(e2)) if e1 == e2 => { /* edge matches */ }
+                    _ => continue, // edge doesn't match the bound rel_var
                 }
             }
 
@@ -1504,8 +1512,18 @@ fn exec_expand(
         // OPTIONAL: if no edges matched, emit a null row.
         if optional && !matched_any {
             let mut row = input_row.clone();
-            row.insert(dst_var.to_string(), Value::Null);
-            if let Some(rv) = rel_var { row.insert(rv.to_string(), Value::Null); }
+            // Only null out dst_var if it was not already bound (new variable).
+            // If it was already bound (e.g. from a prior MATCH or WITH), preserve the binding.
+            if !input_row.contains_key(dst_var) {
+                row.insert(dst_var.to_string(), Value::Null);
+            }
+            if let Some(rv) = rel_var {
+                // Only null out rel_var if it was not already bound in the input row.
+                // If it was already bound (e.g. from a prior WITH), preserve the binding.
+                if !input_row.contains_key(rv) {
+                    row.insert(rv.to_string(), Value::Null);
+                }
+            }
             result.push(row);
         }
     }
@@ -2013,6 +2031,18 @@ fn exec_named_path(
             }
         }
 
+        // Relationship isomorphism: within a named path, each relationship must be
+        // distinct (same physical edge cannot appear twice in the same path traversal).
+        {
+            let mut seen_edge_ids = std::collections::HashSet::new();
+            let has_dup_rel = rels.iter().any(|r| {
+                if let Some(eid) = r.edge_id() { !seen_edge_ids.insert(eid) } else { false }
+            });
+            if has_dup_rel {
+                continue;
+            }
+        }
+
         let path = Value::Path { nodes, rels };
         row.insert(path_var.to_string(), path);
         result.push(row);
@@ -2271,12 +2301,22 @@ fn exec_project_aggregate(
         }
         projected.sort_by(|(proj_a, in_a), (proj_b, in_b)| {
             for item in order_by {
-                let av = eval_expr(&item.expr, proj_a, params)
-                    .or_else(|_| eval_expr(&item.expr, in_a, params))
-                    .unwrap_or(Value::Null);
-                let bv = eval_expr(&item.expr, proj_b, params)
-                    .or_else(|_| eval_expr(&item.expr, in_b, params))
-                    .unwrap_or(Value::Null);
+                // Evaluate ORDER BY expression with fallbacks:
+                // 1. eval on projected row (fast path for aliases / simple exprs)
+                // 2. column lookup by default name (handles aggregate exprs like count(*))
+                // 3. eval on original input row (handles node.prop when node not projected)
+                let eval_ob = |proj: &Row, fallback: &Row| -> Value {
+                    if let Ok(v) = eval_expr(&item.expr, proj, params) {
+                        return v;
+                    }
+                    let col = expr_default_name(&item.expr, 0);
+                    if let Some(v) = proj.get(&col) {
+                        return v.clone();
+                    }
+                    eval_expr(&item.expr, fallback, params).unwrap_or(Value::Null)
+                };
+                let av = eval_ob(proj_a, in_a);
+                let bv = eval_ob(proj_b, in_b);
                 let cmp = value_ordering(&av, &bv);
                 if cmp != std::cmp::Ordering::Equal {
                     return if item.ascending { cmp } else { cmp.reverse() };
@@ -2876,9 +2916,14 @@ pub fn eval_expr(
 ) -> Result<Value, ExecError> {
     match expr {
         Expr::Variable(name) => {
-            row.get(name).cloned().ok_or_else(|| ExecError {
-                message: format!("unbound variable: {name}"),
-            })
+            if let Some(v) = row.get(name) {
+                Ok(v.clone())
+            } else if let Some(pv) = params.get(name) {
+                // Fall back to params for correlated contexts (e.g. MERGE with outer bindings).
+                Ok(json_to_value(pv))
+            } else {
+                Err(ExecError { message: format!("unbound variable: {name}") })
+            }
         }
         Expr::Property(base_expr, key) => {
             let base = eval_expr(base_expr, row, params)?;
@@ -3367,7 +3412,11 @@ pub fn eval_expr(
             // This ensures `MATCH (n)-->()` (where n is outer) uses n as a
             // bound variable rather than scanning all nodes.
             use crate::cypher::planner;
-            let outer_vars: std::collections::HashSet<String> = row.keys().cloned().collect();
+            // Include both row keys and params keys: params may contain outer row
+            // bindings propagated from enclosing EXISTS subqueries (e.g. nested EXISTS
+            // where the middle row doesn't carry outermost variables in `row`).
+            let mut outer_vars: std::collections::HashSet<String> = row.keys().cloned().collect();
+            outer_vars.extend(params.keys().cloned());
             let plan = planner::plan_with_outer(subquery, &outer_vars)
                 .map_err(|e| ExecError { message: e.message })?;
             // Inject outer row vars into params so the inner plan can look them up.
@@ -5054,6 +5103,24 @@ fn exec_set_prop(
                         _ => return Err(ExecError { message: "SET property must reference a property access".into() }),
                     };
                     let val = eval_expr(val_expr, &row, params)?;
+                    // Validate property type: maps and lists-of-maps are not valid property values.
+                    match &val {
+                        Value::Json(serde_json::Value::Object(_)) => {
+                            return Err(ExecError {
+                                message: "TypeError: InvalidPropertyType — \
+                                          map is not a valid property value".into(),
+                            });
+                        }
+                        Value::Json(serde_json::Value::Array(arr))
+                            if arr.iter().any(|e| matches!(e, serde_json::Value::Object(_))) =>
+                        {
+                            return Err(ExecError {
+                                message: "TypeError: InvalidPropertyType — \
+                                          list of maps is not a valid property value".into(),
+                            });
+                        }
+                        _ => {}
+                    }
                     // Skip if target variable is null (SET on null is a no-op).
                     if matches!(row.get(&var), Some(Value::Null)) {
                         continue;
