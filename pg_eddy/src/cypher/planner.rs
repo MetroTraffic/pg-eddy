@@ -16,6 +16,8 @@ enum VarKind {
     Rel,
     Path,
     Scalar,
+    /// Variable is definitely not a node (from a literal, boolean expr, arithmetic, etc.).
+    NotNode,
 }
 
 /// A logical plan node.
@@ -95,6 +97,14 @@ pub enum LogicalPlan {
     Apply {
         outer: Box<LogicalPlan>,
         inner: Box<LogicalPlan>,
+    },
+    /// LeftJoin: for each outer row, execute inner (left join / OPTIONAL MATCH semantics).
+    /// If inner has results: emit merged rows. If inner is empty: emit outer row with
+    /// null_vars set to null. Used for OPTIONAL MATCH where new variables are introduced.
+    LeftJoin {
+        outer: Box<LogicalPlan>,
+        inner: Box<LogicalPlan>,
+        null_vars: Vec<String>,
     },
     /// Empty plan: produces zero rows (used for unimplemented CALL procedures).
     Empty,
@@ -187,15 +197,15 @@ pub fn plan(query: &Query) -> Result<LogicalPlan, PlanError> {
         // Validate that both sides of UNION expose the same column names.
         let left_cols = return_column_names(&query.clauses);
         let right_cols = return_column_names(&right_q.clauses);
-        if let (Some(lc), Some(rc)) = (left_cols, right_cols) {
-            if lc != rc {
-                return Err(PlanError {
-                    message: format!(
-                        "SyntaxError::DifferentColumnsInUnion: columns {:?} and {:?} differ",
+        if let (Some(lc), Some(rc)) = (left_cols, right_cols)
+            && lc != rc
+        {
+            return Err(PlanError {
+                message: format!(
+                    "SyntaxError::DifferentColumnsInUnion: columns {:?} and {:?} differ",
                         lc, rc
                     ),
                 });
-            }
         }
         // Also recursively validate the right side (in case of chained UNIONs).
         let right = plan(right_q)?;
@@ -255,6 +265,48 @@ fn plan_clauses(
                 };
             }
             QueryClause::With { distinct, items, order_by, skip, limit, where_clause } => {
+                // Pattern predicates in WITH projection are not allowed.
+                for item in items.iter() {
+                    if expr_has_inline_pattern(&item.expr) {
+                        return Err(PlanError {
+                            message: "SyntaxError::UnexpectedSyntax: pattern predicates \
+                                      cannot be used in WITH projections".into(),
+                        });
+                    }
+                }
+                // Check for duplicate column names (ColumnNameConflict) and missing aliases.
+                {
+                    let mut seen_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    for item in items.iter() {
+                        // Non-variable/property expressions must have an alias.
+                        if item.alias.is_none() {
+                            let needs_alias = !matches!(item.expr,
+                                Expr::Variable(_) | Expr::Star
+                            );
+                            if needs_alias {
+                                return Err(PlanError {
+                                    message: "SyntaxError: NoExpressionAlias — \
+                                              expressions in WITH must be aliased".into(),
+                                });
+                            }
+                        }
+                        let col_name = if let Some(ref alias) = item.alias {
+                            alias.clone()
+                        } else if let Expr::Variable(ref v) = item.expr {
+                            v.clone()
+                        } else {
+                            continue;
+                        };
+                        if !seen_cols.insert(col_name.clone()) {
+                            return Err(PlanError {
+                                message: format!(
+                                    "SyntaxError: ColumnNameConflict — \
+                                     multiple WITH columns with name '{col_name}'"
+                                ),
+                            });
+                        }
+                    }
+                }
                 // Check: aggregation function in ORDER BY without aggregation in projection
                 // is a SyntaxError (InvalidAggregation).
                 let proj_has_agg = items.iter().any(|it| expr_contains_aggregation(&it.expr));
@@ -268,6 +320,19 @@ fn plan_clauses(
                         }
                     }
                 }
+                // WITH WHERE: filter BEFORE projection so pre-projected variables are in scope.
+                // Additionally substitute projection aliases so that WHERE can also reference
+                // aliases defined in THIS WITH clause (e.g. `WITH a+b AS c WHERE c > 0`).
+                if let Some(wh) = where_clause {
+                    // Build alias map: alias -> expression, for substitution.
+                    let alias_map: HashMap<String, Expr> = items.iter()
+                        .filter_map(|item| {
+                            item.alias.as_ref().map(|alias| (alias.clone(), item.expr.clone()))
+                        })
+                        .collect();
+                    let rewritten_wh = substitute_aliases_in_expr(wh, &alias_map);
+                    current = LogicalPlan::Filter { input: Box::new(current), predicate: rewritten_wh };
+                }
                 current = LogicalPlan::Project {
                     input: Box::new(current),
                     items: items.clone(),
@@ -276,26 +341,73 @@ fn plan_clauses(
                     skip: skip.clone(),
                     limit: limit.clone(),
                 };
-                // After WITH, only the projected variables are in scope.
-                // Re-classify them based on expression type.
+                let old_var_kinds = std::mem::take(var_kinds);
                 bound_vars.clear();
-                var_kinds.clear();
                 for item in items {
                     let exposed = item.alias.clone().or_else(|| {
                         if let Expr::Variable(v) = &item.expr { Some(v.clone()) } else { None }
                     });
                     if let Some(v) = exposed {
                         bound_vars.insert(v.clone());
-                        // Infer kind: Variable passthrough keeps kind; literals are Scalar.
-                        let kind = expr_var_kind(&item.expr, var_kinds);
+                        // Infer kind from old_var_kinds (not yet-cleared var_kinds).
+                        let kind = expr_var_kind(&item.expr, &old_var_kinds);
                         var_kinds.insert(v, kind);
                     }
                 }
-                if let Some(wh) = where_clause {
-                    current = LogicalPlan::Filter { input: Box::new(current), predicate: wh.clone() };
-                }
             }
             QueryClause::Return { distinct, items, order_by, skip, limit } => {
+                // Pattern predicates in RETURN/WITH projection are not allowed.
+                for item in items.iter() {
+                    if expr_has_inline_pattern(&item.expr) {
+                        return Err(PlanError {
+                            message: "SyntaxError::UnexpectedSyntax: pattern predicates \
+                                      cannot be used in RETURN projections".into(),
+                        });
+                    }
+                    // size(path_var) is InvalidArgumentType.
+                    if let Expr::FunctionCall(ref fname, ref args) = item.expr {
+                        if fname.eq_ignore_ascii_case("size") && args.len() == 1 {
+                            if let Expr::Variable(ref v) = args[0] {
+                                if matches!(var_kinds.get(v), Some(VarKind::Path)) {
+                                    return Err(PlanError {
+                                        message: format!(
+                                            "SyntaxError::InvalidArgumentType: size() \
+                                             cannot be used on path variable '{v}'"
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                // Check for duplicate column names (ColumnNameConflict).
+                {
+                    let mut seen_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    for (idx, item) in items.iter().enumerate() {
+                        let col_name = if let Some(ref alias) = item.alias {
+                            alias.clone()
+                        } else if let Expr::Variable(ref v) = item.expr {
+                            v.clone()
+                        } else if let Expr::Property(ref base, ref k) = item.expr {
+                            // Full default name: "base.key" so a.id and b.id don't clash.
+                            if let Expr::Variable(ref bv) = **base {
+                                format!("{bv}.{k}")
+                            } else {
+                                format!("_col{idx}")
+                            }
+                        } else {
+                            continue; // unnamed expressions don't conflict
+                        };
+                        if !seen_cols.insert(col_name.clone()) {
+                            return Err(PlanError {
+                                message: format!(
+                                    "SyntaxError: ColumnNameConflict — \
+                                     multiple return columns with name '{col_name}'"
+                                ),
+                            });
+                        }
+                    }
+                }
                 current = LogicalPlan::Project {
                     input: Box::new(current),
                     items: items.clone(),
@@ -307,17 +419,53 @@ fn plan_clauses(
             }
             // v0.12.0 write clauses
             QueryClause::Create { patterns } => {
-                // Bind any variables introduced by CREATE patterns.
+                // Validate and bind CREATE patterns.
                 for pattern in patterns {
                     for elem in &pattern.elements {
+                        if let PatternElement::Relationship(r) = elem {
+                            // Validate relationship type constraints for CREATE.
+                            if r.rel_types.is_empty() {
+                                return Err(PlanError {
+                                    message: "SyntaxError: NoSingleRelationshipType — \
+                                              CREATE relationship must have exactly one type".to_string(),
+                                });
+                            }
+                            if r.rel_types.len() > 1 {
+                                return Err(PlanError {
+                                    message: "SyntaxError: NoSingleRelationshipType — \
+                                              CREATE relationship cannot have multiple types".to_string(),
+                                });
+                            }
+                            if r.length.is_some() {
+                                return Err(PlanError {
+                                    message: "SyntaxError: CreatingVarLength — \
+                                              CREATE does not support variable-length relationships".to_string(),
+                                });
+                            }
+                            if let Some(v) = &r.variable {
+                                bound_vars.insert(v.clone());
+                            }
+                        }
                         if let PatternElement::Node(n) = elem
-                            && let Some(v) = &n.variable {
+                            && let Some(v) = &n.variable
+                        {
+                            if bound_vars.contains(v) {
+                                // Already bound: error if node re-declares labels/props or standalone
+                                let has_labels = !n.labels.is_empty();
+                                let has_props = !n.properties.is_empty();
+                                let is_standalone = pattern.elements.len() == 1;
+                                if has_labels || has_props || is_standalone {
+                                    return Err(PlanError {
+                                        message: format!(
+                                            "SyntaxError: VariableAlreadyBound — \
+                                             cannot CREATE node '{v}' that is already bound"
+                                        ),
+                                    });
+                                }
+                            } else {
                                 bound_vars.insert(v.clone());
                             }
-                        if let PatternElement::Relationship(r) = elem
-                            && let Some(v) = &r.variable {
-                                bound_vars.insert(v.clone());
-                            }
+                        }
                     }
                 }
                 current = LogicalPlan::CreatePattern {
@@ -338,6 +486,32 @@ fn plan_clauses(
                 };
             }
             QueryClause::Delete { exprs, detach } => {
+                // Validate DELETE expressions: must be variable references.
+                for expr in exprs.iter() {
+                    match expr {
+                        Expr::Variable(v) => {
+                            if !bound_vars.contains(v) {
+                                return Err(PlanError {
+                                    message: format!(
+                                        "SyntaxError: UndefinedVariable — \
+                                         variable '{v}' is not defined"
+                                    ),
+                                });
+                            }
+                        }
+                        // Literal numeric/string/boolean/null cannot be nodes — reject at plan time.
+                        Expr::IntLit(_) | Expr::FloatLit(_) | Expr::StringLit(_)
+                        | Expr::BoolLit(_) | Expr::NullLit | Expr::List(_) | Expr::MapLiteral(_) => {
+                            return Err(PlanError {
+                                message: "SyntaxError: InvalidArgumentType — \
+                                          DELETE expression must be a variable (node or relationship)".into(),
+                            });
+                        }
+                        // Subscript (list[i]), Property (map.key), function calls, etc.
+                        // are evaluated at runtime — allow them.
+                        _ => {}
+                    }
+                }
                 current = LogicalPlan::DeleteNodes {
                     input: Box::new(current),
                     exprs: exprs.clone(),
@@ -345,6 +519,53 @@ fn plan_clauses(
                 };
             }
             QueryClause::Merge { pattern, on_create, on_match } => {
+                // Validate MERGE pattern (similar to CREATE validation).
+                for elem in &pattern.elements {
+                    if let PatternElement::Relationship(r) = elem {
+                        if r.rel_types.is_empty() {
+                            return Err(PlanError {
+                                message: "SyntaxError: NoSingleRelationshipType — \
+                                          MERGE relationship must have exactly one type".to_string(),
+                            });
+                        }
+                        if r.rel_types.len() > 1 {
+                            return Err(PlanError {
+                                message: "SyntaxError: NoSingleRelationshipType — \
+                                          MERGE relationship cannot have multiple types".to_string(),
+                            });
+                        }
+                        if r.length.is_some() {
+                            return Err(PlanError {
+                                message: "SyntaxError: CreatingVarLength — \
+                                          MERGE does not support variable-length relationships".to_string(),
+                            });
+                        }
+                        // Check rel var not already bound.
+                        if let Some(ref v) = r.variable {
+                            if bound_vars.contains(v) {
+                                return Err(PlanError {
+                                    message: format!(
+                                        "SyntaxError: VariableAlreadyBound — \
+                                         relationship '{v}' is already bound in MERGE"
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    // Check node vars: if re-bound with new labels, it's VariableAlreadyBound.
+                    if let PatternElement::Node(n) = elem {
+                        if let Some(ref v) = n.variable {
+                            if bound_vars.contains(v) && !n.labels.is_empty() {
+                                return Err(PlanError {
+                                    message: format!(
+                                        "SyntaxError: VariableAlreadyBound — \
+                                         cannot MERGE node '{v}' that is already bound with new labels"
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
                 // Variables from the merge pattern come into scope.
                 for elem in &pattern.elements {
                     if let PatternElement::Node(n) = elem
@@ -385,6 +606,151 @@ fn plan_clauses(
     Ok(current)
 }
 
+/// Build an OPTIONAL MATCH plan using LeftJoin semantics.
+/// Used when the optional pattern introduces new unbound node variables.
+/// The inner plan is built starting from SingleRow so that each outer row
+/// is matched independently, preventing O(n_nodes)×optional null expansion.
+fn plan_optional_match_left_join(
+    current: LogicalPlan,
+    patterns: &[Pattern],
+    where_clause: &Option<Expr>,
+    bound_vars: &mut HashSet<String>,
+    var_kinds: &mut HashMap<String, VarKind>,
+) -> Result<LogicalPlan, PlanError> {
+    // Collect all variables that will be NEW (introduced by the optional patterns).
+    // These are what we must null-fill if the inner plan produces no rows.
+    let mut null_vars: Vec<String> = Vec::new();
+    let mut inner_bound = bound_vars.clone();
+    let mut inner_kinds = var_kinds.clone();
+    let mut inner_plan = LogicalPlan::SingleRow;
+
+    for pattern in patterns {
+        let (new_plan, new_node_var_list, new_rel_var_list) =
+            plan_pattern_onto(pattern, inner_plan, &inner_bound, &mut inner_kinds, false)?;
+        for v in &new_node_var_list {
+            if !null_vars.contains(v) { null_vars.push(v.clone()); }
+            inner_bound.insert(v.clone());
+        }
+        for v in &new_rel_var_list {
+            if !null_vars.contains(v) { null_vars.push(v.clone()); }
+            inner_bound.insert(v.clone());
+        }
+        if let Some(ref pvar) = pattern.variable {
+            if !null_vars.contains(pvar) { null_vars.push(pvar.clone()); }
+            inner_bound.insert(pvar.clone());
+            inner_kinds.insert(pvar.clone(), VarKind::Path);
+        }
+        inner_plan = new_plan;
+    }
+
+    if let Some(wh) = where_clause {
+        inner_plan = LogicalPlan::Filter { input: Box::new(inner_plan), predicate: wh.clone() };
+    }
+
+    // Register all new vars in the outer bound_vars/var_kinds for subsequent clauses.
+    for v in &null_vars {
+        bound_vars.insert(v.clone());
+        if let Some(k) = inner_kinds.get(v) {
+            var_kinds.insert(v.clone(), k.clone());
+        }
+    }
+
+    Ok(LogicalPlan::LeftJoin {
+        outer: Box::new(current),
+        inner: Box::new(inner_plan),
+        null_vars,
+    })
+}
+
+/// Return true if the expression contains an inline pattern predicate (Exists wrapping a MATCH).
+fn expr_has_inline_pattern(expr: &Expr) -> bool {
+    match expr {
+        Expr::Exists { subquery } => {
+            // An inline pattern predicate has a single MATCH clause (no explicit RETURN).
+            subquery.clauses.len() == 1 && matches!(subquery.clauses[0], QueryClause::Match { .. })
+        }
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+            expr_has_inline_pattern(a) || expr_has_inline_pattern(b)
+        }
+        Expr::Not(e) | Expr::IsNull(e) | Expr::IsNotNull(e) | Expr::Neg(e) => {
+            expr_has_inline_pattern(e)
+        }
+        Expr::FunctionCall(_, args) => args.iter().any(expr_has_inline_pattern),
+        _ => false,
+    }
+}
+
+/// Collect all named (non-anonymous) variables from a pattern.
+fn collect_pattern_named_vars(pattern: &Pattern) -> Vec<String> {
+    let mut vars = Vec::new();
+    if let Some(ref v) = pattern.variable {
+        vars.push(v.clone());
+    }
+    for elem in &pattern.elements {
+        match elem {
+            PatternElement::Node(n) => {
+                if let Some(ref v) = n.variable {
+                    if !v.starts_with('_') { vars.push(v.clone()); }
+                }
+            }
+            PatternElement::Relationship(r) => {
+                if let Some(ref v) = r.variable {
+                    if !v.starts_with('_') { vars.push(v.clone()); }
+                }
+            }
+        }
+    }
+    vars
+}
+
+/// Validate that inline pattern predicates embedded in an expression don't
+/// introduce new named variables beyond what's in `bound_vars`.
+/// Also validates that single-node-only patterns are rejected (InvalidArgumentType).
+fn validate_inline_patterns_in_expr(expr: &Expr, bound_vars: &HashSet<String>) -> Result<(), PlanError> {
+    match expr {
+        Expr::Exists { subquery } => {
+            // Check each MATCH clause in the subquery.
+            for clause in &subquery.clauses {
+                if let QueryClause::Match { patterns, where_clause, .. } = clause {
+                    for pattern in patterns {
+                        // Single-node pattern with no rels → InvalidArgumentType.
+                        let has_rel = pattern.elements.iter().any(|e| matches!(e, PatternElement::Relationship(_)));
+                        if !has_rel {
+                            return Err(PlanError {
+                                message: "SyntaxError::InvalidArgumentType: a single node pattern \
+                                          is not a valid existential predicate".into(),
+                            });
+                        }
+                        // Check for new named variables.
+                        for var in collect_pattern_named_vars(pattern) {
+                            if !bound_vars.contains(&var) {
+                                return Err(PlanError {
+                                    message: format!(
+                                        "SyntaxError::UndefinedVariable: variable '{var}' \
+                                         is not defined in the outer scope of a pattern predicate"
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    if let Some(wc) = where_clause {
+                        validate_inline_patterns_in_expr(wc, bound_vars)?;
+                    }
+                }
+            }
+        }
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+            validate_inline_patterns_in_expr(a, bound_vars)?;
+            validate_inline_patterns_in_expr(b, bound_vars)?;
+        }
+        Expr::Not(e) | Expr::IsNull(e) | Expr::IsNotNull(e) | Expr::Neg(e) => {
+            validate_inline_patterns_in_expr(e, bound_vars)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Plan all patterns in one MATCH (or OPTIONAL MATCH) clause.
 fn plan_match_clause(
     current: LogicalPlan,
@@ -394,16 +760,64 @@ fn plan_match_clause(
     bound_vars: &mut HashSet<String>,
     var_kinds: &mut HashMap<String, VarKind>,
 ) -> Result<LogicalPlan, PlanError> {
+    // For OPTIONAL MATCH: if any pattern introduces a new (unbound) first node variable,
+    // we must use LeftJoin semantics instead of CrossProduct+optional-expand.
+    // With CrossProduct, each scanned value for the new variable gets its own optional
+    // null row if the full pattern doesn't match — producing O(n_nodes) null rows instead
+    // of the expected 1 null row per outer row.
+    // LeftJoin executes the inner pattern freshly for each outer row, with null for
+    // all new variables if the inner produces zero rows.
+    //
+    // Also use LeftJoin when there is a WHERE clause on the OPTIONAL MATCH. Even if
+    // the first node is bound, the WHERE could filter out ALL expanded rows, in which
+    // case the outer row must be preserved with nulls — not discarded.
+    if optional {
+        let needs_left_join = where_clause.is_some() || patterns.iter().any(|pat| {
+            if let Some(crate::cypher::ast::PatternElement::Node(n)) = pat.elements.first() {
+                // First node is unbound if it has no variable OR its variable is not in bound_vars.
+                match &n.variable {
+                    None => true,
+                    Some(v) => !bound_vars.contains(v),
+                }
+            } else {
+                false
+            }
+        });
+        if needs_left_join {
+            return plan_optional_match_left_join(current, patterns, where_clause, bound_vars, var_kinds);
+        }
+    }
+
     let mut plan = current;
     let mut new_node_vars: Vec<String> = Vec::new();
+    let mut new_rel_vars: Vec<String> = Vec::new();
 
     for pattern in patterns {
-        // If the pattern has a path variable, check it isn't already bound as non-Path.
-        if pattern.variable.as_ref().is_some_and(|pvar| var_kinds.contains_key(pvar)) {
+        // If the pattern has a path variable, check it isn't already bound.
+        if pattern.variable.as_ref().is_some_and(|pvar| var_kinds.contains_key(pvar)
+            || bound_vars.contains(pvar))
+        {
             let pvar = pattern.variable.as_deref().unwrap();
             return Err(PlanError {
                 message: format!("SyntaxError: VariableAlreadyBound — '{pvar}' is already bound"),
             });
+        }
+        // Check that the path variable doesn't conflict with node/rel variables in the same pattern.
+        if let Some(ref pvar) = pattern.variable {
+            for elem in &pattern.elements {
+                let conflicts = match elem {
+                    PatternElement::Node(n) => n.variable.as_deref() == Some(pvar.as_str()),
+                    PatternElement::Relationship(r) => r.variable.as_deref() == Some(pvar.as_str()),
+                };
+                if conflicts {
+                    return Err(PlanError {
+                        message: format!(
+                            "SyntaxError: VariableAlreadyBound — path variable '{pvar}' \
+                             conflicts with a node/relationship variable in the same pattern"
+                        ),
+                    });
+                }
+            }
         }
         let (new_plan, new_node_var_list, new_rel_var_list) =
             plan_pattern_onto(pattern, plan, bound_vars, var_kinds, optional)?;
@@ -412,6 +826,7 @@ fn plan_match_clause(
             bound_vars.insert(v.clone());
         }
         for v in &new_rel_var_list {
+            if !new_rel_vars.contains(v) { new_rel_vars.push(v.clone()); }
             bound_vars.insert(v.clone());
         }
         if let Some(ref pvar) = pattern.variable {
@@ -421,10 +836,17 @@ fn plan_match_clause(
         plan = new_plan;
     }
 
-    // Node isomorphism: add a <> filter for every new pair of node variables.
-    let iso_filter = build_isomorphism_filter(&new_node_vars);
+    // Validate WHERE clause: no new named vars in inline pattern predicates.
+    if let Some(wc) = where_clause {
+        validate_inline_patterns_in_expr(wc, bound_vars)?;
+    }
 
-    let combined = match (iso_filter, where_clause.clone()) {
+    // Relationship isomorphism: different relationship variables in the same MATCH clause
+    // must not be bound to the same relationship (openCypher relationship uniqueness).
+    let rel_iso_filter = build_rel_isomorphism_filter(&new_rel_vars);
+
+    // In openCypher, different node variables CAN bind to the same node (no node isomorphism).
+    let combined = match (rel_iso_filter, where_clause.clone()) {
         (Some(iso), Some(wh)) => Some(Expr::And(Box::new(iso), Box::new(wh))),
         (Some(iso), None) => Some(iso),
         (None, Some(wh)) => Some(wh),
@@ -460,8 +882,10 @@ fn plan_pattern_onto(
     let first_is_bound = first_node.variable.is_some() && bound_vars.contains(&first_var);
 
     // Type-conflict check for first node.
+    // Allow Scalar (could be a node from an expression like coalesce) and Node.
+    // Reject explicit non-node kinds: Rel, Path, and NotNode.
     if first_node.variable.is_some()
-        && matches!(var_kinds.get(&first_var), Some(k) if *k != VarKind::Node)
+        && matches!(var_kinds.get(&first_var), Some(VarKind::Rel | VarKind::Path | VarKind::NotNode))
     {
         return Err(PlanError {
             message: format!(
@@ -473,7 +897,26 @@ fn plan_pattern_onto(
 
     let mut plan = if first_is_bound {
         // Start with current pipeline — first node is already in scope.
-        current
+        // But apply any label/property constraints from the pattern as a filter.
+        let mut p = current;
+        if !first_node.labels.is_empty() {
+            let filter_expr = Expr::HasLabel(
+                Box::new(Expr::Variable(first_var.clone())),
+                first_node.labels.clone(),
+            );
+            p = LogicalPlan::Filter { input: Box::new(p), predicate: filter_expr };
+        }
+        if !first_node.properties.is_empty() {
+            for (key, expr) in &first_node.properties {
+                let prop_eq = Expr::Compare(
+                    Box::new(Expr::Property(Box::new(Expr::Variable(first_var.clone())), key.clone())),
+                    CmpOp::Eq,
+                    Box::new(expr.clone()),
+                );
+                p = LogicalPlan::Filter { input: Box::new(p), predicate: prop_eq };
+            }
+        }
+        p
     } else {
         // New node: LabelScan, cross-product with current.
         let label = first_node.labels.first().cloned();
@@ -485,10 +928,21 @@ fn plan_pattern_onto(
         };
         new_node_vars.push(first_var.clone());
         var_kinds.insert(first_var.clone(), VarKind::Node);
-        match current {
+        let mut p = match current {
             LogicalPlan::SingleRow => scan,
             other => LogicalPlan::CrossProduct { left: Box::new(other), right: Box::new(scan) },
+        };
+        // If the node has multiple labels, add Filter for the extra ones.
+        if first_node.labels.len() > 1 {
+            for extra_label in &first_node.labels[1..] {
+                let filter_expr = Expr::HasLabel(
+                    Box::new(Expr::Variable(first_var.clone())),
+                    vec![extra_label.clone()],
+                );
+                p = LogicalPlan::Filter { predicate: filter_expr, input: Box::new(p) };
+            }
         }
+        p
     };
 
     // Track element vars for named-path assembly: alternating [node, rel, node, ...]
@@ -523,6 +977,15 @@ fn plan_pattern_onto(
                         ),
                     });
                 }
+                // Detect same relationship variable used twice in the same pattern.
+                if new_rel_vars.contains(rv) {
+                    return Err(PlanError {
+                        message: format!(
+                            "SyntaxError: RelationshipUniquenessViolation — \
+                             relationship variable '{rv}' appears more than once in the same pattern"
+                        ),
+                    });
+                }
                 Some(rv.clone())
             } else if is_named {
                 // Anonymous rel in a named path: generate internal name so it appears in row.
@@ -551,8 +1014,9 @@ fn plan_pattern_onto(
                 .unwrap_or_else(|| format!("_anon_n{}", i + 1));
 
             // Type-conflict check for dest node.
+            // Allow Scalar (could be a node from expression). Reject explicit Rel/Path/NotNode.
             if next_node.variable.is_some()
-                && matches!(var_kinds.get(&dst_var), Some(k) if *k != VarKind::Node)
+                && matches!(var_kinds.get(&dst_var), Some(VarKind::Rel | VarKind::Path | VarKind::NotNode))
             {
                 return Err(PlanError {
                     message: format!(
@@ -652,7 +1116,7 @@ fn expr_contains_aggregation(expr: &Expr) -> bool {
             ) || args.iter().any(expr_contains_aggregation)
         }
         Expr::Property(inner, _) | Expr::IsNull(inner) | Expr::IsNotNull(inner)
-        | Expr::Not(inner) | Expr::Neg(inner) => expr_contains_aggregation(inner),
+        | Expr::Not(inner) | Expr::Neg(inner) | Expr::HasLabel(inner, _) => expr_contains_aggregation(inner),
         Expr::And(l, r) | Expr::Or(l, r) | Expr::Xor(l, r)
         | Expr::Arith(l, _, r)
         | Expr::Compare(l, _, r) | Expr::InList(l, r) | Expr::Subscript(l, r)
@@ -675,15 +1139,202 @@ fn expr_contains_aggregation(expr: &Expr) -> bool {
     }
 }
 
+/// Substitute projection aliases in an expression. Used for WITH WHERE rewriting:
+/// when WHERE references a projection alias defined in the same WITH clause,
+/// replace the variable reference with the underlying expression so it can be
+/// evaluated in the pre-projection scope.
+fn substitute_aliases_in_expr(expr: &Expr, alias_map: &HashMap<String, Expr>) -> Expr {
+    use Expr::*;
+    match expr {
+        Variable(v) => {
+            if let Some(replacement) = alias_map.get(v) {
+                replacement.clone()
+            } else {
+                expr.clone()
+            }
+        }
+        Property(base, key) => Property(
+            Box::new(substitute_aliases_in_expr(base, alias_map)),
+            key.clone(),
+        ),
+        Compare(l, op, r) => Compare(
+            Box::new(substitute_aliases_in_expr(l, alias_map)),
+            *op,
+            Box::new(substitute_aliases_in_expr(r, alias_map)),
+        ),
+        And(l, r) => And(
+            Box::new(substitute_aliases_in_expr(l, alias_map)),
+            Box::new(substitute_aliases_in_expr(r, alias_map)),
+        ),
+        Or(l, r) => Or(
+            Box::new(substitute_aliases_in_expr(l, alias_map)),
+            Box::new(substitute_aliases_in_expr(r, alias_map)),
+        ),
+        Xor(l, r) => Xor(
+            Box::new(substitute_aliases_in_expr(l, alias_map)),
+            Box::new(substitute_aliases_in_expr(r, alias_map)),
+        ),
+        Not(e) => Not(Box::new(substitute_aliases_in_expr(e, alias_map))),
+        IsNull(e) => IsNull(Box::new(substitute_aliases_in_expr(e, alias_map))),
+        IsNotNull(e) => IsNotNull(Box::new(substitute_aliases_in_expr(e, alias_map))),
+        Arith(l, op, r) => Arith(
+            Box::new(substitute_aliases_in_expr(l, alias_map)),
+            *op,
+            Box::new(substitute_aliases_in_expr(r, alias_map)),
+        ),
+        Neg(e) => Neg(Box::new(substitute_aliases_in_expr(e, alias_map))),
+        FunctionCall(name, args) => FunctionCall(
+            name.clone(),
+            args.iter().map(|a| substitute_aliases_in_expr(a, alias_map)).collect(),
+        ),
+        InList(l, r) => InList(
+            Box::new(substitute_aliases_in_expr(l, alias_map)),
+            Box::new(substitute_aliases_in_expr(r, alias_map)),
+        ),
+        StartsWith(l, r) => StartsWith(
+            Box::new(substitute_aliases_in_expr(l, alias_map)),
+            Box::new(substitute_aliases_in_expr(r, alias_map)),
+        ),
+        EndsWith(l, r) => EndsWith(
+            Box::new(substitute_aliases_in_expr(l, alias_map)),
+            Box::new(substitute_aliases_in_expr(r, alias_map)),
+        ),
+        Contains(l, r) => Contains(
+            Box::new(substitute_aliases_in_expr(l, alias_map)),
+            Box::new(substitute_aliases_in_expr(r, alias_map)),
+        ),
+        Regex(l, r) => Regex(
+            Box::new(substitute_aliases_in_expr(l, alias_map)),
+            Box::new(substitute_aliases_in_expr(r, alias_map)),
+        ),
+        Subscript(l, r) => Subscript(
+            Box::new(substitute_aliases_in_expr(l, alias_map)),
+            Box::new(substitute_aliases_in_expr(r, alias_map)),
+        ),
+        HasLabel(e, labels) => HasLabel(
+            Box::new(substitute_aliases_in_expr(e, alias_map)),
+            labels.clone(),
+        ),
+        List(items) => List(
+            items.iter().map(|e| substitute_aliases_in_expr(e, alias_map)).collect(),
+        ),
+        MapLiteral(pairs) => MapLiteral(
+            pairs.iter().map(|(k, v)| (k.clone(), substitute_aliases_in_expr(v, alias_map))).collect(),
+        ),
+        ListSlice { list_expr, from, to } => ListSlice {
+            list_expr: Box::new(substitute_aliases_in_expr(list_expr, alias_map)),
+            from: from.as_ref().map(|e| Box::new(substitute_aliases_in_expr(e, alias_map))),
+            to: to.as_ref().map(|e| Box::new(substitute_aliases_in_expr(e, alias_map))),
+        },
+        CaseSearched { branches, else_ } => CaseSearched {
+            branches: branches.iter().map(|(cond, val)| (
+                substitute_aliases_in_expr(cond, alias_map),
+                substitute_aliases_in_expr(val, alias_map),
+            )).collect(),
+            else_: else_.as_ref().map(|e| Box::new(substitute_aliases_in_expr(e, alias_map))),
+        },
+        CaseSimple { test, branches, else_ } => CaseSimple {
+            test: Box::new(substitute_aliases_in_expr(test, alias_map)),
+            branches: branches.iter().map(|(cond, val)| (
+                substitute_aliases_in_expr(cond, alias_map),
+                substitute_aliases_in_expr(val, alias_map),
+            )).collect(),
+            else_: else_.as_ref().map(|e| Box::new(substitute_aliases_in_expr(e, alias_map))),
+        },
+        ListComprehension { variable, list_expr, predicate, projection } => ListComprehension {
+            variable: variable.clone(),
+            list_expr: Box::new(substitute_aliases_in_expr(list_expr, alias_map)),
+            predicate: predicate.as_ref().map(|e| Box::new(substitute_aliases_in_expr(e, alias_map))),
+            projection: projection.as_ref().map(|e| Box::new(substitute_aliases_in_expr(e, alias_map))),
+        },
+        ListPredicate { kind, variable, list_expr, predicate } => ListPredicate {
+            kind: *kind,
+            variable: variable.clone(),
+            list_expr: Box::new(substitute_aliases_in_expr(list_expr, alias_map)),
+            predicate: Box::new(substitute_aliases_in_expr(predicate, alias_map)),
+        },
+        // Leaf nodes and complex subqueries: return as-is
+        IntLit(_) | FloatLit(_) | StringLit(_) | BoolLit(_) | NullLit | Star | Parameter(_) => expr.clone(),
+        ShortestPath { .. } | PatternComprehension { .. } | Exists { .. } => expr.clone(),
+    }
+}
+
 /// Infer the VarKind of an expression for use after WITH re-scoping.
 /// Only Variable passthrough preserves kind; everything else is Scalar.
 fn expr_var_kind(expr: &Expr, kinds: &HashMap<String, VarKind>) -> VarKind {
     match expr {
         Expr::Variable(v) => kinds.get(v).cloned().unwrap_or(VarKind::Scalar),
+        _ if expr_is_definitely_not_node(expr, kinds) => VarKind::NotNode,
         _ => VarKind::Scalar,
     }
 }
 
+/// Returns true if the expression is guaranteed to never produce a graph node.
+/// This is used for compile-time VariableTypeConflict detection.
+fn expr_is_definitely_not_node(expr: &Expr, kinds: &HashMap<String, VarKind>) -> bool {
+    match expr {
+        // Literal types that are never nodes (NullLit is excluded: null is valid as a node-var result from OPTIONAL MATCH)
+        Expr::IntLit(_) | Expr::FloatLit(_) | Expr::StringLit(_) | Expr::BoolLit(_) => true,
+        // Collections — never nodes
+        Expr::List(_) | Expr::MapLiteral(_) => true,
+        // Boolean expressions — always bool, never node
+        Expr::And(_, _) | Expr::Or(_, _) | Expr::Not(_) | Expr::Xor(_, _) => true,
+        Expr::Compare(_, _, _) | Expr::IsNull(_) | Expr::IsNotNull(_) | Expr::HasLabel(_, _) => true,
+        Expr::InList(_, _) | Expr::StartsWith(_, _) | Expr::EndsWith(_, _)
+            | Expr::Contains(_, _) | Expr::Regex(_, _) => true,
+        // Arithmetic — always numeric
+        Expr::Arith(_, _, _) | Expr::Neg(_) => true,
+        // Variables: check their kind
+        Expr::Variable(v) => matches!(kinds.get(v), Some(VarKind::NotNode | VarKind::Rel | VarKind::Path)),
+        // Everything else (function calls, CASE, property access, coalesce, etc.) might be a node
+        _ => false,
+    }
+}
+
+/// Build a relationship isomorphism filter: for N relationship variables,
+/// emit id(r1) != id(r2) for every pair (i, j) with i < j.
+/// Null-safe: `r1 IS NULL OR r2 IS NULL OR id(r1) != id(r2)`.
+/// This enforces openCypher relationship uniqueness within a MATCH clause.
+fn build_rel_isomorphism_filter(rel_vars: &[String]) -> Option<Expr> {
+    if rel_vars.len() < 2 {
+        return None;
+    }
+
+    let mut pairs: Vec<Expr> = Vec::new();
+    for i in 0..rel_vars.len() {
+        for j in (i + 1)..rel_vars.len() {
+            let left = Expr::FunctionCall(
+                "id".into(),
+                vec![Expr::Variable(rel_vars[i].clone())],
+            );
+            let right = Expr::FunctionCall(
+                "id".into(),
+                vec![Expr::Variable(rel_vars[j].clone())],
+            );
+            let neq = Expr::Compare(Box::new(left), CmpOp::Neq, Box::new(right));
+            // Null-safe for OPTIONAL MATCH.
+            let null_safe = Expr::Or(
+                Box::new(Expr::IsNull(Box::new(Expr::Variable(rel_vars[i].clone())))),
+                Box::new(Expr::Or(
+                    Box::new(Expr::IsNull(Box::new(Expr::Variable(rel_vars[j].clone())))),
+                    Box::new(neq),
+                )),
+            );
+            pairs.push(null_safe);
+        }
+    }
+
+    let mut result = pairs.remove(0);
+    for p in pairs {
+        result = Expr::And(Box::new(result), Box::new(p));
+    }
+    Some(result)
+}
+
+/// Build an isomorphism filter for node variables.
+/// NOTE: openCypher enforces only relationship isomorphism, not node isomorphism.
+/// This function is retained for potential future use but is no longer called.
+#[allow(dead_code)]
 fn build_isomorphism_filter(node_vars: &[String]) -> Option<Expr> {
     if node_vars.len() < 2 {
         return None;
@@ -805,6 +1456,11 @@ pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
             let o = explain(outer, indent + 1);
             let i = explain(inner, indent + 1);
             format!("{prefix}Apply\n{o}\n{i}")
+        }
+        LogicalPlan::LeftJoin { outer, inner, null_vars } => {
+            let o = explain(outer, indent + 1);
+            let i = explain(inner, indent + 1);
+            format!("{prefix}LeftJoin(null_vars=[{}])\n{o}\n{i}", null_vars.join(", "))
         }
         LogicalPlan::Empty => format!("{prefix}Empty"),
         LogicalPlan::CreatePattern { input, .. } => {

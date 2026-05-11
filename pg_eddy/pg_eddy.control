@@ -1,6 +1,6 @@
 # pg_eddy extension control file
 comment     = 'High-performance native LPG store for PostgreSQL 18'
-default_version = '0.8.0'
+default_version = '@CARGO_VERSION@'
 module_pathname = '$libdir/pg_eddy'
 relocatable = false
 trusted     = false

@@ -323,10 +323,17 @@ sub run_scenario {
                 my $json_obj = cypher_map_to_json($v);
                 push @kv, qq("$k": $json_obj);
             } elsif ($v =~ /^\[/) {
-                # List literal — pass as-is (already JSON-compatible for simple cases)
-                push @kv, qq("$k": $v);
+                # List literal — convert Cypher single-quoted strings to JSON double-quoted
+                my $json_list = cypher_list_to_json($v);
+                push @kv, qq("$k": $json_list);
             } else {
-                (my $vs = $v) =~ s/"/\\"/g;
+                # Strip surrounding single quotes if present (Cypher string literal convention)
+                (my $vs = $v) =~ s/^'(.*)'$/$1/s;
+                # Escape backslashes and double quotes for JSON embedding
+                $vs =~ s/\\/\\\\/g;
+                $vs =~ s/"/\\"/g;
+                # Escape single quotes for SQL string embedding
+                $vs =~ s/'/''/g;
                 push @kv, qq("$k": "$vs");
             }
         }
@@ -441,8 +448,16 @@ sub compare_results {
 
 sub match_row {
     my ($exp_cells, $actual, $hdrs) = @_;
+    # Build a case-insensitive, space-normalized lookup of actual keys.
+    my %norm_actual;
+    for my $k (keys %$actual) {
+        (my $nk = lc($k)) =~ s/\s+//g;
+        $norm_actual{$nk} = $actual->{$k};
+    }
     for my $i (0..$#$hdrs) {
-        my $err = cell_match($exp_cells->[$i] // '', $actual->{$hdrs->[$i]});
+        (my $norm_hdr = lc($hdrs->[$i])) =~ s/\s+//g;
+        my $act_val = exists $actual->{$hdrs->[$i]} ? $actual->{$hdrs->[$i]} : $norm_actual{$norm_hdr};
+        my $err = cell_match($exp_cells->[$i] // '', $act_val);
         return "col '$hdrs->[$i]': $err" if $err;
     }
     return undef;
@@ -461,9 +476,23 @@ sub cell_match {
 
     if ($exp =~ /^-?\d+$/)        { return undef if $act == $exp;                 return "expected int $exp, got $act"; }
     if ($exp =~ /^-?\d+\.\d+$/)   { return undef if abs($act - $exp) < 1e-9;     return "expected float $exp, got $act"; }
+    # Scientific notation: e.g. 1.2635418652381264e305
+    if ($exp =~ /^-?[\d.]+[eE][+-]?\d+$/) {
+        return undef if $act eq $exp;
+        # Also try numeric comparison with relative tolerance
+        return undef if $act != 0 && abs(($act - $exp) / $exp) < 1e-9;
+        return "expected float $exp, got $act";
+    }
+    if ($exp eq 'NaN') { return undef if defined $act && $act eq 'NaN'; return "expected NaN, got " . _repr($act); }
 
     if ($exp =~ /^'(.*)'$/) {
-        my $s = $1; $s =~ s/\\'/'/g;
+        my $s = $1;
+        $s =~ s/\\'/'/g;
+        # Interpret common escape sequences
+        $s =~ s/\\n/\n/g;
+        $s =~ s/\\t/\t/g;
+        $s =~ s/\\r/\r/g;
+        $s =~ s/\\\\/\\/g;
         return undef if $act eq $s;
         return "expected '$s', got '$act'";
     }
@@ -670,6 +699,15 @@ sub parse_map_display {
 }
 
 sub _repr { defined $_[0] ? (ref($_[0]) ? encode_json($_[0]) : $_[0]) : 'undef' }
+
+# Convert a Cypher list literal like ['Apa', 123] to a JSON array string ["Apa", 123].
+sub cypher_list_to_json {
+    my ($str) = @_;
+    $str =~ s/^\s+|\s+$//g;
+    # Replace Cypher single-quoted strings with JSON double-quoted strings
+    $str =~ s/'([^']*)'/'"' . $1 . '"'/ge;
+    return $str;
+}
 
 # Convert a Cypher map display string like {name: 'Apa', age: 38} to a JSON object string.
 sub cypher_map_to_json {

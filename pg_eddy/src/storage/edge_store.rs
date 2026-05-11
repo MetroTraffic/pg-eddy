@@ -376,6 +376,92 @@ pub unsafe fn delete_edge(
 // Find edge by id
 // ---------------------------------------------------------------------------
 
+/// Update the properties of an existing edge in-place.
+///
+/// The new prop_bytes must fit within `PROP_INLINE_MAX`. The slot is padded
+/// to the original item size with zero bytes if the new props are smaller.
+///
+/// Returns true if updated, false if edge not found.
+pub unsafe fn update_edge_props(
+    edge_rel: pg_sys::Relation,
+    edge_id: i64,
+    new_prop_bytes: &[u8],
+) -> bool {
+    use std::mem::size_of;
+    let hdr_size = size_of::<pg_sys::HeapTupleHeaderData>();
+    if new_prop_bytes.len() > PROP_INLINE_MAX {
+        pgrx::error!(
+            "pg_eddy PE200: edge property data ({} B) exceeds inline limit ({} B)",
+            new_prop_bytes.len(), PROP_INLINE_MAX,
+        );
+    }
+
+    let snapshot = pg_sys::GetActiveSnapshot();
+    let nblocks = pg_sys::RelationGetNumberOfBlocksInFork(
+        edge_rel,
+        pg_sys::ForkNumber::MAIN_FORKNUM,
+    );
+
+    for blkno in 0..nblocks {
+        let buf = pg_sys::ReadBufferExtended(
+            edge_rel,
+            pg_sys::ForkNumber::MAIN_FORKNUM,
+            blkno,
+            pg_sys::ReadBufferMode::RBM_NORMAL,
+            std::ptr::null_mut(),
+        );
+        pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
+        let page = pg_sys::BufferGetPage(buf);
+        let max_off = pg_sys::PageGetMaxOffsetNumber(page as *const _);
+
+        let mut found = false;
+        for off in pg_sys::FirstOffsetNumber..=max_off {
+            if let Some(rec) = read_edge_at_offset(page, blkno, off)
+                && rec.edge_id == edge_id
+            {
+                // Found the edge. Update prop bytes in-place.
+                let iid = pg_sys::PageGetItemId(page, off);
+                let item_len = (*iid).lp_len() as usize;
+                let item = pg_sys::PageGetItem(page as *const _, iid) as *mut u8;
+                let data = std::slice::from_raw_parts_mut(item.add(hdr_size), item_len - hdr_size);
+
+                // Ensure new prop bytes fit in the reserved space.
+                let available_prop_space = item_len - hdr_size - EDGE_FIXED_DATA_SIZE;
+                if new_prop_bytes.len() > available_prop_space {
+                    pg_sys::UnlockReleaseBuffer(buf);
+                    pgrx::error!(
+                        "pg_eddy PE200: edge property update ({} B) exceeds reserved space ({} B)",
+                        new_prop_bytes.len(), available_prop_space,
+                    );
+                }
+
+                // Update prop length field.
+                let plen = new_prop_bytes.len() as u16;
+                data[OFF_EDGE_PROP_INLINE_LEN..OFF_EDGE_PROP_INLINE_LEN + 2]
+                    .copy_from_slice(&plen.to_le_bytes());
+
+                // Zero out reserved prop area, then write new props.
+                let prop_area_len = available_prop_space;
+                for b in &mut data[OFF_EDGE_PROP_DATA..OFF_EDGE_PROP_DATA + prop_area_len] {
+                    *b = 0;
+                }
+                if !new_prop_bytes.is_empty() {
+                    data[OFF_EDGE_PROP_DATA..OFF_EDGE_PROP_DATA + new_prop_bytes.len()]
+                        .copy_from_slice(new_prop_bytes);
+                }
+
+                pg_sys::MarkBufferDirty(buf);
+                found = true;
+                break;
+            }
+            let _ = snapshot;
+        }
+        pg_sys::UnlockReleaseBuffer(buf);
+        if found { return true; }
+    }
+    false
+}
+
 /// Scan the edge relation for an edge with `edge_id` and return it.
 ///
 /// Phase 2: simplified visibility — returns LP_NORMAL, non-deleted edges.
@@ -507,6 +593,13 @@ pub unsafe fn adjacency_follow(
             rel_type_filter,
             &mut results,
         );
+    }
+
+    // For undirected (Both) traversal, self-loop edges appear in both out- and
+    // in-chains of the same node and would be returned twice. Deduplicate by edge_id.
+    if matches!(direction, Direction::Both) {
+        let mut seen = std::collections::HashSet::new();
+        results.retain(|e| seen.insert(e.edge_id));
     }
 
     results
@@ -646,7 +739,10 @@ unsafe fn build_edge_item_bytes(
     prop_bytes: &[u8],
 ) -> Vec<u8> {
     let hdr_size = size_of::<pg_sys::HeapTupleHeaderData>();
-    let total = hdr_size + EDGE_FIXED_DATA_SIZE + prop_bytes.len();
+    // Always reserve PROP_INLINE_MAX bytes for properties so in-place updates don't exceed
+    // the item's original size. This wastes a bit of space but keeps update logic simple.
+    let prop_reserved = PROP_INLINE_MAX.max(prop_bytes.len());
+    let total = hdr_size + EDGE_FIXED_DATA_SIZE + prop_reserved;
     let mut buf = vec![0u8; total];
 
     // Fill HeapTupleHeaderData.

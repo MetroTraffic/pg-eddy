@@ -55,7 +55,7 @@ pub const PD_NODE_SPECIAL_SIZE: usize = MAX_NODE_SLOTS_PER_PAGE * ADJ_HEADER_BYT
 
 /// Maximum bytes of property data stored inline inside the node record.
 /// Properties exceeding this limit spill to overflow pages (Phase 1: error).
-pub const PROP_INLINE_MAX: usize = 48;
+pub const PROP_INLINE_MAX: usize = 512;
 
 /// Maximum label IDs per node.
 pub const MAX_LABELS_PER_NODE: usize = 32;

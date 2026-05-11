@@ -324,12 +324,21 @@ fn parse_localtime_str(s: &str) -> Option<NaiveTime> {
         // only strip if it's a timezone offset like -05:00, not part of time
         if pos >= 3 { &s[..pos] } else { s }
     } else { s };
-    // Try with fractional seconds
+    // Extended formats (with colons): HH:MM:SS.f, HH:MM:SS, HH:MM
     if let Ok(t) = NaiveTime::parse_from_str(s, "%H:%M:%S%.f") { return Some(t); }
     if let Ok(t) = NaiveTime::parse_from_str(s, "%H:%M:%S") { return Some(t); }
     if let Ok(t) = NaiveTime::parse_from_str(s, "%H:%M") { return Some(t); }
-    // Basic format HHMMSS
+    // Basic (compact) formats: HHMMSS.f, HHMMSS, HHMM, HH
+    if let Ok(t) = NaiveTime::parse_from_str(s, "%H%M%S%.f") { return Some(t); }
     if let Ok(t) = NaiveTime::parse_from_str(s, "%H%M%S") { return Some(t); }
+    if let Ok(t) = NaiveTime::parse_from_str(s, "%H%M") { return Some(t); }
+    // Hour-only: "21" → 21:00:00
+    if s.len() == 2 && s.chars().all(|c| c.is_ascii_digit())
+        && let Ok(h) = s.parse::<u32>()
+        && h < 24
+    {
+        return NaiveTime::from_hms_opt(h, 0, 0);
+    }
     None
 }
 
@@ -687,7 +696,11 @@ fn duration_in_seconds(lhs: &TemporalValue, rhs: &TemporalValue) -> CypherDurati
 
 fn format_localtime(t: &NaiveTime) -> String {
     let ns = t.nanosecond();
-    if ns == 0 {
+    let sec = t.second();
+    if ns == 0 && sec == 0 {
+        // Truncated form: HH:MM (omit zero seconds)
+        t.format("%H:%M").to_string()
+    } else if ns == 0 {
         t.format("%H:%M:%S").to_string()
     } else {
         // trim trailing zeros
@@ -760,6 +773,44 @@ fn extract_time_tz(s: &str) -> (&str, Option<i32>, Option<String>) {
         }
     }
     (s, None, None)
+}
+
+/// Try to parse an ISO-formatted temporal string (date, localtime, time, localdatetime, datetime).
+/// Returns None if the string doesn't look like any known temporal format.
+fn try_parse_temporal_str(s: &str) -> Option<TemporalValue> {
+    let s = s.trim();
+    // Try date: YYYY-MM-DD
+    if s.len() == 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-'
+        && let Some(d) = parse_date_str(s)
+    {
+        return Some(TemporalValue { kind: TemporalKind::Date, iso: s.to_string(), date: Some(d), time: None, offset_secs: None, tz_name: None });
+    }
+    // Try localdatetime: contains 'T' but no timezone offset
+    if let Some(t_pos) = s.find('T') {
+        let date_part = &s[..t_pos];
+        let time_part = &s[t_pos+1..];
+        if let (Some(d), Some(t)) = (parse_date_str(date_part), parse_localtime_str(time_part)) {
+            let iso = s.to_string();
+            let has_tz = time_part.contains('+') || time_part.contains('Z')
+                || (time_part.len() > 6 && time_part[time_part.len()-6..].contains('-'));
+            if !has_tz {
+                return Some(TemporalValue { kind: TemporalKind::LocalDateTime, iso, date: Some(d), time: Some(t), offset_secs: None, tz_name: None });
+            }
+            // Datetime with offset
+            let (time_str, off, tz) = extract_time_tz(time_part);
+            if let Some(t2) = parse_localtime_str(time_str) {
+                return Some(TemporalValue { kind: TemporalKind::DateTime, iso: s.to_string(), date: Some(d), time: Some(t2), offset_secs: off, tz_name: tz });
+            }
+        }
+    }
+    // Try localtime: HH:MM[:SS[.f]]
+    if s.len() >= 4 && s.len() <= 20 && !s.contains('T') && !s.contains('-')
+        && let Some(t) = parse_localtime_str(s)
+    {
+        let iso = format_localtime(&t);
+        return Some(TemporalValue { kind: TemporalKind::LocalTime, iso, date: None, time: Some(t), offset_secs: None, tz_name: None });
+    }
+    None
 }
 
 /// Get a named property from a TemporalValue.
@@ -875,9 +926,15 @@ impl Value {
                 serde_json::Value::Object(m)
             }
             Value::Int(v) => (*v).into(),
-            Value::Float(v) => serde_json::Number::from_f64(*v)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null),
+            Value::Float(v) => {
+                if v.is_nan() {
+                    serde_json::Value::String("NaN".into())
+                } else {
+                    serde_json::Number::from_f64(*v)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null)
+                }
+            }
             Value::Str(s) => s.clone().into(),
             Value::Bool(b) => (*b).into(),
             Value::Null => serde_json::Value::Null,
@@ -1090,6 +1147,9 @@ pub fn execute(
             }
             Ok(left_rows)
         }
+        LogicalPlan::LeftJoin { outer, inner, null_vars } => {
+            exec_left_join(outer, inner, null_vars, params)
+        }
     }
 }
 
@@ -1272,9 +1332,10 @@ fn exec_expand(
             continue;
         }
 
-        let src_node_id = src_val.node_id().ok_or_else(|| ExecError {
-            message: format!("{src_var} is not a node"),
-        })?;
+        let src_node_id = match src_val.node_id() {
+            Some(id) => id,
+            None => continue, // non-node value: skip this row (0 matches, like null)
+        };
 
         // Follow adjacency chains.
         let edges = unsafe {
@@ -1516,6 +1577,35 @@ fn build_path_from_elem_vars(elem_vars: &[String], row: &Row) -> Value {
 }
 
 /// Build a Value::Path from lists of node IDs and edge IDs (for var-length named paths).
+/// Build a list of relationship values from edge IDs (for var-length rel variables).
+fn build_rel_list_from_ids(edge_ids: &[i64]) -> Value {
+    use crate::catalog::labels::{prop_key_name, rel_type_name};
+    use crate::storage::{edge_store, prop_store};
+    let mut rels: Vec<serde_json::Value> = Vec::new();
+    for &eid in edge_ids {
+        let edge_val = unsafe {
+            let edge_rel = crate::open_edges_relation();
+            let snapshot = pgrx::pg_sys::GetActiveSnapshot();
+            let r = edge_store::find_edge_by_id(edge_rel, eid, snapshot);
+            pgrx::pg_sys::table_close(edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+            r
+        };
+        if let Some(er) = edge_val {
+            let edge_props = prop_store::decode(&er.prop_bytes, prop_key_name);
+            let edge_type = rel_type_name(er.rel_type_id);
+            let ev = Value::Edge {
+                edge_id: eid,
+                rel_type: edge_type,
+                source: er.source_node_id,
+                target: er.target_node_id,
+                properties: edge_props,
+            };
+            rels.push(ev.to_json());
+        }
+    }
+    Value::Json(serde_json::Value::Array(rels))
+}
+
 fn build_path_from_ids(
     node_ids: &[i64],
     edge_ids: &[i64],
@@ -1667,7 +1757,7 @@ fn exec_var_length_expand(
         // filter BFS results to only paths ending at that node.
         let expected_dst_id: Option<i64> = {
             let bound_dst = input_row.get(dst_var)
-                .map(|v| v.clone())
+                .cloned()
                 .or_else(|| params.get(dst_var).map(json_to_value));
             if let Some(Value::Node { node_id, .. }) = bound_dst { Some(node_id) } else { None }
         };
@@ -1733,7 +1823,7 @@ fn exec_var_length_expand(
                                 row.entry(src_var.to_string()).or_insert_with(|| src_val.clone());
                                 row.insert(dst_var.to_string(), dst_val);
                                 if let Some(rv) = rel_var {
-                                    row.insert(rv.to_string(), Value::Null);
+                                    row.insert(rv.to_string(), build_rel_list_from_ids(&entry.path_edge_ids));
                                 }
                                 if let Some(pcv) = path_carry_var {
                                     let path_val = build_path_from_ids(
@@ -1752,7 +1842,7 @@ fn exec_var_length_expand(
                             row.entry(src_var.to_string()).or_insert_with(|| src_val.clone());
                             row.insert(dst_var.to_string(), dst_val);
                             if let Some(rv) = rel_var {
-                                row.insert(rv.to_string(), Value::Null);
+                                row.insert(rv.to_string(), build_rel_list_from_ids(&entry.path_edge_ids));
                             }
                             // Build and store the full path if path_carry_var is set.
                             if let Some(pcv) = path_carry_var {
@@ -1943,11 +2033,18 @@ fn exec_project(
     for row in rows {
         let mut out_row = Row::new();
         for (idx, item) in items.iter().enumerate() {
-            let val = eval_expr(&item.expr, &row, params)?;
-            let key = item.alias.clone().unwrap_or_else(|| {
-                expr_default_name(&item.expr, idx)
-            });
-            out_row.insert(key, val);
+            if matches!(item.expr, Expr::Star) {
+                // RETURN * — expand all bound variables from the row.
+                for (k, v) in &row {
+                    out_row.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            } else {
+                let val = eval_expr(&item.expr, &row, params)?;
+                let key = item.alias.clone().unwrap_or_else(|| {
+                    expr_default_name(&item.expr, idx)
+                });
+                out_row.insert(key, val);
+            }
         }
         projected.push((out_row, row));
     }
@@ -1995,7 +2092,7 @@ fn exec_project(
 
     // SKIP
     if let Some(skip_expr) = skip {
-        let n = eval_const_usize(skip_expr, params);
+        let n = eval_const_usize(skip_expr, params)?;
         if n >= projected.len() {
             projected.clear();
         } else {
@@ -2005,7 +2102,7 @@ fn exec_project(
 
     // LIMIT
     if let Some(limit_expr) = limit {
-        let n = eval_const_usize(limit_expr, params);
+        let n = eval_const_usize(limit_expr, params)?;
         projected.truncate(n);
     }
 
@@ -2077,9 +2174,9 @@ fn exec_project_aggregate(
     let has_key = items.iter().any(|i| !expr_has_aggregate(&i.expr));
 
     // Groups: ordered by first seen fingerprint.
-    // Each entry: (fingerprint, key_row, group_rows)
+    // Each entry: (fingerprint, key_row, group_rows, first_input_row)
     let mut group_order: Vec<String> = Vec::new();
-    let mut groups: std::collections::HashMap<String, (Row, Vec<Row>)> =
+    let mut groups: std::collections::HashMap<String, (Row, Vec<Row>, Row)> =
         std::collections::HashMap::new();
 
     for row in &rows {
@@ -2099,7 +2196,7 @@ fn exec_project_aggregate(
         let fp = key_parts.join("\x00");
         if !groups.contains_key(&fp) {
             group_order.push(fp.clone());
-            groups.insert(fp.clone(), (key_row, Vec::new()));
+            groups.insert(fp.clone(), (key_row, Vec::new(), row.clone()));
         }
         groups.get_mut(&fp).unwrap().1.push(row.clone());
     }
@@ -2108,12 +2205,12 @@ fn exec_project_aggregate(
     // produce one empty group so COUNT returns 0.
     if groups.is_empty() && !has_key {
         group_order.push(String::new());
-        groups.insert(String::new(), (Row::new(), Vec::new()));
+        groups.insert(String::new(), (Row::new(), Vec::new(), Row::new()));
     }
 
     let mut projected: Vec<(Row, Row)> = Vec::new();
     for fp in &group_order {
-        let (key_row, group_rows) = groups.get(fp).unwrap();
+        let (key_row, group_rows, first_row) = groups.get(fp).unwrap();
         let mut out_row = Row::new();
         for (idx, item) in items.iter().enumerate() {
             let val = eval_with_agg(&item.expr, group_rows, key_row, params)?;
@@ -2121,7 +2218,10 @@ fn exec_project_aggregate(
                 .unwrap_or_else(|| expr_default_name(&item.expr, idx));
             out_row.insert(col, val);
         }
-        projected.push((out_row, key_row.clone()));
+        // Merge key_row and first_row into the "input" row for ORDER BY fallback.
+        let mut in_row = first_row.clone();
+        for (k, v) in key_row { in_row.entry(k.clone()).or_insert_with(|| v.clone()); }
+        projected.push((out_row, in_row));
     }
 
     // ORDER BY
@@ -2165,13 +2265,13 @@ fn exec_project_aggregate(
 
     // SKIP
     if let Some(skip_expr) = skip {
-        let n = eval_const_usize(skip_expr, params);
+        let n = eval_const_usize(skip_expr, params)?;
         if n >= projected.len() { projected.clear(); } else { projected.drain(0..n); }
     }
 
     // LIMIT
     if let Some(limit_expr) = limit {
-        projected.truncate(eval_const_usize(limit_expr, params));
+        projected.truncate(eval_const_usize(limit_expr, params)?);
     }
 
     Ok(projected.into_iter().map(|(out_row, _)| out_row).collect())
@@ -2190,7 +2290,7 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
             expr_has_aggregate(l) || expr_has_aggregate(r)
         }
         Expr::Not(e) | Expr::Neg(e) | Expr::IsNull(e) | Expr::IsNotNull(e)
-        | Expr::Property(e, _) => expr_has_aggregate(e),
+        | Expr::Property(e, _) | Expr::HasLabel(e, _) => expr_has_aggregate(e),
         Expr::Subscript(l, r) => expr_has_aggregate(l) || expr_has_aggregate(r),
         Expr::ListSlice { list_expr, from, to, .. } => {
             expr_has_aggregate(list_expr)
@@ -2633,7 +2733,8 @@ fn collect_free_var_refs(expr: &Expr, acc: &mut Vec<Expr>) {
             collect_free_var_refs(l, acc);
             collect_free_var_refs(r, acc);
         }
-        Expr::Not(e) | Expr::Neg(e) | Expr::IsNull(e) | Expr::IsNotNull(e) => {
+        Expr::Not(e) | Expr::Neg(e) | Expr::IsNull(e) | Expr::IsNotNull(e)
+        | Expr::HasLabel(e, _) => {
             collect_free_var_refs(e, acc);
         }
         Expr::Subscript(l, r) => { collect_free_var_refs(l, acc); collect_free_var_refs(r, acc); }
@@ -2687,6 +2788,20 @@ pub fn eval_expr(
                 Value::Node { .. } | Value::Edge { .. } | Value::Null
                 | Value::Temporal(_) | Value::Duration(_)
                 | Value::Json(serde_json::Value::Object(_)) => Ok(base.get_property(key)),
+                // Strings that look like temporal ISO values (stored as strings in props):
+                // try to parse as a temporal and access the component.
+                Value::Str(s) => {
+                    if let Some(tv) = try_parse_temporal_str(s) {
+                        Ok(temporal_get_property(&tv, key))
+                    } else {
+                        Err(ExecError {
+                            message: format!(
+                                "TypeError: {} has no property `{}`",
+                                value_type_name(&base), key
+                            ),
+                        })
+                    }
+                }
                 _ => Err(ExecError {
                     message: format!(
                         "TypeError: {} has no property `{}`",
@@ -2718,44 +2833,29 @@ pub fn eval_expr(
         }
         Expr::And(left, right) => {
             // openCypher 3-valued logic with strict boolean type checking.
+            // Both operands must be boolean-compatible (bool or null).
+            // We evaluate BOTH sides to ensure type errors are always reported.
             let l = eval_expr(left, row, params)?;
-            match require_bool(&l)? {
-                Some(false) => Ok(Value::Bool(false)),
-                Some(true) => {
-                    let r = eval_expr(right, row, params)?;
-                    match require_bool(&r)? {
-                        Some(b) => Ok(Value::Bool(b)),
-                        None => Ok(Value::Null),
-                    }
-                }
-                None => {
-                    let r = eval_expr(right, row, params)?;
-                    match require_bool(&r)? {
-                        Some(false) => Ok(Value::Bool(false)),
-                        _ => Ok(Value::Null),
-                    }
-                }
+            let r = eval_expr(right, row, params)?;
+            let lb = require_bool(&l)?;
+            let rb = require_bool(&r)?;
+            match (lb, rb) {
+                (Some(false), _) | (_, Some(false)) => Ok(Value::Bool(false)),
+                (Some(true), Some(true)) => Ok(Value::Bool(true)),
+                _ => Ok(Value::Null),
             }
         }
         Expr::Or(left, right) => {
             // openCypher 3-valued logic with strict boolean type checking.
+            // Both operands must be boolean-compatible (bool or null).
             let l = eval_expr(left, row, params)?;
-            match require_bool(&l)? {
-                Some(true) => Ok(Value::Bool(true)),
-                Some(false) => {
-                    let r = eval_expr(right, row, params)?;
-                    match require_bool(&r)? {
-                        Some(b) => Ok(Value::Bool(b)),
-                        None => Ok(Value::Null),
-                    }
-                }
-                None => {
-                    let r = eval_expr(right, row, params)?;
-                    match require_bool(&r)? {
-                        Some(true) => Ok(Value::Bool(true)),
-                        _ => Ok(Value::Null),
-                    }
-                }
+            let r = eval_expr(right, row, params)?;
+            let lb = require_bool(&l)?;
+            let rb = require_bool(&r)?;
+            match (lb, rb) {
+                (Some(true), _) | (_, Some(true)) => Ok(Value::Bool(true)),
+                (Some(false), Some(false)) => Ok(Value::Bool(false)),
+                _ => Ok(Value::Null),
             }
         }
         Expr::Not(inner) => {
@@ -2772,6 +2872,21 @@ pub fn eval_expr(
         Expr::IsNotNull(inner) => {
             let v = eval_expr(inner, row, params)?;
             Ok(Value::Bool(!matches!(v, Value::Null)))
+        }
+        Expr::HasLabel(inner, labels) => {
+            let v = eval_expr(inner, row, params)?;
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Node { labels: node_labels, .. } => {
+                    let has_all = labels.iter().all(|l| node_labels.iter().any(|nl| nl == l));
+                    Ok(Value::Bool(has_all))
+                }
+                Value::Edge { rel_type, .. } => {
+                    let has_all = labels.iter().all(|l| l == &rel_type);
+                    Ok(Value::Bool(has_all))
+                }
+                _ => Ok(Value::Bool(false)),
+            }
         }
         Expr::Arith(left, op, right) => {
             let l = eval_expr(left, row, params)?;
@@ -2806,9 +2921,6 @@ pub fn eval_expr(
         }
         Expr::InList(left, right_list) => {
             let val = eval_expr(left, row, params)?;
-            if matches!(val, Value::Null) {
-                return Ok(Value::Null);
-            }
             let list = eval_expr(right_list, row, params)?;
             let arr = match &list {
                 Value::Json(serde_json::Value::Array(a)) => a.clone(),
@@ -2819,6 +2931,10 @@ pub fn eval_expr(
                               IN operator requires a list on the right-hand side".into(),
                 }),
             };
+            // null IN [] => false; null IN [non-empty] => null
+            if matches!(val, Value::Null) {
+                return Ok(if arr.is_empty() { Value::Bool(false) } else { Value::Null });
+            }
             let mut has_null = false;
             for item in &arr {
                 let item_val = json_to_value(item);
@@ -2939,18 +3055,20 @@ pub fn eval_expr(
                 _ => return Ok(Value::Bool(false)),
             };
             let mut true_count = 0usize;
-            let mut has_null = false;
+            let mut null_count = 0usize;
             for item in &arr {
                 let mut inner_row = row.clone();
                 inner_row.insert(variable.clone(), json_to_value(item));
                 let pv = eval_expr(predicate, &inner_row, params)?;
                 match truthy3(&pv) {
                     Some(true) => true_count += 1,
-                    None => has_null = true,
+                    None => null_count += 1,
                     Some(false) => {}
                 }
             }
             let total = arr.len();
+            let false_count = total - true_count - null_count;
+            let has_null = null_count > 0;
             match kind {
                 ListPredicateKind::Any => {
                     if true_count > 0 { Ok(Value::Bool(true)) }
@@ -2958,18 +3076,19 @@ pub fn eval_expr(
                     else { Ok(Value::Bool(false)) }
                 }
                 ListPredicateKind::All => {
-                    if true_count == total { Ok(Value::Bool(true)) }
-                    else if has_null && true_count + 1 == total { Ok(Value::Null) }
-                    else { Ok(Value::Bool(false)) }
+                    if false_count > 0 { Ok(Value::Bool(false)) }
+                    else if has_null { Ok(Value::Null) }
+                    else { Ok(Value::Bool(true)) }
                 }
                 ListPredicateKind::None_ => {
-                    if true_count == 0 && !has_null { Ok(Value::Bool(true)) }
-                    else if true_count > 0 { Ok(Value::Bool(false)) }
-                    else { Ok(Value::Null) }
+                    if true_count > 0 { Ok(Value::Bool(false)) }
+                    else if has_null { Ok(Value::Null) }
+                    else { Ok(Value::Bool(true)) }
                 }
                 ListPredicateKind::Single => {
-                    if true_count == 1 && !has_null { Ok(Value::Bool(true)) }
-                    else if true_count > 1 || (true_count == 0 && !has_null) { Ok(Value::Bool(false)) }
+                    if true_count > 1 { Ok(Value::Bool(false)) }
+                    else if true_count == 1 && !has_null { Ok(Value::Bool(true)) }
+                    else if true_count == 0 && !has_null { Ok(Value::Bool(false)) }
                     else { Ok(Value::Null) }
                 }
             }
@@ -2995,12 +3114,31 @@ pub fn eval_expr(
                     }),
                 };
             }
+            // Dynamic property access on nodes/edges: n['propname']
+            if let Value::Str(key) = &idx_val {
+                match &list_val {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Node { properties, .. } => {
+                        return Ok(properties.get(key.as_str()).map(json_to_value).unwrap_or(Value::Null));
+                    }
+                    Value::Edge { properties, .. } => {
+                        return Ok(properties.get(key.as_str()).map(json_to_value).unwrap_or(Value::Null));
+                    }
+                    Value::Json(serde_json::Value::Array(_)) => {
+                        // String index on a list → TypeError
+                        return Err(ExecError {
+                            message: "TypeError: InvalidArgumentType: \
+                                      list element access requires an integer index".into(),
+                        });
+                    }
+                    _ => {} // fall through to list handling
+                }
+            }
             let arr = match &list_val {
                 Value::Json(serde_json::Value::Array(a)) => a,
                 Value::Null => return Ok(Value::Null),
-                // Non-list, non-map: raise TypeError for integer index.
+                // Non-list, non-map: raise TypeError for non-null index.
                 _ => {
-                    // Only raise an error for integer (not null) index.
                     if matches!(idx_val, Value::Null) {
                         return Ok(Value::Null);
                     }
@@ -3012,8 +3150,21 @@ pub fn eval_expr(
             };
             let idx = match idx_val {
                 Value::Int(i) => i,
-                Value::Float(f) => f as i64,
-                _ => return Ok(Value::Null),
+                Value::Float(f) => {
+                    // Non-integer float → TypeError
+                    if f.fract() != 0.0 {
+                        return Err(ExecError {
+                            message: "TypeError: InvalidArgumentType: \
+                                      list index must be an integer, not a float".into(),
+                        });
+                    }
+                    f as i64
+                }
+                Value::Null => return Ok(Value::Null),
+                _ => return Err(ExecError {
+                    message: "TypeError: InvalidArgumentType: \
+                              list index must be an integer".into(),
+                }),
             };
             let len = arr.len() as i64;
             let actual = if idx < 0 { len + idx } else { idx };
@@ -3033,6 +3184,7 @@ pub fn eval_expr(
             let len = arr.len() as i64;
             let start = if let Some(f) = from {
                 match eval_expr(f, row, params)? {
+                    Value::Null => return Ok(Value::Null),
                     Value::Int(i) => if i < 0 { (len + i).max(0) } else { i.min(len) },
                     Value::Float(f) => { let i = f as i64; if i < 0 { (len + i).max(0) } else { i.min(len) } }
                     _ => 0,
@@ -3040,6 +3192,7 @@ pub fn eval_expr(
             } else { 0 };
             let end = if let Some(t) = to {
                 match eval_expr(t, row, params)? {
+                    Value::Null => return Ok(Value::Null),
                     Value::Int(i) => if i < 0 { (len + i).max(0) } else { i.min(len) },
                     Value::Float(f) => { let i = f as i64; if i < 0 { (len + i).max(0) } else { i.min(len) } }
                     _ => len,
@@ -3204,6 +3357,12 @@ fn compare_values(left: &Value, op: &CmpOp, right: &Value) -> Option<bool> {
     if matches!(left, Value::Null) || matches!(right, Value::Null) {
         return None;
     }
+    // NaN comparisons: NaN = anything → false, NaN <> anything → true (openCypher spec).
+    let left_is_nan = matches!(left, Value::Float(f) if f.is_nan());
+    let right_is_nan = matches!(right, Value::Float(f) if f.is_nan());
+    if left_is_nan || right_is_nan {
+        return Some(matches!(op, CmpOp::Neq));
+    }
     match (left, right) {
         (Value::Int(a), Value::Int(b)) => Some(int_cmp(*a, op, *b)),
         (Value::Float(a), Value::Float(b)) => Some(float_cmp(*a, op, *b)),
@@ -3354,9 +3513,13 @@ fn int_cmp(a: i64, op: &CmpOp, b: i64) -> bool {
 }
 
 fn float_cmp(a: f64, op: &CmpOp, b: f64) -> bool {
+    // NaN comparisons: NaN == anything → false, NaN != anything → true, NaN ord anything → false
+    if a.is_nan() || b.is_nan() {
+        return matches!(op, CmpOp::Neq);
+    }
     match op {
-        CmpOp::Eq => (a - b).abs() < f64::EPSILON,
-        CmpOp::Neq => (a - b).abs() >= f64::EPSILON,
+        CmpOp::Eq => a == b,
+        CmpOp::Neq => a != b,
         CmpOp::Lt => a < b,
         CmpOp::Gt => a > b,
         CmpOp::Le => a <= b,
@@ -3426,7 +3589,12 @@ fn float_arith(a: f64, op: &ArithOp, b: f64) -> Result<Value, ExecError> {
         ArithOp::Sub => Ok(Value::Float(a - b)),
         ArithOp::Mul => Ok(Value::Float(a * b)),
         ArithOp::Div => {
-            if b == 0.0 { Ok(Value::Null) } else { Ok(Value::Float(a / b)) }
+            if b == 0.0 {
+                if a == 0.0 { Ok(Value::Float(f64::NAN)) } // 0.0/0.0 → NaN
+                else { Ok(Value::Null) }                    // x/0.0 → null
+            } else {
+                Ok(Value::Float(a / b))
+            }
         }
         ArithOp::Mod => {
             if b == 0.0 { Ok(Value::Null) } else { Ok(Value::Float(a % b)) }
@@ -3486,7 +3654,13 @@ fn eval_function(
                 Value::Node { properties, .. } | Value::Edge { properties, .. } => {
                     Ok(Value::Json(serde_json::Value::Object(properties)))
                 }
-                _ => Ok(Value::Null),
+                Value::Json(serde_json::Value::Object(m)) => {
+                    Ok(Value::Json(serde_json::Value::Object(m)))
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Err(ExecError {
+                    message: "TypeError: properties() requires a node, relationship, or map".into(),
+                }),
             }
         }
         "keys" => {
@@ -3496,7 +3670,15 @@ fn eval_function(
             let val = eval_expr(&args[0], row, params)?;
             match val {
                 Value::Node { properties, .. } | Value::Edge { properties, .. } => {
-                    let keys: Vec<serde_json::Value> = properties.keys().map(|k| k.clone().into()).collect();
+                    // Exclude null-valued properties per openCypher spec.
+                    let keys: Vec<serde_json::Value> = properties.iter()
+                        .filter(|(_, v)| !v.is_null())
+                        .map(|(k, _)| k.clone().into())
+                        .collect();
+                    Ok(Value::Json(serde_json::Value::Array(keys)))
+                }
+                Value::Json(serde_json::Value::Object(obj)) => {
+                    let keys: Vec<serde_json::Value> = obj.keys().map(|k| k.clone().into()).collect();
                     Ok(Value::Json(serde_json::Value::Array(keys)))
                 }
                 _ => Ok(Value::Null),
@@ -3524,10 +3706,16 @@ fn eval_function(
             match val {
                 Value::Int(i) => Ok(Value::Int(i)),
                 Value::Float(f) => Ok(Value::Int(f as i64)),
-                Value::Str(s) => match s.parse::<i64>() {
-                    Ok(i) => Ok(Value::Int(i)),
-                    Err(_) => Ok(Value::Null),
-                },
+                Value::Str(s) => {
+                    // Try integer parse first, then float-truncation.
+                    if let Ok(i) = s.trim().parse::<i64>() {
+                        Ok(Value::Int(i))
+                    } else if let Ok(f) = s.trim().parse::<f64>() {
+                        Ok(Value::Int(f as i64))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
                 Value::Null => Ok(Value::Null),
                 _ => Ok(Value::Null),
             }
@@ -4074,6 +4262,10 @@ fn math1f(
 }
 
 fn values_equal(a: &Value, b: &Value) -> bool {
+    // NaN is not equal to anything (including itself)
+    if matches!(a, Value::Float(f) if f.is_nan()) || matches!(b, Value::Float(f) if f.is_nan()) {
+        return false;
+    }
     match (a, b) {
         // JSON array equality: element-wise
         (Value::Json(serde_json::Value::Array(aa)), Value::Json(serde_json::Value::Array(bb))) => {
@@ -4164,6 +4356,17 @@ fn expr_default_name(expr: &Expr, idx: usize) -> String {
             expr_default_name(l, idx),
             expr_default_name(r, idx),
         ),
+        Expr::Subscript(base, idx_expr) => {
+            let base_str = expr_default_name(base, idx);
+            let idx_str = expr_default_name(idx_expr, idx);
+            format!("{base_str}[{idx_str}]")
+        }
+        Expr::List(items) => {
+            let parts: Vec<String> = items.iter().enumerate()
+                .map(|(i, e)| expr_default_name(e, i))
+                .collect();
+            format!("[{}]", parts.join(", "))
+        }
         _ => format!("_col{idx}"),
     }
 }
@@ -4222,11 +4425,15 @@ fn list_ordering(a: &[serde_json::Value], b: &[serde_json::Value]) -> std::cmp::
 }
 
 /// Evaluate a SKIP/LIMIT expression to a usize (params available, no row context needed).
-fn eval_const_usize(expr: &Expr, params: &HashMap<String, serde_json::Value>) -> usize {
+fn eval_const_usize(expr: &Expr, params: &HashMap<String, serde_json::Value>) -> Result<usize, ExecError> {
     let dummy = Row::new();
     match eval_expr(expr, &dummy, params).unwrap_or(Value::Null) {
-        Value::Int(n) => n.max(0) as usize,
-        _ => 0,
+        Value::Int(n) if n < 0 =>
+            Err(ExecError { message: "SyntaxError::NegativeIntegerArgument: SKIP/LIMIT must be a non-negative integer".into() }),
+        Value::Int(n) => Ok(n as usize),
+        Value::Float(_) =>
+            Err(ExecError { message: "SyntaxError::InvalidArgumentType: SKIP/LIMIT must be an integer, not a float".into() }),
+        _ => Ok(0),
     }
 }
 
@@ -4263,6 +4470,48 @@ fn exec_apply(
 }
 
 /// Convert result rows to JSONB output format.
+/// LeftJoin: for each outer row, execute inner with outer vars in params.
+/// If inner produces rows: emit merged (inner + outer) rows.
+/// If inner produces no rows: emit outer row with null_vars set to Null.
+/// This implements OPTIONAL MATCH semantics when new variables are introduced.
+fn exec_left_join(
+    outer: &LogicalPlan,
+    inner: &LogicalPlan,
+    null_vars: &[String],
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<Row>, ExecError> {
+    let outer_rows = execute(outer, params)?;
+    let mut result = Vec::new();
+    for outer_row in &outer_rows {
+        // Inject outer bindings into params so inner plan can look them up.
+        let mut inner_params = params.clone();
+        for (k, v) in outer_row {
+            inner_params.insert(k.clone(), v.to_json());
+        }
+        let inner_rows = execute(inner, &inner_params)?;
+
+        if inner_rows.is_empty() {
+            // No match: emit outer row with null_vars = Null.
+            let mut row = outer_row.clone();
+            for v in null_vars {
+                row.insert(v.clone(), Value::Null);
+            }
+            result.push(row);
+        } else {
+            // Matches found: emit each inner row merged with outer row.
+            for inner_row in inner_rows {
+                let mut row = outer_row.clone();
+                // Inner vars take precedence (may refine or extend outer bindings).
+                for (k, v) in inner_row {
+                    row.insert(k, v);
+                }
+                result.push(row);
+            }
+        }
+    }
+    Ok(result)
+}
+
 pub fn rows_to_jsonb(rows: Vec<Row>) -> Vec<pgrx::JsonB> {
     rows.into_iter().map(|row| {
         let mut m = serde_json::Map::new();
@@ -4570,6 +4819,10 @@ fn exec_set_prop(
     let mut result = Vec::new();
 
     for mut row in input_rows {
+        // Inject params into row for variable lookup (e.g. MERGE ON MATCH/ON CREATE).
+        for (k, v) in params {
+            row.entry(k.clone()).or_insert_with(|| json_to_value(v));
+        }
         for item in items {
             match item {
                 SetItem::Property(prop_expr, val_expr) => {
@@ -4584,6 +4837,44 @@ fn exec_set_prop(
                         _ => return Err(ExecError { message: "SET property must reference a property access".into() }),
                     };
                     let val = eval_expr(val_expr, &row, params)?;
+                    // Skip if target variable is null (SET on null is a no-op).
+                    if matches!(row.get(&var), Some(Value::Null)) {
+                        continue;
+                    }
+                    // Handle edge property SET.
+                    if matches!(row.get(&var), Some(Value::Edge { .. })) {
+                        let edge_id = match row.get(&var) {
+                            Some(Value::Edge { edge_id, .. }) => *edge_id,
+                            _ => unreachable!(),
+                        };
+                        // Load current edge props and update.
+                        let mut props2 = match row.get(&var) {
+                            Some(Value::Edge { properties, .. }) => properties.clone(),
+                            _ => serde_json::Map::new(),
+                        };
+                        if val == Value::Null {
+                            props2.remove(&key);
+                        } else {
+                            props2.insert(key.clone(), val.to_json());
+                        }
+                        let new_bytes = prop_store::encode(&props2, |name| -> Result<i32, std::convert::Infallible> {
+                            Ok(ensure_prop_key(name))
+                        }).unwrap_or_default();
+                        unsafe {
+                            let edge_rel = crate::open_edges_relation();
+                            crate::storage::edge_store::update_edge_props(edge_rel, edge_id, &new_bytes);
+                            pgrx::pg_sys::table_close(edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                        }
+                        // Update in-memory row value.
+                        if let Some(Value::Edge { properties, .. }) = row.get_mut(&var) {
+                            if val == Value::Null {
+                                properties.remove(&key);
+                            } else {
+                                properties.insert(key.clone(), val.to_json());
+                            }
+                        }
+                        continue;
+                    }
                     // Load current node state.
                     let node_id = node_id_from_row(&row, &var)?;
                     let mut rec = load_node(node_id)?;
@@ -4620,71 +4911,137 @@ fn exec_set_prop(
                     }
                 }
                 SetItem::Variable(var, val_expr) => {
-                    // n = {map} — replace all properties.
+                    // Skip if target variable is null (SET on null is a no-op).
+                    if matches!(row.get(var), Some(Value::Null)) {
+                        continue;
+                    }
+                    // n = {map|node|edge} — replace all properties with the source properties.
                     let val = eval_expr(val_expr, &row, params)?;
-                    let new_props = match val.to_json() {
-                        serde_json::Value::Object(m) => m,
-                        _ => return Err(ExecError { message: format!("SET {var} = must be a map") }),
+                    let new_props = match val {
+                        // Node: copy node's properties
+                        Value::Node { properties, .. } => properties,
+                        // Edge: copy edge's properties
+                        Value::Edge { properties, .. } => properties,
+                        // Map: use directly
+                        Value::Json(serde_json::Value::Object(m)) => m,
+                        // Null: no-op (skip)
+                        Value::Null => continue,
+                        _ => return Err(ExecError { message: format!("SET {var} = must be a map, node, or relationship") }),
                     };
-                    let node_id = node_id_from_row(&row, var)?;
-                    let rec = load_node(node_id)?;
                     let new_bytes = prop_store::encode(&new_props, |name| -> Result<i32, std::convert::Infallible> {
                         Ok(ensure_prop_key(name))
                     }).unwrap_or_default();
-                    unsafe {
-                        let rel = crate::open_nodes_relation();
-                        node_store::update_node(rel, node_id, &rec.label_ids, &new_bytes);
-                        pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
-                    }
-                    if let Some(Value::Node { properties, .. }) = row.get_mut(var) {
-                        *properties = new_props;
+                    // Handle both Node and Edge.
+                    if let Some(Value::Edge { edge_id, .. }) = row.get(var) {
+                        let edge_id = *edge_id;
+                        unsafe {
+                            let edge_rel = crate::open_edges_relation();
+                            crate::storage::edge_store::update_edge_props(edge_rel, edge_id, &new_bytes);
+                            pgrx::pg_sys::table_close(edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                        }
+                        if let Some(Value::Edge { properties, .. }) = row.get_mut(var) {
+                            *properties = new_props;
+                        }
+                    } else {
+                        let node_id = node_id_from_row(&row, var)?;
+                        let rec = load_node(node_id)?;
+                        unsafe {
+                            let rel = crate::open_nodes_relation();
+                            node_store::update_node(rel, node_id, &rec.label_ids, &new_bytes);
+                            pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                        }
+                        if let Some(Value::Node { properties, .. }) = row.get_mut(var) {
+                            *properties = new_props;
+                        }
                     }
                 }
                 SetItem::MergeMap(var, val_expr) => {
-                    // n += {map} — merge properties.
+                    // Skip if target variable is null (SET on null is a no-op).
+                    if matches!(row.get(var), Some(Value::Null)) {
+                        continue;
+                    }
+                    // n += {map|node|edge} — merge properties from source.
                     let val = eval_expr(val_expr, &row, params)?;
-                    let extra = match val.to_json() {
-                        serde_json::Value::Object(m) => m,
-                        _ => return Err(ExecError { message: format!("SET {var} += must be a map") }),
+                    let extra = match val {
+                        Value::Node { properties, .. } => properties,
+                        Value::Edge { properties, .. } => properties,
+                        Value::Json(serde_json::Value::Object(m)) => m,
+                        Value::Null => continue,
+                        _ => return Err(ExecError { message: format!("SET {var} += must be a map, node, or relationship") }),
                     };
-                    let node_id = node_id_from_row(&row, var)?;
-                    let mut rec = load_node(node_id)?;
-                    if rec.overflow_blkno != 0 && rec.prop_bytes.is_empty() {
-                        rec.prop_bytes = unsafe {
-                            let rel = crate::open_nodes_relation();
-                            let bytes = node_store::read_overflow_block(rel, rec.overflow_blkno);
-                            pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
-                            bytes
-                        };
-                    }
-                    let mut props = prop_store::decode(&rec.prop_bytes, prop_key_name);
-                    for (k, v) in extra.iter() {
-                        if v.is_null() {
-                            props.remove(k);
-                        } else {
-                            props.insert(k.clone(), v.clone());
-                        }
-                    }
-                    let new_bytes = prop_store::encode(&props, |name| -> Result<i32, std::convert::Infallible> {
-                        Ok(ensure_prop_key(name))
-                    }).unwrap_or_default();
-                    unsafe {
-                        let rel = crate::open_nodes_relation();
-                        node_store::update_node(rel, node_id, &rec.label_ids, &new_bytes);
-                        pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
-                    }
-                    if let Some(Value::Node { properties, .. }) = row.get_mut(var) {
-                        for (k, v) in &extra {
+                    // Handle both Node and Edge.
+                    if let Some(Value::Edge { edge_id, properties: edge_props, .. }) = row.get(var) {
+                        let edge_id = *edge_id;
+                        // Merge extra into current edge properties.
+                        let mut props = edge_props.clone();
+                        for (k, v) in extra.iter() {
                             if v.is_null() {
-                                properties.remove(k);
+                                props.remove(k);
                             } else {
-                                properties.insert(k.clone(), v.clone());
+                                props.insert(k.clone(), v.clone());
+                            }
+                        }
+                        let new_bytes = prop_store::encode(&props, |name| -> Result<i32, std::convert::Infallible> {
+                            Ok(ensure_prop_key(name))
+                        }).unwrap_or_default();
+                        unsafe {
+                            let edge_rel = crate::open_edges_relation();
+                            crate::storage::edge_store::update_edge_props(edge_rel, edge_id, &new_bytes);
+                            pgrx::pg_sys::table_close(edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                        }
+                        if let Some(Value::Edge { properties, .. }) = row.get_mut(var) {
+                            for (k, v) in &extra {
+                                if v.is_null() {
+                                    properties.remove(k);
+                                } else {
+                                    properties.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                    } else {
+                        let node_id = node_id_from_row(&row, var)?;
+                        let mut rec = load_node(node_id)?;
+                        if rec.overflow_blkno != 0 && rec.prop_bytes.is_empty() {
+                            rec.prop_bytes = unsafe {
+                                let rel = crate::open_nodes_relation();
+                                let bytes = node_store::read_overflow_block(rel, rec.overflow_blkno);
+                                pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                                bytes
+                            };
+                        }
+                        let mut props = prop_store::decode(&rec.prop_bytes, prop_key_name);
+                        for (k, v) in extra.iter() {
+                            if v.is_null() {
+                                props.remove(k);
+                            } else {
+                                props.insert(k.clone(), v.clone());
+                            }
+                        }
+                        let new_bytes = prop_store::encode(&props, |name| -> Result<i32, std::convert::Infallible> {
+                            Ok(ensure_prop_key(name))
+                        }).unwrap_or_default();
+                        unsafe {
+                            let rel = crate::open_nodes_relation();
+                            node_store::update_node(rel, node_id, &rec.label_ids, &new_bytes);
+                            pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                        }
+                        if let Some(Value::Node { properties, .. }) = row.get_mut(var) {
+                            for (k, v) in &extra {
+                                if v.is_null() {
+                                    properties.remove(k);
+                                } else {
+                                    properties.insert(k.clone(), v.clone());
+                                }
                             }
                         }
                     }
                 }
                 SetItem::Label(var, new_labels) => {
                     // n:Label — add labels to node.
+                    // Skip if variable is null (null is ignored in SET label).
+                    if matches!(row.get(var), Some(Value::Null)) {
+                        continue;
+                    }
                     let node_id = node_id_from_row(&row, var)?;
                     let mut rec = load_node(node_id)?;
                     if rec.overflow_blkno != 0 && rec.prop_bytes.is_empty() {
@@ -4742,12 +5099,40 @@ fn exec_remove_prop(
     let mut result = Vec::new();
 
     for mut row in input_rows {
+        // Inject params into row for variable lookup.
+        for (k, v) in params {
+            row.entry(k.clone()).or_insert_with(|| json_to_value(v));
+        }
         for item in items {
             match item {
                 RemoveItem::Property(var_expr, key) => {
                     let var = if let Expr::Variable(v) = var_expr { v } else {
                         return Err(ExecError { message: "REMOVE property must reference a variable".into() });
                     };
+                    // Skip null (ignore null in REMOVE).
+                    if matches!(row.get(var), Some(Value::Null)) {
+                        continue;
+                    }
+                    // Handle edge property removal.
+                    if matches!(row.get(var), Some(Value::Edge { .. })) {
+                        let (edge_id, mut cur_props) = match row.get(var) {
+                            Some(Value::Edge { edge_id, properties, .. }) => (*edge_id, properties.clone()),
+                            _ => unreachable!(),
+                        };
+                        cur_props.remove(key);
+                        let new_bytes = prop_store::encode(&cur_props, |name| -> Result<i32, std::convert::Infallible> {
+                            Ok(ensure_prop_key(name))
+                        }).unwrap_or_default();
+                        unsafe {
+                            let edge_rel = crate::open_edges_relation();
+                            crate::storage::edge_store::update_edge_props(edge_rel, edge_id, &new_bytes);
+                            pgrx::pg_sys::table_close(edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                        }
+                        if let Some(Value::Edge { properties, .. }) = row.get_mut(var) {
+                            properties.remove(key);
+                        }
+                        continue;
+                    }
                     let node_id = node_id_from_row(&row, var)?;
                     let mut rec = load_node(node_id)?;
                     if rec.overflow_blkno != 0 && rec.prop_bytes.is_empty() {
@@ -4773,6 +5158,10 @@ fn exec_remove_prop(
                     }
                 }
                 RemoveItem::Label(var, rm_labels) => {
+                    // Skip null (ignore null in REMOVE label).
+                    if matches!(row.get(var), Some(Value::Null)) {
+                        continue;
+                    }
                     let node_id = node_id_from_row(&row, var)?;
                     let mut rec = load_node(node_id)?;
                     if rec.overflow_blkno != 0 && rec.prop_bytes.is_empty() {
@@ -4823,11 +5212,16 @@ fn exec_delete_nodes(
 
     let input_rows = execute(input, params)?;
 
+    // Track already-deleted nodes/edges to avoid double-delete (e.g., undirected expand).
+    let mut deleted_nodes: HashSet<i64> = HashSet::new();
+    let mut deleted_edges: HashSet<i64> = HashSet::new();
+
     for row in &input_rows {
         for expr in exprs {
             let val = eval_expr(expr, row, params)?;
             match val {
                 Value::Node { node_id, .. } => {
+                    if deleted_nodes.contains(&node_id) { continue; }
                     if detach {
                         // Collect and delete all edges first.
                         let all_edge_ids: Vec<i64> = unsafe {
@@ -4842,20 +5236,24 @@ fn exec_delete_nodes(
                             for e in out_edges.iter().chain(in_edges.iter()) { seen.insert(e.edge_id); }
                             seen.into_iter().collect()
                         };
+                        let new_edge_ids: Vec<i64> = all_edge_ids.into_iter()
+                            .filter(|eid| !deleted_edges.contains(eid))
+                            .collect();
                         unsafe {
                             let edge_rel = crate::open_edges_relation();
-                            for eid in &all_edge_ids { delete_edge(edge_rel, *eid); }
+                            for eid in &new_edge_ids { delete_edge(edge_rel, *eid); }
                             pgrx::pg_sys::table_close(edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                         }
-                        if !all_edge_ids.is_empty() {
+                        if !new_edge_ids.is_empty() {
                             pgrx::Spi::run_with_args(
                                 "DELETE FROM _pg_eddy.edge_type_src WHERE edge_id = ANY($1)",
-                                &[pgrx::datum::DatumWithOid::from(all_edge_ids.as_slice())],
+                                &[pgrx::datum::DatumWithOid::from(new_edge_ids.as_slice())],
                             ).unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_src delete: {e}"));
                             pgrx::Spi::run_with_args(
                                 "DELETE FROM _pg_eddy.edge_type_dst WHERE edge_id = ANY($1)",
-                                &[pgrx::datum::DatumWithOid::from(all_edge_ids.as_slice())],
+                                &[pgrx::datum::DatumWithOid::from(new_edge_ids.as_slice())],
                             ).unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_dst delete: {e}"));
+                            for eid in new_edge_ids { deleted_edges.insert(eid); }
                         }
                     }
                     // Delete the node.
@@ -4868,8 +5266,27 @@ fn exec_delete_nodes(
                         "DELETE FROM _pg_eddy.label_index WHERE node_id = $1",
                         &[pgrx::datum::DatumWithOid::from(node_id)],
                     ).unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index delete: {e}"));
+                    deleted_nodes.insert(node_id);
                 }
                 Value::Null => { /* no-op for null nodes */ }
+                Value::Edge { edge_id, .. } => {
+                    if deleted_edges.contains(&edge_id) { continue; }
+                    // DELETE a relationship directly.
+                    unsafe {
+                        let edge_rel = crate::open_edges_relation();
+                        delete_edge(edge_rel, edge_id);
+                        pgrx::pg_sys::table_close(edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                    }
+                    pgrx::Spi::run_with_args(
+                        "DELETE FROM _pg_eddy.edge_type_src WHERE edge_id = $1",
+                        &[pgrx::datum::DatumWithOid::from(edge_id)],
+                    ).unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_src delete: {e}"));
+                    pgrx::Spi::run_with_args(
+                        "DELETE FROM _pg_eddy.edge_type_dst WHERE edge_id = $1",
+                        &[pgrx::datum::DatumWithOid::from(edge_id)],
+                    ).unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_dst delete: {e}"));
+                    deleted_edges.insert(edge_id);
+                }
                 other => {
                     return Err(ExecError {
                         message: format!("DELETE: expected a node, got {:?}", other),
@@ -4879,7 +5296,10 @@ fn exec_delete_nodes(
         }
     }
     let _ = next_edge_id; // suppress unused import warning
-    Ok(Vec::new()) // DELETE returns no rows
+    // DELETE passes through the input rows so downstream clauses (RETURN, SKIP, LIMIT, etc.)
+    // can still use them. The deleted nodes remain in memory as stale values, which is fine
+    // since the property values were captured at the time of MATCH.
+    Ok(input_rows)
 }
 
 /// Execute MERGE pattern.
@@ -5026,9 +5446,16 @@ fn load_node(node_id: i64) -> Result<NodeRecord, ExecError> {
 }
 
 fn node_id_from_row(row: &Row, var: &str) -> Result<i64, ExecError> {
-    match row.get(var) {
-        Some(Value::Node { node_id, .. }) => Ok(*node_id),
-        Some(Value::Int(id)) => Ok(*id),
+    node_id_from_row_or_params(row, var, &HashMap::new())
+}
+
+fn node_id_from_row_or_params(row: &Row, var: &str, params: &HashMap<String, serde_json::Value>) -> Result<i64, ExecError> {
+    let val = row.get(var)
+        .cloned()
+        .or_else(|| params.get(var).map(json_to_value));
+    match val {
+        Some(Value::Node { node_id, .. }) => Ok(node_id),
+        Some(Value::Int(id)) => Ok(id),
         Some(other) => Err(ExecError { message: format!("variable {var} is not a node (got {:?})", other) }),
         None => Err(ExecError { message: format!("variable {var} not in scope") }),
     }

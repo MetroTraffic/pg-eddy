@@ -242,7 +242,15 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
                     pos += 1;
                 }
                 let hex_str = &input[hex_start..pos];
-                let val = i64::from_str_radix(hex_str, 16).unwrap_or(i64::MAX);
+                if hex_str.is_empty() {
+                    return Err(LexError { message: "incomplete hexadecimal integer".into(), offset: start });
+                }
+                // Parse as u64 first to handle 0x8000000000000000 (i64::MIN after negation).
+                let val = if let Ok(v) = u64::from_str_radix(hex_str, 16) {
+                    v as i64 // wrapping cast: handles i64::MIN case (0x8000000000000000)
+                } else {
+                    return Err(LexError { message: "hexadecimal integer overflow".into(), offset: start });
+                };
                 tokens.push(SpannedToken { token: Token::IntLit(val), offset: start });
                 continue;
             }
@@ -254,7 +262,14 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
                     pos += 1;
                 }
                 let oct_str = &input[oct_start..pos];
-                let val = i64::from_str_radix(oct_str, 8).unwrap_or(i64::MAX);
+                if oct_str.is_empty() {
+                    return Err(LexError { message: "incomplete octal integer".into(), offset: start });
+                }
+                let val = if let Ok(v) = u64::from_str_radix(oct_str, 8) {
+                    v as i64 // wrapping cast: handles i64::MIN case
+                } else {
+                    return Err(LexError { message: "octal integer overflow".into(), offset: start });
+                };
                 tokens.push(SpannedToken { token: Token::IntLit(val), offset: start });
                 continue;
             }

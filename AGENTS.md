@@ -64,6 +64,45 @@ The project includes three test suites:
 line 6: `[![OpenCypher TCK](https://img.shields.io/badge/OpenCypher%20TCK-NN%2FNNNN%20passed-orange.svg)](tests/tck/)`
 Replace `NN/NNNN` with the new count (e.g., `82/3881 passed`).
 
+## Versioning Policy
+
+There are **two independent version axes**:
+
+### Schema version (`Cargo.toml` + `pg_eddy.control`)
+
+`pg_eddy.control` uses `default_version = '@CARGO_VERSION@'` — a pgrx-supported
+placeholder that is substituted with the Cargo.toml version at build/install time.
+**Never hardcode the version in the control file.** This means the two files can
+never drift out of sync, and `pg_eddy.control` never needs editing on a version bump.
+
+**Until the extension is distributed to external users, do not bump the schema
+version or add migration files for pure Rust-only changes.** Only increment the
+schema version (and add the corresponding `pg_eddy--OLD--NEW.sql` migration file
+and a new `pg_eddy--NEW.sql` full-DDL file) when there is an actual catalog/schema
+change: new tables, sequences, indexes, or SQL function signature changes. Rust
+implementation changes that don't touch the catalog require no schema version bump,
+no new SQL files, and no control file edit.
+
+Once the extension is being distributed and users will run
+`ALTER EXTENSION pg_eddy UPDATE` on live databases, every release — even
+Rust-only ones — should get a schema version bump with an empty (but present)
+migration file so PostgreSQL's upgrade path stays linear.
+
+### Software release version (git tags + CHANGELOG)
+
+Git tags (`v0.8.0`, etc.) and CHANGELOG entries are **independent** of the schema
+version. You can tag `v0.9.0` in git and add a CHANGELOG entry for it while
+`Cargo.toml` and `pg_eddy.control` remain at `0.8.0` (the last schema-changing
+release). The two axes only coincide when a release includes a catalog change.
+
+**Current state (as of the policy change):** `Cargo.toml` and `pg_eddy.control`
+are both at `0.8.0` — but that is not because `0.8.0` was a schema release. They
+were historically bumped in lockstep with every git release tag (the old
+behaviour), producing empty migration files for `0.5.1→0.6.0`, `0.6.0→0.7.0`,
+and `0.7.0→0.8.0`. The last real catalog change was `0.5.1`. Going forward, the
+schema version stays frozen at `0.8.0` until there is a genuine catalog change,
+regardless of how many git release tags are created.
+
 ## Release Checklist
 
 Before releasing a new version:
@@ -72,8 +111,11 @@ Before releasing a new version:
    `plans/implementation_plan.md` checklist for the version being released.
    Verify every `[ ]` item is actually implemented before committing. Mark
    each done item `[x]` in the plan. Note any deferred items with a reason.
-2. **Update version files** — Update `Cargo.toml` version, create migration SQL
-   files if needed (`pg_eddy--X.Y.Z--X.Y.W.sql`), and update `pg_eddy.control`.
+2. **Update schema version files** — Only if there are catalog/schema changes (see
+   Versioning Policy above): bump `Cargo.toml` version, update `pg_eddy.control`
+   `default_version` to match, add a migration SQL file (`pg_eddy--X.Y.Z--X.Y.W.sql`),
+   and add a new full-DDL file (`pg_eddy--X.Y.W.sql`). Skip entirely for Rust-only
+   releases — git tag and CHANGELOG entries are independent of the schema version.
 3. **Update CHANGELOG.md** — Document all changes, fixes, and features for the
    release.
 4. **Run unit tests** — ⚠️ **REQUIRED GATE** — Execute `cargo pgrx test pg18`

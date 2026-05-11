@@ -437,13 +437,12 @@ impl Parser {
                 };
                 let right = self.parse_query()?;
                 // Detect mixing UNION and UNION ALL (Union3[1,2]).
-                if let Some((right_all, _)) = &right.union {
-                    if *right_all != all {
-                        return Err(ParseError {
-                            message: "SyntaxError::InvalidClauseComposition: cannot mix UNION and UNION ALL".to_string(),
-                            offset: self.offset(),
-                        });
-                    }
+                if let Some((right_all, _)) = &right.union
+                    && *right_all != all {
+                    return Err(ParseError {
+                        message: "SyntaxError::InvalidClauseComposition: cannot mix UNION and UNION ALL".to_string(),
+                        offset: self.offset(),
+                    });
                 }
                 return Ok(Query { clauses, union: Some((all, Box::new(right))) });
             }
@@ -498,7 +497,9 @@ impl Parser {
     fn try_parse_skip(&mut self) -> Result<Option<Expr>, ParseError> {
         if *self.peek() == Token::Skip {
             self.advance();
-            Ok(Some(self.parse_expr()?))
+            let expr = self.parse_expr()?;
+            Self::validate_skip_limit_expr(&expr, "SKIP").map_err(|m| ParseError { message: m, offset: self.offset() })?;
+            Ok(Some(expr))
         } else {
             Ok(None)
         }
@@ -507,9 +508,64 @@ impl Parser {
     fn try_parse_limit(&mut self) -> Result<Option<Expr>, ParseError> {
         if *self.peek() == Token::Limit {
             self.advance();
-            Ok(Some(self.parse_expr()?))
+            let expr = self.parse_expr()?;
+            Self::validate_skip_limit_expr(&expr, "LIMIT").map_err(|m| ParseError { message: m, offset: self.offset() })?;
+            Ok(Some(expr))
         } else {
             Ok(None)
+        }
+    }
+
+    /// Validate that a SKIP/LIMIT expression is a non-negative integer constant or parameter.
+    fn validate_skip_limit_expr(expr: &Expr, clause: &str) -> Result<(), String> {
+        match expr {
+            Expr::IntLit(n) if *n < 0 =>
+                Err(format!("SyntaxError::NegativeIntegerArgument: {clause} must be a non-negative integer")),
+            Expr::FloatLit(_) =>
+                Err(format!("SyntaxError::InvalidArgumentType: {clause} must be an integer, not a float")),
+            // Unary minus on literal → negative
+            Expr::Neg(inner) => match inner.as_ref() {
+                Expr::IntLit(_) =>
+                    Err(format!("SyntaxError::NegativeIntegerArgument: {clause} must be a non-negative integer")),
+                Expr::FloatLit(_) =>
+                    Err(format!("SyntaxError::InvalidArgumentType: {clause} must be an integer, not a float")),
+                other => {
+                    if Self::expr_contains_variable(other) {
+                        Err(format!("SyntaxError::NonConstantExpression: {clause} must be a constant expression"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            // Parameters ($var) are allowed — runtime validation
+            Expr::Parameter(_) => Ok(()),
+            // Non-negative integer literals are allowed
+            Expr::IntLit(_) => Ok(()),
+            // Anything referencing a query variable is not allowed
+            other => {
+                if Self::expr_contains_variable(other) {
+                    Err(format!("SyntaxError::NonConstantExpression: {clause} must be a constant expression"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// Returns true if the expression references any query variable (not a parameter).
+    fn expr_contains_variable(expr: &Expr) -> bool {
+        match expr {
+            Expr::Variable(_) => true,
+            Expr::Property(inner, _) => Self::expr_contains_variable(inner),
+            Expr::FunctionCall(_, args) => args.iter().any(Self::expr_contains_variable),
+            Expr::Arith(a, _, b) | Expr::And(a, b) | Expr::Or(a, b) | Expr::Compare(a, _, b) => {
+                Self::expr_contains_variable(a) || Self::expr_contains_variable(b)
+            }
+            Expr::Neg(inner) | Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner)
+            | Expr::HasLabel(inner, _) => {
+                Self::expr_contains_variable(inner)
+            }
+            _ => false,
         }
     }
 
@@ -592,7 +648,7 @@ impl Parser {
         // Optional labels: :Label1:Label2
         while *self.peek() == Token::Colon {
             self.advance();
-            labels.push(self.eat_ident()?);
+            labels.push(self.eat_ident_flexible()?);
         }
 
         // Optional properties: {key: value, ...}
@@ -635,13 +691,17 @@ impl Parser {
                 variable = Some(self.eat_ident()?);
             }
 
-            // Optional types: :TYPE1|TYPE2
+            // Optional types: :TYPE1|TYPE2 or :TYPE1|:TYPE2
             if *self.peek() == Token::Colon {
                 self.advance();
-                rel_types.push(self.eat_ident()?);
+                rel_types.push(self.eat_ident_flexible()?);
                 while *self.peek() == Token::Pipe {
-                    self.advance();
-                    rel_types.push(self.eat_ident()?);
+                    self.advance(); // consume |
+                    // Optional colon prefix: |:TYPE is valid alongside |TYPE
+                    if *self.peek() == Token::Colon {
+                        self.advance();
+                    }
+                    rel_types.push(self.eat_ident_flexible()?);
                 }
             }
 
@@ -718,14 +778,14 @@ impl Parser {
         let mut props = Vec::new();
 
         if *self.peek() != Token::RBrace {
-            let key = self.eat_ident()?;
+            let key = self.eat_ident_flexible()?;
             self.expect(&Token::Colon)?;
             let val = self.parse_expr()?;
             props.push((key, val));
 
             while *self.peek() == Token::Comma {
                 self.advance();
-                let key = self.eat_ident()?;
+                let key = self.eat_ident_flexible()?;
                 self.expect(&Token::Colon)?;
                 let val = self.parse_expr()?;
                 props.push((key, val));
@@ -751,12 +811,38 @@ impl Parser {
     fn eat_ident_flexible(&mut self) -> Result<String, ParseError> {
         match self.peek().clone() {
             Token::Ident(name) => { self.advance(); Ok(name) }
-            Token::End    => { self.advance(); Ok("end".to_string()) }
-            Token::Yield  => { self.advance(); Ok("yield".to_string()) }
-            Token::Call   => { self.advance(); Ok("call".to_string()) }
-            Token::On     => { self.advance(); Ok("on".to_string()) }
-            Token::Remove => { self.advance(); Ok("remove".to_string()) }
-            Token::Merge  => { self.advance(); Ok("merge".to_string()) }
+            Token::End        => { self.advance(); Ok("end".to_string()) }
+            Token::Yield      => { self.advance(); Ok("yield".to_string()) }
+            Token::Call       => { self.advance(); Ok("call".to_string()) }
+            Token::On         => { self.advance(); Ok("on".to_string()) }
+            Token::Remove     => { self.advance(); Ok("remove".to_string()) }
+            Token::Merge      => { self.advance(); Ok("merge".to_string()) }
+            Token::Null       => { self.advance(); Ok("null".to_string()) }
+            Token::True       => { self.advance(); Ok("true".to_string()) }
+            Token::False      => { self.advance(); Ok("false".to_string()) }
+            Token::Not        => { self.advance(); Ok("not".to_string()) }
+            Token::And        => { self.advance(); Ok("and".to_string()) }
+            Token::Or         => { self.advance(); Ok("or".to_string()) }
+            Token::Xor        => { self.advance(); Ok("xor".to_string()) }
+            Token::In         => { self.advance(); Ok("in".to_string()) }
+            Token::Is         => { self.advance(); Ok("is".to_string()) }
+            Token::As         => { self.advance(); Ok("as".to_string()) }
+            Token::With       => { self.advance(); Ok("with".to_string()) }
+            Token::Return     => { self.advance(); Ok("return".to_string()) }
+            Token::Match      => { self.advance(); Ok("match".to_string()) }
+            Token::Where      => { self.advance(); Ok("where".to_string()) }
+            Token::Create     => { self.advance(); Ok("create".to_string()) }
+            Token::Delete     => { self.advance(); Ok("delete".to_string()) }
+            Token::Detach     => { self.advance(); Ok("detach".to_string()) }
+            Token::Set        => { self.advance(); Ok("set".to_string()) }
+            Token::Distinct   => { self.advance(); Ok("distinct".to_string()) }
+            Token::Skip       => { self.advance(); Ok("skip".to_string()) }
+            Token::Limit      => { self.advance(); Ok("limit".to_string()) }
+            Token::Unwind     => { self.advance(); Ok("unwind".to_string()) }
+            Token::Case       => { self.advance(); Ok("case".to_string()) }
+            Token::When       => { self.advance(); Ok("when".to_string()) }
+            Token::Then       => { self.advance(); Ok("then".to_string()) }
+            Token::Else       => { self.advance(); Ok("else".to_string()) }
             other => Err(ParseError {
                 message: format!("expected identifier, got {:?}", other),
                 offset: self.offset(),
@@ -789,6 +875,20 @@ impl Parser {
     }
 
     fn parse_set_item(&mut self) -> Result<SetItem, ParseError> {
+        // SET can use a parenthesized expression for the variable: SET (n).prop = val
+        // Detect this by checking for LParen + ident + RParen + Dot pattern.
+        if *self.peek() == Token::LParen {
+            // Try to parse (var).prop = expr
+            self.advance(); // consume (
+            let var = self.eat_ident_flexible()?;
+            self.expect(&Token::RParen)?;
+            self.expect(&Token::Dot)?;
+            let prop = self.eat_ident_flexible()?;
+            self.expect(&Token::Eq)?;
+            let val = self.parse_expr()?;
+            return Ok(SetItem::Property(Expr::Property(Box::new(Expr::Variable(var)), prop), val));
+        }
+
         // Start with an identifier (the variable or property access)
         let var = self.eat_ident_flexible()?;
 
@@ -1006,7 +1106,31 @@ impl Parser {
         if let Some(op) = op {
             self.advance();
             let right = self.parse_inlist()?;
-            Ok(Expr::Compare(Box::new(left), op, Box::new(right)))
+            let first_cmp = Expr::Compare(Box::new(left), op, Box::new(right.clone()));
+            // Support chained comparisons: `a < x = b <> c` → `(a<x) AND (x=b) AND (b<>c)`.
+            let mut result = first_cmp;
+            let mut prev_right = right;
+            loop {
+                let next_op = match self.peek() {
+                    Token::Eq => Some(CmpOp::Eq),
+                    Token::Neq => Some(CmpOp::Neq),
+                    Token::LArrow => Some(CmpOp::Lt),
+                    Token::RArrow => Some(CmpOp::Gt),
+                    Token::Le => Some(CmpOp::Le),
+                    Token::Ge => Some(CmpOp::Ge),
+                    _ => None,
+                };
+                if let Some(op_next) = next_op {
+                    self.advance();
+                    let next_right = self.parse_inlist()?;
+                    let next_cmp = Expr::Compare(Box::new(prev_right), op_next, Box::new(next_right.clone()));
+                    result = Expr::And(Box::new(result), Box::new(next_cmp));
+                    prev_right = next_right;
+                } else {
+                    break;
+                }
+            }
+            Ok(result)
         } else {
             Ok(left)
         }
@@ -1447,7 +1571,7 @@ impl Parser {
         loop {
             if *self.peek() == Token::Dot {
                 self.advance();
-                let prop = self.eat_ident()?;
+                let prop = self.eat_ident_flexible()?;
 
                 // Check for method-style function call: expr.prop(args)
                 if *self.peek() == Token::LParen {
@@ -1494,6 +1618,19 @@ impl Parser {
                         expr = Expr::Subscript(Box::new(expr), Box::new(inner));
                     }
                 }
+            } else if *self.peek() == Token::Colon
+                && matches!(self.peek_at(1), Token::Ident(_) | Token::End | Token::On | Token::Yield | Token::Call | Token::Remove | Token::Merge | Token::With)
+            {
+                // Label test expression: n:Label[:Label2 ...]
+                // e.g. `n:A:B` returns true if node has both labels A and B
+                let mut labels = Vec::new();
+                while *self.peek() == Token::Colon
+                    && matches!(self.peek_at(1), Token::Ident(_) | Token::End | Token::On | Token::Yield | Token::Call | Token::Remove | Token::Merge | Token::With)
+                {
+                    self.advance(); // consume :
+                    labels.push(self.eat_ident_flexible()?);
+                }
+                expr = Expr::HasLabel(Box::new(expr), labels);
             } else {
                 break;
             }

@@ -287,6 +287,8 @@ pub enum Expr {
     Exists {
         subquery: Box<Query>,
     },
+    /// Label test: `n:Label` or `n:A:B` — true if node/rel has all listed labels/type
+    HasLabel(Box<Expr>, Vec<String>),
     /// Map literal: {key: expr, key2: expr2}
     MapLiteral(Vec<(String, Expr)>),
 }
