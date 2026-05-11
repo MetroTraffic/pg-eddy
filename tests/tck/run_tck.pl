@@ -569,9 +569,9 @@ sub node_display_matches {
     my @exp_labels;
     push @exp_labels, $1 while $inner =~ s/^:(\w+)//;
     $inner =~ s/^\s+//;
-    my %al = map { $_ => 1 } @{$actual->{labels}};
-    # All expected labels must be present.
-    for my $l (@exp_labels) { return 0 unless $al{$l}; }
+    my %al = map { lc($_) => 1 } @{$actual->{labels}};
+    # All expected labels must be present (case-insensitive).
+    for my $l (@exp_labels) { return 0 unless $al{lc($l)}; }
     # When labels are explicitly specified, the count must match exactly
     # (otherwise (:A:B) would greedily match (:A:B:C) nodes).
     return 0 if @exp_labels && scalar(@exp_labels) != scalar(@{$actual->{labels}});
@@ -588,7 +588,7 @@ sub edge_display_matches {
     return 0 unless exists $actual->{rel_type};
     (my $inner = $d) =~ s/^\[\s*|\s*\]$//g;
     my $et = ''; $et = $1 if $inner =~ s/^:(\w+)//;
-    return 0 if $et && $actual->{rel_type} ne $et;
+    return 0 if $et && lc($actual->{rel_type}) ne lc($et);
     $inner =~ s/^\s+//;
     if ($inner =~ /^\{(.+)\}$/) {
         my %ep = parse_prop_display($1);

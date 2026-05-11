@@ -5589,14 +5589,10 @@ fn exec_delete_nodes(
                     deleted_edges.insert(edge_id);
                 }
                 other => {
-                    // Handle Path: when DETACH DELETE is used with a path variable,
-                    // delete all nodes and edges in the path.
+                    // Handle Path: delete all nodes and edges in the path.
+                    // Per spec, DELETE on a path deletes all elements (both
+                    // nodes and relationships) without requiring DETACH.
                     if let Value::Path { nodes, rels } = other {
-                        if !detach {
-                            return Err(ExecError {
-                                message: "DELETE on a path requires DETACH DELETE".into(),
-                            });
-                        }
                         for rel in &rels {
                             if let Value::Edge { edge_id, .. } = rel {
                                 if deleted_edges.contains(edge_id) { continue; }

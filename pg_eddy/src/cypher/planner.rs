@@ -331,6 +331,34 @@ fn plan_clauses(
                             });
                         }
                     }
+                } else {
+                    // When WITH has aggregation, ORDER BY may reference projected
+                    // aliases and repeat projected aggregations. However it cannot
+                    // introduce a NOVEL aggregation over pre-aggregation variables
+                    // (those are consumed by the grouping step).
+                    // Collect the projected aggregation expressions for comparison.
+                    let proj_aggs: Vec<&Expr> = items.iter()
+                        .filter_map(|it| {
+                            if expr_contains_aggregation(&it.expr) { Some(&it.expr) } else { None }
+                        })
+                        .collect();
+                    for ob_item in order_by {
+                        let ob_aggs = extract_agg_calls(&ob_item.expr);
+                        for ob_agg in &ob_aggs {
+                            // Check if this ORDER BY aggregation matches any projected aggregation.
+                            let matches_projected = proj_aggs.iter().any(|pa| {
+                                let pa_aggs = extract_agg_calls(pa);
+                                pa_aggs.iter().any(|paa| expr_structural_eq(ob_agg, paa))
+                            });
+                            if !matches_projected {
+                                return Err(PlanError {
+                                    message: "SyntaxError: UndefinedVariable — ORDER BY \
+                                        aggregation references variable not available \
+                                        after WITH aggregation".into(),
+                                });
+                            }
+                        }
+                    }
                 }
                 // WITH WHERE handling:
                 // - If the WITH has aggregation (e.g. count(*) AS c), the WHERE is a
@@ -1144,6 +1172,13 @@ fn plan_pattern_onto(
     let mut new_node_vars: Vec<String> = Vec::new();
     let mut new_rel_vars: Vec<String> = Vec::new();
 
+    // Count fixed-length relationship hops — needed to decide if anonymous rels
+    // need tracking for relationship uniqueness enforcement.
+    // Only fixed-length hops participate (VarLength handles uniqueness internally).
+    let fixed_hop_count = pattern.elements.iter()
+        .filter(|e| matches!(e, PatternElement::Relationship(r) if r.length.is_none()))
+        .count();
+
     // First element must be a node.
     let first_node = match pattern.elements.first() {
         Some(PatternElement::Node(n)) => n,
@@ -1264,6 +1299,13 @@ fn plan_pattern_onto(
                 let internal = format!("_pr_{}", anon_rel_counter);
                 anon_rel_counter += 1;
                 Some(internal)
+            } else if fixed_hop_count > 1 && rel.length.is_none() {
+                // Multi-hop pattern with anonymous fixed-length rel: generate internal
+                // name so relationship uniqueness can be enforced via isomorphism filter.
+                // (Variable-length rels handle uniqueness internally via BFS.)
+                let internal = format!("_anon_rel_{}", anon_rel_counter);
+                anon_rel_counter += 1;
+                Some(internal)
             } else {
                 None
             };
@@ -1276,7 +1318,7 @@ fn plan_pattern_onto(
                 // Track as Rel kind if not already known.
                 if !var_kinds.contains_key(rv) {
                     var_kinds.insert(rv.clone(), VarKind::Rel);
-                    if rel.variable.is_some() {
+                    if rel.variable.is_some() || rv.starts_with("_anon_rel_") {
                         new_rel_vars.push(rv.clone());
                     }
                 }
@@ -1474,6 +1516,84 @@ fn expr_contains_aggregation(expr: &Expr) -> bool {
                 || branches.iter().any(|(c, t)| expr_contains_aggregation(c) || expr_contains_aggregation(t))
                 || else_.as_ref().is_some_and(|e| expr_contains_aggregation(e))
         }
+        _ => false,
+    }
+}
+
+/// Extract all top-level aggregation function call expressions from an expression tree.
+fn extract_agg_calls(expr: &Expr) -> Vec<&Expr> {
+    let mut result = Vec::new();
+    extract_agg_calls_inner(expr, &mut result);
+    result
+}
+
+fn extract_agg_calls_inner<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::FunctionCall(name, _args) if matches!(
+            name.to_lowercase().as_str(),
+            "count" | "sum" | "avg" | "min" | "max" | "collect" | "stdev" | "stdevp"
+            | "percentilecont" | "percentiledisc"
+        ) => {
+            out.push(expr);
+            // Don't recurse into args of an aggregate — we want the whole call as a unit
+        }
+        Expr::FunctionCall(_, args) => {
+            for a in args { extract_agg_calls_inner(a, out); }
+        }
+        Expr::Property(inner, _) | Expr::IsNull(inner) | Expr::IsNotNull(inner)
+        | Expr::Not(inner) | Expr::Neg(inner) | Expr::HasLabel(inner, _) => extract_agg_calls_inner(inner, out),
+        Expr::And(l, r) | Expr::Or(l, r) | Expr::Xor(l, r)
+        | Expr::Arith(l, _, r)
+        | Expr::Compare(l, _, r) | Expr::InList(l, r) | Expr::Subscript(l, r)
+        | Expr::StartsWith(l, r) | Expr::EndsWith(l, r) | Expr::Contains(l, r)
+        | Expr::Regex(l, r) => {
+            extract_agg_calls_inner(l, out);
+            extract_agg_calls_inner(r, out);
+        }
+        Expr::List(elems) => { for e in elems { extract_agg_calls_inner(e, out); } }
+        Expr::MapLiteral(pairs) => { for (_, v) in pairs { extract_agg_calls_inner(v, out); } }
+        _ => {}
+    }
+}
+
+/// Structural equality of two expressions (for comparing aggregation calls).
+fn expr_structural_eq(a: &Expr, b: &Expr) -> bool {
+    match (a, b) {
+        (Expr::Variable(v1), Expr::Variable(v2)) => v1 == v2,
+        (Expr::IntLit(l1), Expr::IntLit(l2)) => l1 == l2,
+        (Expr::FloatLit(f1), Expr::FloatLit(f2)) => f1 == f2,
+        (Expr::StringLit(s1), Expr::StringLit(s2)) => s1 == s2,
+        (Expr::BoolLit(b1), Expr::BoolLit(b2)) => b1 == b2,
+        (Expr::NullLit, Expr::NullLit) => true,
+        (Expr::Property(e1, p1), Expr::Property(e2, p2)) => p1 == p2 && expr_structural_eq(e1, e2),
+        (Expr::FunctionCall(n1, a1), Expr::FunctionCall(n2, a2)) => {
+            n1.to_lowercase() == n2.to_lowercase()
+                && a1.len() == a2.len()
+                && a1.iter().zip(a2.iter()).all(|(x, y)| expr_structural_eq(x, y))
+        }
+        (Expr::Arith(l1, op1, r1), Expr::Arith(l2, op2, r2)) => {
+            op1 == op2 && expr_structural_eq(l1, l2) && expr_structural_eq(r1, r2)
+        }
+        (Expr::Compare(l1, op1, r1), Expr::Compare(l2, op2, r2)) => {
+            op1 == op2 && expr_structural_eq(l1, l2) && expr_structural_eq(r1, r2)
+        }
+        (Expr::Not(e1), Expr::Not(e2)) | (Expr::Neg(e1), Expr::Neg(e2))
+        | (Expr::IsNull(e1), Expr::IsNull(e2)) | (Expr::IsNotNull(e1), Expr::IsNotNull(e2)) => {
+            expr_structural_eq(e1, e2)
+        }
+        (Expr::And(l1, r1), Expr::And(l2, r2))
+        | (Expr::Or(l1, r1), Expr::Or(l2, r2))
+        | (Expr::Xor(l1, r1), Expr::Xor(l2, r2)) => {
+            expr_structural_eq(l1, l2) && expr_structural_eq(r1, r2)
+        }
+        (Expr::List(e1), Expr::List(e2)) => {
+            e1.len() == e2.len() && e1.iter().zip(e2.iter()).all(|(x, y)| expr_structural_eq(x, y))
+        }
+        (Expr::Subscript(b1, i1), Expr::Subscript(b2, i2)) => {
+            expr_structural_eq(b1, b2) && expr_structural_eq(i1, i2)
+        }
+        (Expr::Star, Expr::Star) => true,
+        (Expr::Parameter(p1), Expr::Parameter(p2)) => p1 == p2,
         _ => false,
     }
 }
