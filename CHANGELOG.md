@@ -45,6 +45,11 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ### Cypher Correctness
 
+- **MERGE binds path variable on create** (Merge5 [10], 1 TCK scenario):
+  `MERGE p = (a)-[:R]->(b) RETURN p` now correctly populates `p` with the
+  freshly-created path when the pattern did not previously exist. The
+  match-path branch already populated `p`; only the create-path branch was
+  missing path materialization.
 - **WHERE expression must be boolean** (Pattern1 [11], 1 TCK scenario):
   `MATCH (n) WHERE (n) RETURN n` now raises `SyntaxError: InvalidArgumentType`
   at compile time, matching openCypher 9 semantics — a bare graph-entity
@@ -57,7 +62,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ### TCK
 
-- Pass rate: 3006 → 3019 / 3880 (77.5% → 77.8%, +13).
+- Pass rate: 3006 → 3020 / 3880 (77.5% → 77.8%, +14).
 
 ---
 

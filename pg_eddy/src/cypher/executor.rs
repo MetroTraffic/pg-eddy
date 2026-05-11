@@ -5723,9 +5723,23 @@ fn exec_merge_pattern(
             // Normalize undirected relationships to OUT (openCypher MERGE semantics).
             let mut create_pattern = pattern.clone();
             for elem in &mut create_pattern.elements {
-                if let PatternElement::Relationship(r) = elem {
-                    if r.direction == crate::cypher::ast::RelDirection::Both {
+                if let PatternElement::Relationship(r) = elem
+                    && r.direction == crate::cypher::ast::RelDirection::Both {
                         r.direction = crate::cypher::ast::RelDirection::Out;
+                    }
+            }
+            // For path binding, ensure every element has a variable so the path
+            // can be constructed from the row after create.
+            if pattern.variable.is_some() {
+                for (i, elem) in create_pattern.elements.iter_mut().enumerate() {
+                    match elem {
+                        PatternElement::Node(n) if n.variable.is_none() => {
+                            n.variable = Some(format!("_anon_merge_n{i}"));
+                        }
+                        PatternElement::Relationship(r) if r.variable.is_none() => {
+                            r.variable = Some(format!("_anon_merge_r{i}"));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -5750,6 +5764,15 @@ fn exec_merge_pattern(
                         new_row.insert(k, v);
                     }
                 }
+            }
+            // Build path value if pattern has a path variable.
+            if let Some(ref pvar) = pattern.variable {
+                let elem_vars: Vec<String> = create_pattern.elements.iter().map(|e| match e {
+                    PatternElement::Node(n) => n.variable.clone().unwrap_or_else(|| "_anon_n0".to_string()),
+                    PatternElement::Relationship(r) => r.variable.clone().unwrap_or_else(|| "_anon_r".to_string()),
+                }).collect();
+                let path_val = build_path_from_elem_vars(&elem_vars, &new_row);
+                new_row.insert(pvar.clone(), path_val);
             }
             result.push(new_row);
         } else {
