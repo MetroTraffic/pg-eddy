@@ -136,6 +136,12 @@ pub enum LogicalPlan {
         list_expr: Expr,
         body: Box<LogicalPlan>,
     },
+    /// UNION / UNION ALL: execute two plans and combine their results.
+    Union {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        all: bool, // true = UNION ALL (no dedup), false = UNION (dedup)
+    },
 }
 
 /// A plan error.
@@ -151,7 +157,55 @@ impl std::fmt::Display for PlanError {
 }
 
 /// Build a logical plan from a parsed Query pipeline.
+/// Extract the output column names from a RETURN clause in the given clauses list.
+fn return_column_names(clauses: &[QueryClause]) -> Option<Vec<String>> {
+    for clause in clauses.iter().rev() {
+        if let QueryClause::Return { items, .. } = clause {
+            let names: Vec<String> = items
+                .iter()
+                .map(|item| {
+                    if let Some(alias) = &item.alias {
+                        alias.clone()
+                    } else {
+                        match &item.expr {
+                            crate::cypher::ast::Expr::Variable(v) => v.clone(),
+                            crate::cypher::ast::Expr::Property(_, k) => k.clone(),
+                            _ => "_col".to_string(),
+                        }
+                    }
+                })
+                .collect();
+            return Some(names);
+        }
+    }
+    None
+}
+
 pub fn plan(query: &Query) -> Result<LogicalPlan, PlanError> {
+    let left = plan_single(query)?;
+    if let Some((all, right_q)) = &query.union {
+        // Validate that both sides of UNION expose the same column names.
+        let left_cols = return_column_names(&query.clauses);
+        let right_cols = return_column_names(&right_q.clauses);
+        if let (Some(lc), Some(rc)) = (left_cols, right_cols) {
+            if lc != rc {
+                return Err(PlanError {
+                    message: format!(
+                        "SyntaxError::DifferentColumnsInUnion: columns {:?} and {:?} differ",
+                        lc, rc
+                    ),
+                });
+            }
+        }
+        // Also recursively validate the right side (in case of chained UNIONs).
+        let right = plan(right_q)?;
+        Ok(LogicalPlan::Union { left: Box::new(left), right: Box::new(right), all: *all })
+    } else {
+        Ok(left)
+    }
+}
+
+fn plan_single(query: &Query) -> Result<LogicalPlan, PlanError> {
     let mut bound_vars: HashSet<String> = HashSet::new();
     let mut var_kinds: HashMap<String, VarKind> = HashMap::new();
     plan_clauses(&query.clauses, LogicalPlan::SingleRow, &mut bound_vars, &mut var_kinds)
@@ -442,6 +496,10 @@ fn plan_pattern_onto(
     let mut element_vars: Vec<String> = if is_named { vec![first_var.clone()] } else { Vec::new() };
     // Counter for anonymous rel names (used in named paths to ensure rel is stored in row).
     let mut anon_rel_counter: usize = 0;
+    // Track the current "last node variable" for src_var of each expand.
+    // When first_is_bound=true, plan starts as SingleRow but find_last_node_var would
+    // return "_none". We need to track explicitly.
+    let mut last_node_var = first_var.clone();
 
     // Process relationship+node pairs.
     let mut i = 1;
@@ -452,7 +510,7 @@ fn plan_pattern_onto(
                 _ => return Err(PlanError { message: "relationship must be followed by a node".into() }),
             };
 
-            let src_var = find_last_node_var(&plan);
+            let src_var = last_node_var.clone();
 
             // Determine rel variable name (user-provided or internal for named paths).
             let rel_var_name: Option<String> = if let Some(ref rv) = rel.variable {
@@ -525,7 +583,7 @@ fn plan_pattern_onto(
                     input: Box::new(plan),
                     src_var,
                     rel_var: if is_named { None } else { rel.variable.clone() },
-                    dst_var,
+                    dst_var: dst_var.clone(),
                     rel_types: rel.rel_types.clone(),
                     direction: rel.direction,
                     min_hops: vl.min,
@@ -539,7 +597,7 @@ fn plan_pattern_onto(
                     input: Box::new(plan),
                     src_var,
                     rel_var: rel_var_name.clone(),
-                    dst_var,
+                    dst_var: dst_var.clone(),
                     rel_types: rel.rel_types.clone(),
                     direction: rel.direction,
                     rel_props: rel.properties.clone(),
@@ -548,6 +606,7 @@ fn plan_pattern_onto(
                     optional,
                 };
             }
+            last_node_var = dst_var;
             i += 2;
         } else {
             i += 1;
@@ -565,32 +624,6 @@ fn plan_pattern_onto(
     }
 
     Ok((plan, new_node_vars, new_rel_vars))
-}
-
-/// Find the last node variable name from a plan branch.
-fn find_last_node_var(plan: &LogicalPlan) -> String {
-    match plan {
-        LogicalPlan::SingleRow => "_none".to_string(),
-        LogicalPlan::LabelScan { variable, .. } => variable.clone(),
-        LogicalPlan::Expand { dst_var, .. } => dst_var.clone(),
-        LogicalPlan::VarLengthExpand { dst_var, .. } => dst_var.clone(),
-        LogicalPlan::NamedPath { element_vars, .. } => {
-            // Last element in alternating list is always a node var.
-            element_vars.last().cloned().unwrap_or_else(|| "_none".to_string())
-        }
-        LogicalPlan::CrossProduct { right, .. } => find_last_node_var(right),
-        LogicalPlan::Filter { input, .. } => find_last_node_var(input),
-        LogicalPlan::Project { input, .. } => find_last_node_var(input),
-        LogicalPlan::Unwind { alias, .. } => alias.clone(),
-        LogicalPlan::Apply { outer, .. } => find_last_node_var(outer),
-        LogicalPlan::Empty => "_none".to_string(),
-        LogicalPlan::CreatePattern { input, .. } => find_last_node_var(input),
-        LogicalPlan::SetProp { input, .. } => find_last_node_var(input),
-        LogicalPlan::RemoveProp { input, .. } => find_last_node_var(input),
-        LogicalPlan::DeleteNodes { input, .. } => find_last_node_var(input),
-        LogicalPlan::MergePattern { input, .. } => find_last_node_var(input),
-        LogicalPlan::Foreach { input, .. } => find_last_node_var(input),
-    }
 }
 
 /// Build an isomorphism filter: for N node variables, emit
@@ -799,6 +832,12 @@ pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
             let child = explain(input, indent + 1);
             format!("{prefix}Foreach({variable} IN list)\n{child}")
         }
+        LogicalPlan::Union { left, right, all } => {
+            let l = explain(left, indent + 1);
+            let r = explain(right, indent + 1);
+            let kind = if *all { "ALL" } else { "" };
+            format!("{prefix}Union{kind}\n{l}\n{r}")
+        }
     }
 }
 
@@ -808,22 +847,63 @@ pub fn exec_pattern_inline(
     pattern: &Pattern,
     row: &crate::cypher::executor::Row,
     params: &HashMap<String, serde_json::Value>,
-) -> Result<Vec<crate::cypher::executor::Row>, PlanError> {
+) -> Result<(Vec<crate::cypher::executor::Row>, Vec<String>), PlanError> {
     use crate::cypher::executor::execute;
     let bound: HashSet<String> = row.keys().cloned().collect();
     let mut dummy_kinds: HashMap<String, VarKind> = HashMap::new();
     let (plan, _, _) = plan_pattern_onto(pattern, LogicalPlan::SingleRow, &bound, &mut dummy_kinds, false)?;
-    // Seed the plan with the current row bindings by using a cross-product seed.
-    // We pass params as-is; the row bindings are injected below.
-    let inner_rows = execute(&plan, params)
+    // Inject outer row bindings into params so pre-bound variables (like `n` in `(n)-->()`)
+    // are accessible during execution via the params lookup in exec_expand.
+    let mut inner_params = params.clone();
+    for (k, v) in row {
+        inner_params.insert(k.clone(), v.to_json());
+    }
+    let inner_rows = execute(&plan, &inner_params)
         .map_err(|e| PlanError { message: e.message })?;
-    // For each result row, merge with outer row bindings.
-    Ok(inner_rows.into_iter().map(|mut r| {
+    // For each result row, merge with outer row bindings (outer vars don't overwrite inner).
+    let merged: Vec<_> = inner_rows.into_iter().map(|mut r| {
         for (k, v) in row {
             r.entry(k.clone()).or_insert_with(|| v.clone());
         }
         r
-    }).collect())
+    }).collect();
+    // Re-derive element_vars using the same naming convention as plan_pattern_onto.
+    // is_named = pattern.variable.is_some()
+    let is_named = pattern.variable.is_some();
+    let mut element_vars: Vec<String> = Vec::new();
+    if is_named {
+        let first_node = match pattern.elements.first() {
+            Some(crate::cypher::ast::PatternElement::Node(n)) => n,
+            _ => return Ok((merged, element_vars)),
+        };
+        let first_var = first_node.variable.clone().unwrap_or_else(|| "_anon_n0".to_string());
+        element_vars.push(first_var);
+        let mut anon_rel_counter: usize = 0;
+        let mut i = 1usize;
+        while i < pattern.elements.len() {
+            if let crate::cypher::ast::PatternElement::Relationship(rel) = &pattern.elements[i] {
+                let rel_var = if let Some(ref rv) = rel.variable {
+                    rv.clone()
+                } else {
+                    let internal = format!("_pr_{}", anon_rel_counter);
+                    anon_rel_counter += 1;
+                    internal
+                };
+                element_vars.push(rel_var);
+                let next_node = match pattern.elements.get(i + 1) {
+                    Some(crate::cypher::ast::PatternElement::Node(n)) => n,
+                    _ => break,
+                };
+                let dst_var = next_node.variable.clone()
+                    .unwrap_or_else(|| format!("_anon_n{}", i + 1));
+                element_vars.push(dst_var);
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    Ok((merged, element_vars))
 }
 
 /// Execute shortestPath(pattern) — run BFS and return the shortest path as a Value::Path.

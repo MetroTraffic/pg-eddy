@@ -44,7 +44,6 @@ my $SKIP_GROUPS = do {
 # A scenario whose query contains any of these patterns is skipped.
 my @UNSUPPORTED_QUERY_PATTERNS = (
     [ qr/\bCALL\b/i,               'CALL'              ],
-    [ qr/\bUNION\b/i,              'UNION'             ],
     [ qr/\bFOREACH\b/i,            'FOREACH'           ],
     [ qr/\bexists\b\s*\(/i,        'exists()'          ],
 );
@@ -783,5 +782,5 @@ sub parse_feature {
     return @scenarios;
 }
 
-sub _subst { my ($t, $b) = @_; return $t unless defined $t; $t =~ s/<([^>]+)>/defined($b->{$1}) ? $b->{$1} : "<$1>"/ge; $t }
+sub _subst { my ($t, $b) = @_; return $t unless defined $t; $t =~ s/<(\w[\w ]*)>/defined($b->{$1}) ? $b->{$1} : "<$1>"/ge; $t }
 sub _split_row { my ($l) = @_; $l =~ s/^\s*\|\s*//; $l =~ s/\s*\|\s*$//; map { my $c=$_; $c=~s/^\s+|\s+$//g; $c } split /\s*\|\s*/, $l }

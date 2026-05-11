@@ -84,6 +84,53 @@ impl Parser {
         &self.tokens[idx].token
     }
 
+    /// Lookahead: returns true if the current position starts a pattern predicate
+    /// in expression context — i.e., `(nodePattern)-->...` where `-->`, `--`, `<--`,
+    /// `-[`, or `<-[` follow the closing `)` of the node pattern.
+    ///
+    /// Does NOT consume any tokens.
+    fn looks_like_pattern_predicate(&self) -> bool {
+        // Current token must be LParen.
+        debug_assert!(*self.peek() == Token::LParen);
+        let mut offset = 1; // skip past `(`
+
+        // Skip optional variable name (but not `name =` which would be a named path).
+        if matches!(self.peek_at(offset), Token::Ident(_)) {
+            offset += 1;
+        }
+
+        // Skip optional labels: :Label1:Label2
+        while self.peek_at(offset) == &Token::Colon {
+            offset += 1;
+            if matches!(self.peek_at(offset), Token::Ident(_)) {
+                offset += 1;
+            }
+        }
+
+        // Skip optional property map { ... } (depth-aware).
+        if self.peek_at(offset) == &Token::LBrace {
+            let mut depth = 1usize;
+            offset += 1;
+            while depth > 0 {
+                match self.peek_at(offset) {
+                    Token::LBrace => { depth += 1; offset += 1; }
+                    Token::RBrace => { depth -= 1; offset += 1; }
+                    Token::Eof => return false,
+                    _ => { offset += 1; }
+                }
+            }
+        }
+
+        // Should be at `)`
+        if self.peek_at(offset) != &Token::RParen {
+            return false;
+        }
+        offset += 1;
+
+        // After `)`, expect a relationship connector: `-`, `<`, or `<-[`.
+        matches!(self.peek_at(offset), Token::Dash | Token::LArrow)
+    }
+
     /// Parse a full query pipeline: (MATCH | OPTIONAL MATCH | UNWIND | WITH)* RETURN ...
     fn parse_query(&mut self) -> Result<Query, ParseError> {
         let mut clauses: Vec<QueryClause> = Vec::new();
@@ -375,13 +422,38 @@ impl Parser {
         }
 
         if *self.peek() != Token::Eof && *self.peek() != Token::RBrace {
+            // Check for UNION [ALL]
+            if let Token::Ident(ref kw) = self.peek().clone()
+                && kw.eq_ignore_ascii_case("UNION")
+            {
+                self.advance(); // consume UNION
+                let all = if let Token::Ident(ref kw2) = self.peek().clone()
+                    && kw2.eq_ignore_ascii_case("ALL")
+                {
+                    self.advance(); // consume ALL
+                    true
+                } else {
+                    false
+                };
+                let right = self.parse_query()?;
+                // Detect mixing UNION and UNION ALL (Union3[1,2]).
+                if let Some((right_all, _)) = &right.union {
+                    if *right_all != all {
+                        return Err(ParseError {
+                            message: "SyntaxError::InvalidClauseComposition: cannot mix UNION and UNION ALL".to_string(),
+                            offset: self.offset(),
+                        });
+                    }
+                }
+                return Ok(Query { clauses, union: Some((all, Box::new(right))) });
+            }
             return Err(ParseError {
                 message: format!("unexpected token after RETURN: {:?}", self.peek()),
                 offset: self.offset(),
             });
         }
 
-        Ok(Query { clauses })
+        Ok(Query { clauses, union: None })
     }
 
     /// Parse a WHERE clause if present.
@@ -808,6 +880,7 @@ impl Parser {
         let where_clause = self.try_parse_where()?;
         Ok(Query {
             clauses: vec![QueryClause::Match { optional: false, patterns, where_clause }],
+            union: None,
         })
     }
 
@@ -1064,16 +1137,39 @@ impl Parser {
                 Expr::Parameter(name)
             }
             Token::LParen => {
-                self.advance();
-                let inner = self.parse_expr()?;
-                self.expect(&Token::RParen)?;
-                inner
+                // Check if this looks like a pattern predicate: (node)-->() in WHERE/expr context.
+                // If so, parse as a pattern and wrap in Exists{} subquery.
+                if self.looks_like_pattern_predicate() {
+                    let pattern = self.parse_pattern()?;
+                    let where_clause = if *self.peek() == Token::Where {
+                        self.advance();
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    Expr::Exists {
+                        subquery: Box::new(Query {
+                            clauses: vec![QueryClause::Match {
+                                optional: false,
+                                patterns: vec![pattern],
+                                where_clause,
+                            }],
+                            union: None,
+                        }),
+                    }
+                } else {
+                    self.advance();
+                    let inner = self.parse_expr()?;
+                    self.expect(&Token::RParen)?;
+                    inner
+                }
             }
             Token::LBracket => {
-                // Three cases:
+                // Four cases:
                 // 1. List comprehension: [var IN list WHERE? pred? | proj?]  — Ident followed by IN
-                // 2. Pattern comprehension: [(n)-[r]->(m) | proj]  — starts with (
-                // 3. List literal: [expr, expr, ...]
+                // 2. Named pattern comprehension: [p = (n)-[r]->(m) | proj]  — Ident = ...
+                // 3. Pattern comprehension: [(n)-[r]->(m) | proj]  — starts with (
+                // 4. List literal: [expr, expr, ...]
                 self.advance();
                 if matches!(self.peek(), Token::Ident(_)) && *self.peek_at(1) == Token::In {
                     // List comprehension
@@ -1113,6 +1209,26 @@ impl Parser {
                     self.expect(&Token::RBracket)?;
                     Expr::PatternComprehension {
                         path_variable: None,
+                        pattern,
+                        predicate,
+                        projection: Box::new(projection),
+                    }
+                } else if matches!(self.peek(), Token::Ident(_)) && *self.peek_at(1) == Token::Eq {
+                    // Named pattern comprehension: [p = (n)-[r]->(m) WHERE pred | expr]
+                    // parse_pattern() will consume `p =` and handle the named path var internally.
+                    let pattern = self.parse_pattern()?;
+                    let path_var = pattern.variable.clone();
+                    let predicate = if *self.peek() == Token::Where {
+                        self.advance();
+                        Some(Box::new(self.parse_expr()?))
+                    } else {
+                        None
+                    };
+                    self.expect(&Token::Pipe)?;
+                    let projection = self.parse_expr()?;
+                    self.expect(&Token::RBracket)?;
+                    Expr::PatternComprehension {
+                        path_variable: path_var,
                         pattern,
                         predicate,
                         projection: Box::new(projection),

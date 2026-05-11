@@ -1,0 +1,2 @@
+-- pg_eddy upgrade: 0.7.0 → 0.8.0
+-- No schema changes; this release adds Cypher features in Rust only.

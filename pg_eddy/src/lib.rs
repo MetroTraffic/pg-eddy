@@ -1811,6 +1811,78 @@ mod tests {
     }
 
     #[pg_test]
+    fn test_quantifier_parse() {
+        use crate::cypher::parser::parse;
+        // Quantifier with < should parse correctly.
+        let q1 = parse("RETURN single(x IN [1,2,3] WHERE x < 7) AS r");
+        assert!(q1.is_ok(), "parse failed: {:?}", q1);
+        // CASE WHEN with < comparison.
+        let q2 = parse("WITH CASE WHEN rand() < 0.5 THEN 1 ELSE 2 END AS n RETURN n");
+        assert!(q2.is_ok(), "parse failed: {:?}", q2);
+        // List comprehension with < comparison.
+        let q3 = parse("RETURN [x IN [1,2,3,4,5] WHERE x < 4 | x] AS r");
+        assert!(q3.is_ok(), "parse failed: {:?}", q3);
+        // CASE WHEN with not and rand() > 0.5
+        let q4 = parse("WITH CASE WHEN NOT (rand() > 0.5) THEN 1 ELSE 2 END AS n RETURN n");
+        assert!(q4.is_ok(), "parse failed: {:?}", q4);
+        // Full Quantifier9[3]-like query with x < 7 predicate
+        let full = "UNWIND [{list: [2], fixed: true}, {list: [1, 2, 3, 4, 5, 6, 7, 8, 9], fixed: false}] AS input \
+            WITH CASE WHEN input.fixed THEN input.list ELSE null END AS fixedList, \
+                 CASE WHEN NOT input.fixed THEN input.list ELSE [1] END AS inputList \
+            UNWIND inputList AS x \
+            WITH fixedList, inputList, x, [ y IN inputList WHERE rand() > 0.5 | y] AS list \
+            WITH fixedList, inputList, CASE WHEN rand() < 0.5 THEN reverse(list) ELSE list END + x AS list \
+            WITH coalesce(fixedList, list) AS list \
+            WITH single(x IN list WHERE x < 7) = (size([x IN list WHERE x < 7 | x]) = 1) AS result, count(*) AS cnt \
+            RETURN result";
+        // Full Quantifier10[4]-like query (3x repetition) with x < 7 predicate
+        let full3 = "UNWIND [{list: [2], fixed: true}, {list: [1, 2, 3, 4, 5, 6, 7, 8, 9], fixed: false}] AS input \
+            WITH CASE WHEN input.fixed THEN input.list ELSE null END AS fixedList, \
+                 CASE WHEN NOT input.fixed THEN input.list ELSE [1] END AS inputList \
+            UNWIND inputList AS x \
+            WITH fixedList, inputList, x, [ y IN inputList WHERE rand() > 0.5 | y] AS list \
+            WITH fixedList, inputList, CASE WHEN rand() < 0.5 THEN reverse(list) ELSE list END + x AS list \
+            UNWIND inputList AS x \
+            WITH fixedList, inputList, x, [ y IN inputList WHERE rand() > 0.5 | y] AS list \
+            WITH fixedList, inputList, CASE WHEN rand() < 0.5 THEN reverse(list) ELSE list END + x AS list \
+            UNWIND inputList AS x \
+            WITH fixedList, inputList, x, [ y IN inputList WHERE rand() > 0.5 | y] AS list \
+            WITH fixedList, inputList, CASE WHEN rand() < 0.5 THEN reverse(list) ELSE list END + x AS list \
+            WITH coalesce(fixedList, list) AS list \
+            WITH single(x IN list WHERE x < 7) = (size([x IN list WHERE x < 7 | x]) = 1) AS result, count(*) AS cnt \
+            RETURN result";
+        // Exact Quantifier10[4] query with x < 7 predicate
+        let exact = r#"UNWIND [{list: [2], fixed: true},
+              {list: [6], fixed: true},
+              {list: [7], fixed: true},
+              {list: [1, 2, 3, 4, 5, 6, 7, 8, 9], fixed: false}] AS input
+      WITH CASE WHEN input.fixed THEN input.list ELSE null END AS fixedList,
+           CASE WHEN NOT input.fixed THEN input.list ELSE [1] END AS inputList
+      UNWIND inputList AS x
+      WITH fixedList, inputList, x, [ y IN inputList WHERE rand() > 0.5 | y] AS list
+      WITH fixedList, inputList, CASE WHEN rand() < 0.5 THEN reverse(list) ELSE list END + x AS list
+      UNWIND inputList AS x
+      WITH fixedList, inputList, x, [ y IN inputList WHERE rand() > 0.5 | y] AS list
+      WITH fixedList, inputList, CASE WHEN rand() < 0.5 THEN reverse(list) ELSE list END + x AS list
+      UNWIND inputList AS x
+      WITH fixedList, inputList, x, [ y IN inputList WHERE rand() > 0.5 | y] AS list
+      WITH fixedList, inputList, CASE WHEN rand() < 0.5 THEN reverse(list) ELSE list END + x AS list
+      WITH coalesce(fixedList, list) AS list
+      WITH single(x IN list WHERE x < 7) = (size([x IN list WHERE x < 7 | x]) = 1) AS result, count(*) AS cnt
+      RETURN result"#;
+        // Exact Quantifier10[4] from feature file (with leading spaces as in actual docstring)
+        let exact_with_spaces = "UNWIND [{list: [2], fixed: true},\n              {list: [6], fixed: true},\n              {list: [7], fixed: true},\n              {list: [1, 2, 3, 4, 5, 6, 7, 8, 9], fixed: false}] AS input\n      WITH CASE WHEN input.fixed THEN input.list ELSE null END AS fixedList,\n           CASE WHEN NOT input.fixed THEN input.list ELSE [1] END AS inputList\n      UNWIND inputList AS x\n      WITH fixedList, inputList, x, [ y IN inputList WHERE rand() > 0.5 | y] AS list\n      WITH fixedList, inputList, CASE WHEN rand() < 0.5 THEN reverse(list) ELSE list END + x AS list\n      UNWIND inputList AS x\n      WITH fixedList, inputList, x, [ y IN inputList WHERE rand() > 0.5 | y] AS list\n      WITH fixedList, inputList, CASE WHEN rand() < 0.5 THEN reverse(list) ELSE list END + x AS list\n      UNWIND inputList AS x\n      WITH fixedList, inputList, x, [ y IN inputList WHERE rand() > 0.5 | y] AS list\n      WITH fixedList, inputList, CASE WHEN rand() < 0.5 THEN reverse(list) ELSE list END + x AS list\n      WITH coalesce(fixedList, list) AS list\n      WITH single(x IN list WHERE x = 2) = (size([x IN list WHERE x = 2 | x]) = 1) AS result, count(*) AS cnt\n      RETURN result";
+        // Check length and character at 1065
+        let len = exact_with_spaces.len();
+        let char_at_1065 = if len > 1065 { exact_with_spaces.as_bytes()[1065] as char } else { '?' };
+        let context_start = 1065usize.saturating_sub(30);
+        let context_end = (1065 + 30).min(len);
+        let context = if len > 1065 { &exact_with_spaces[context_start..context_end] } else { "BEYOND_END" };
+        let q7 = parse(exact_with_spaces);
+        assert!(q7.is_ok(), "exact_with_spaces parse failed: {:?}, len={}, char@1065='{}', context: {:?}", q7, len, char_at_1065, context);
+    }
+
+    #[pg_test]
     fn test_cypher_create_node() {
         // Create a node via Cypher and verify it exists.
         Spi::run("SELECT * FROM cypher('CREATE (:CypherTestPerson {name: ''Alice''})', NULL::jsonb)").unwrap();

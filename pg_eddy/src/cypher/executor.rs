@@ -928,8 +928,65 @@ fn json_to_value(v: &serde_json::Value) -> Value {
             }
         }
         serde_json::Value::String(s) => Value::Str(s.clone()),
-        _ => Value::Json(v.clone()),
+        serde_json::Value::Object(m) => {
+            // Detect serialized Node: {"node_id": i64, "labels": [...], "properties": {...}}
+            if let (Some(serde_json::Value::Number(nid)), Some(serde_json::Value::Array(lbls)), Some(serde_json::Value::Object(props)))
+                = (m.get("node_id"), m.get("labels"), m.get("properties"))
+                && let Some(node_id) = nid.as_i64()
+            {
+                let labels = lbls.iter().filter_map(|l| l.as_str().map(|s| s.to_string())).collect();
+                return Value::Node { node_id, labels, properties: props.clone() };
+            }
+            // Detect serialized Edge: {"rel_id": i64, "rel_type": str, "source_node_id": i64, "target_node_id": i64, "properties": {...}}
+            if let (Some(serde_json::Value::Number(eid)), Some(serde_json::Value::String(rtype)),
+                    Some(serde_json::Value::Number(src)), Some(serde_json::Value::Number(tgt)),
+                    Some(serde_json::Value::Object(props)))
+                = (m.get("rel_id"), m.get("rel_type"), m.get("source_node_id"), m.get("target_node_id"), m.get("properties"))
+                && let (Some(edge_id), Some(source), Some(target)) = (eid.as_i64(), src.as_i64(), tgt.as_i64())
+            {
+                return Value::Edge { edge_id, rel_type: rtype.clone(), source, target, properties: props.clone() };
+            }
+            Value::Json(v.clone())
+        }
+        serde_json::Value::Array(arr) => {
+            // Detect serialized Path: alternating node/edge JSON objects
+            // A path serialized by Value::Path.to_json() is an array like [node_json, edge_json, node_json, ...]
+            // where node_json has node_id key and edge_json has rel_id key.
+            if !arr.is_empty() && is_path_array(arr) {
+                let mut nodes = Vec::new();
+                let mut rels = Vec::new();
+                for (i, item) in arr.iter().enumerate() {
+                    let val = json_to_value(item);
+                    if i % 2 == 0 {
+                        nodes.push(val);
+                    } else {
+                        rels.push(val);
+                    }
+                }
+                return Value::Path { nodes, rels };
+            }
+            Value::Json(v.clone())
+        }
     }
+}
+
+/// Returns true if a JSON array looks like a serialized path (alternating node/edge objects).
+fn is_path_array(arr: &[serde_json::Value]) -> bool {
+    if arr.is_empty() { return false; }
+    for (i, item) in arr.iter().enumerate() {
+        if let serde_json::Value::Object(m) = item {
+            if i % 2 == 0 {
+                // Even index → should be a node
+                if !m.contains_key("node_id") { return false; }
+            } else {
+                // Odd index → should be an edge
+                if !m.contains_key("rel_id") { return false; }
+            }
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 /// Execute error.
@@ -1018,6 +1075,20 @@ pub fn execute(
         }
         LogicalPlan::Foreach { input, variable, list_expr, body } => {
             exec_foreach(input, variable, list_expr, body, params)
+        }
+        LogicalPlan::Union { left, right, all } => {
+            let mut left_rows = execute(left, params)?;
+            let right_rows = execute(right, params)?;
+            left_rows.extend(right_rows);
+            if !all {
+                // Deduplicate: keep first occurrence of each fingerprint.
+                let mut seen = std::collections::HashSet::new();
+                left_rows.retain(|row| {
+                    let fp = row_fingerprint(row);
+                    seen.insert(fp)
+                });
+            }
+            Ok(left_rows)
         }
     }
 }
@@ -1180,9 +1251,15 @@ fn exec_expand(
     let dst_label_ids: Vec<i32> = dst_labels.iter().filter_map(|l| label_id_by_name(l)).collect();
 
     for input_row in &input_rows {
-        let src_val = input_row.get(src_var).ok_or_else(|| ExecError {
-            message: format!("unbound variable: {src_var}"),
-        })?;
+        // Look up the source variable in the row, or fall back to params (for correlated subqueries
+        // where outer row bindings are passed through params by exec_pattern_inline).
+        let src_val = if let Some(v) = input_row.get(src_var) {
+            v.clone()
+        } else if let Some(pv) = params.get(src_var) {
+            json_to_value(pv)
+        } else {
+            return Err(ExecError { message: format!("unbound variable: {src_var}") });
+        };
 
         // If src is NULL (propagated from upstream optional expand), emit a null row.
         if matches!(src_val, Value::Null) {
@@ -1325,7 +1402,19 @@ fn exec_expand(
                 }
             }
 
+            // Self-loop / variable reuse check: if dst_var is already bound in the input row
+            // (same variable appears on both ends of the pattern), only keep rows where the
+            // found destination matches the existing binding.
+            if let Some(existing_dst) = input_row.get(dst_var)
+                && !matches!(existing_dst, Value::Null)
+                && existing_dst.node_id() != dst_val.node_id()
+            {
+                continue;
+            }
+
             let mut row = input_row.clone();
+            // Ensure src_var is in the row (may have come from params fallback for correlated patterns).
+            row.entry(src_var.to_string()).or_insert_with(|| src_val.clone());
             row.insert(dst_var.to_string(), dst_val);
             if let Some(rv) = rel_var {
                 row.insert(rv.to_string(), edge_val);
@@ -1408,6 +1497,22 @@ fn exec_cross_product(
     }
 
     Ok(result)
+}
+
+/// Build a Value::Path from element variable names already bound in the row.
+/// `elem_vars` alternates [node_var, rel_var, node_var, rel_var, ..., node_var].
+fn build_path_from_elem_vars(elem_vars: &[String], row: &Row) -> Value {
+    let mut nodes: Vec<Value> = Vec::new();
+    let mut rels: Vec<Value> = Vec::new();
+    for (i, var) in elem_vars.iter().enumerate() {
+        let val = row.get(var).cloned().unwrap_or(Value::Null);
+        if i % 2 == 0 {
+            nodes.push(val);
+        } else {
+            rels.push(val);
+        }
+    }
+    Value::Path { nodes, rels }
 }
 
 /// Build a Value::Path from lists of node IDs and edge IDs (for var-length named paths).
@@ -1525,17 +1630,19 @@ fn exec_var_length_expand(
     };
 
     for input_row in &input_rows {
-        let src_val = match input_row.get(src_var) {
-            Some(v) => v.clone(),
-            None => {
-                if optional {
-                    let mut r = input_row.clone();
-                    r.insert(dst_var.to_string(), Value::Null);
-                    if let Some(rv) = rel_var { r.insert(rv.to_string(), Value::Null); }
-                    result.push(r);
-                }
-                continue;
+        let src_val = if let Some(v) = input_row.get(src_var) {
+            v.clone()
+        } else if let Some(pv) = params.get(src_var) {
+            // Fallback to params for correlated subqueries (exec_pattern_inline injects outer row).
+            json_to_value(pv)
+        } else {
+            if optional {
+                let mut r = input_row.clone();
+                r.insert(dst_var.to_string(), Value::Null);
+                if let Some(rv) = rel_var { r.insert(rv.to_string(), Value::Null); }
+                result.push(r);
             }
+            continue;
         };
 
         let start_id = match &src_val {
@@ -1555,6 +1662,15 @@ fn exec_var_length_expand(
         // BFS: (node_id, depth, visited_edge_ids, path_node_ids, path_edge_ids)
         // path_node_ids/path_edge_ids are only populated when path_carry_var is set.
         let max_depth = max_hops.unwrap_or(u32::MAX).min(256); // safety cap
+
+        // If dst_var is already bound in the input row or in params (correlated pattern),
+        // filter BFS results to only paths ending at that node.
+        let expected_dst_id: Option<i64> = {
+            let bound_dst = input_row.get(dst_var)
+                .map(|v| v.clone())
+                .or_else(|| params.get(dst_var).map(json_to_value));
+            if let Some(Value::Node { node_id, .. }) = bound_dst { Some(node_id) } else { None }
+        };
 
         struct BfsEntry {
             node_id: i64,
@@ -1602,22 +1718,54 @@ fn exec_var_length_expand(
                             labels: dst_labels,
                             properties: dst_props,
                         };
-                        let mut row = input_row.clone();
-                        row.insert(dst_var.to_string(), dst_val);
-                        if let Some(rv) = rel_var {
-                            row.insert(rv.to_string(), Value::Null);
+                        // If dst_var is bound in the outer scope, only emit rows that match.
+                        if let Some(eid) = expected_dst_id {
+                            if entry.node_id != eid {
+                                // Continue BFS but don't emit this path.
+                                // Don't set found_any here — just keep exploring.
+                                // (We still enqueue children below.)
+                                // We DO need to push to the BFS queue, so use a flag approach.
+                                // Actually: just skip emitting and keep going (the enqueue is below).
+                                // For found_any tracking: skip.
+                            } else {
+                                let mut row = input_row.clone();
+                                // Store src node so NamedPath can find it.
+                                row.entry(src_var.to_string()).or_insert_with(|| src_val.clone());
+                                row.insert(dst_var.to_string(), dst_val);
+                                if let Some(rv) = rel_var {
+                                    row.insert(rv.to_string(), Value::Null);
+                                }
+                                if let Some(pcv) = path_carry_var {
+                                    let path_val = build_path_from_ids(
+                                        &entry.path_node_ids,
+                                        &entry.path_edge_ids,
+                                        direction,
+                                    );
+                                    row.insert(pcv.to_string(), path_val);
+                                }
+                                result.push(row);
+                                found_any = true;
+                            }
+                        } else {
+                            let mut row = input_row.clone();
+                            // Store src node so NamedPath can find it.
+                            row.entry(src_var.to_string()).or_insert_with(|| src_val.clone());
+                            row.insert(dst_var.to_string(), dst_val);
+                            if let Some(rv) = rel_var {
+                                row.insert(rv.to_string(), Value::Null);
+                            }
+                            // Build and store the full path if path_carry_var is set.
+                            if let Some(pcv) = path_carry_var {
+                                let path_val = build_path_from_ids(
+                                    &entry.path_node_ids,
+                                    &entry.path_edge_ids,
+                                    direction,
+                                );
+                                row.insert(pcv.to_string(), path_val);
+                            }
+                            result.push(row);
+                            found_any = true;
                         }
-                        // Build and store the full path if path_carry_var is set.
-                        if let Some(pcv) = path_carry_var {
-                            let path_val = build_path_from_ids(
-                                &entry.path_node_ids,
-                                &entry.path_edge_ids,
-                                direction,
-                            );
-                            row.insert(pcv.to_string(), path_val);
-                        }
-                        result.push(row);
-                        found_any = true;
                     }
                 }
             }
@@ -2665,15 +2813,20 @@ pub fn eval_expr(
             let arr = match &list {
                 Value::Json(serde_json::Value::Array(a)) => a.clone(),
                 Value::Null => return Ok(Value::Null),
-                _ => return Ok(Value::Bool(false)),
+                // Per openCypher spec, IN on a non-list type raises SyntaxError.
+                _ => return Err(ExecError {
+                    message: "SyntaxError: InvalidArgumentType: \
+                              IN operator requires a list on the right-hand side".into(),
+                }),
             };
             let mut has_null = false;
             for item in &arr {
                 let item_val = json_to_value(item);
-                if matches!(item_val, Value::Null) {
-                    has_null = true;
-                } else if values_equal(&val, &item_val) {
-                    return Ok(Value::Bool(true));
+                // Use ternary comparison: None means the comparison is uncertain (null-related).
+                match compare_values(&val, &CmpOp::Eq, &item_val) {
+                    Some(true) => return Ok(Value::Bool(true)),
+                    None => has_null = true,
+                    Some(false) => {}
                 }
             }
             if has_null { Ok(Value::Null) } else { Ok(Value::Bool(false)) }
@@ -2845,7 +2998,17 @@ pub fn eval_expr(
             let arr = match &list_val {
                 Value::Json(serde_json::Value::Array(a)) => a,
                 Value::Null => return Ok(Value::Null),
-                _ => return Ok(Value::Null),
+                // Non-list, non-map: raise TypeError for integer index.
+                _ => {
+                    // Only raise an error for integer (not null) index.
+                    if matches!(idx_val, Value::Null) {
+                        return Ok(Value::Null);
+                    }
+                    return Err(ExecError {
+                        message: "TypeError: InvalidArgumentType: \
+                                  element access requires a list".into(),
+                    });
+                }
             };
             let idx = match idx_val {
                 Value::Int(i) => i,
@@ -2899,11 +3062,11 @@ pub fn eval_expr(
                 Err(e) => Err(ExecError { message: e.message }),
             }
         }
-        Expr::PatternComprehension { path_variable: _, pattern, predicate, projection } => {
+        Expr::PatternComprehension { path_variable, pattern, predicate, projection } => {
             // Execute the pattern as an inline plan, then project each row.
             use crate::cypher::planner;
             let rows_result = planner::exec_pattern_inline(pattern, row, params);
-            let inner_rows = match rows_result {
+            let (inner_rows, element_vars) = match rows_result {
                 Ok(r) => r,
                 Err(e) => return Err(ExecError { message: e.message }),
             };
@@ -2912,6 +3075,29 @@ pub fn eval_expr(
                 // Merge outer row bindings (inner vars take precedence).
                 for (k, v) in row {
                     inner_row.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+                // If there is a path variable, build the path from the pattern's element vars
+                // (using the element_vars list returned by exec_pattern_inline which matches
+                // plan_pattern_onto naming conventions exactly).
+                // For var-length patterns, if NamedPath already built the path correctly,
+                // use that. Otherwise build from element_vars (fixed-hop case).
+                if let Some(pv_name) = path_variable {
+                    if !inner_row.contains_key(pv_name.as_str()) || element_vars.is_empty() {
+                        let path_val = build_path_from_elem_vars(&element_vars, &inner_row);
+                        inner_row.insert(pv_name.clone(), path_val);
+                    }
+                    // If already set (NamedPath did it), verify it's a valid path (not corrupted by
+                    // var-length relay). The NamedPath path is preferred when element_vars contains
+                    // a var-length sub-path carry var (Value::Path in a rel slot).
+                    // Check: if any rel-slot element_var holds a Value::Path, the NamedPath result
+                    // is correct; if not (all are Value::Edge), rebuild for accuracy.
+                    let has_subpath = element_vars.iter().enumerate().any(|(i, v)| {
+                        i % 2 == 1 && matches!(inner_row.get(v), Some(Value::Path { .. }))
+                    });
+                    if !has_subpath && !element_vars.is_empty() {
+                        let path_val = build_path_from_elem_vars(&element_vars, &inner_row);
+                        inner_row.insert(pv_name.clone(), path_val);
+                    }
                 }
                 // Apply WHERE predicate if present.
                 if let Some(pred) = predicate {
@@ -4178,11 +4364,22 @@ fn create_pattern_in_row(
     use crate::storage::{prop_store, node_store, edge_store};
 
     let mut last_node_id: Option<i64> = None;
+    // Track whether the Relationship arm pre-created the destination node (anonymous or named).
+    // When true, the next Node arm should skip creating a new node and use last_node_id.
+    let mut node_was_precreated = false;
 
     for (i, elem) in pattern.elements.iter().enumerate() {
         match elem {
             PatternElement::Node(n) => {
                 let var = n.variable.as_deref();
+
+                // If this node was pre-created by the preceding Relationship arm, skip it.
+                if node_was_precreated && i > 0 {
+                    node_was_precreated = false;
+                    // last_node_id is already set to the pre-created node's ID.
+                    continue;
+                }
+                node_was_precreated = false;
 
                 // If the node has a variable and it's already bound, reuse it.
                 if let Some(v) = var
@@ -4282,8 +4479,9 @@ fn create_pattern_in_row(
                                 if let Some(v) = var {
                                     row.insert(v.to_string(), node_val);
                                 }
-                                // Track this as the last node so the next iteration skips it.
+                                // Mark next node element as pre-created so it doesn't create again.
                                 last_node_id = Some(nid);
+                                node_was_precreated = true;
                                 nid
                             }
                         } else {
@@ -4307,7 +4505,9 @@ fn create_pattern_in_row(
                             for lid in &label_ids {
                                 buf.label_index.push((*lid, nid));
                             }
+                            // Mark next node element as pre-created so it doesn't create again.
                             last_node_id = Some(nid);
+                            node_was_precreated = true;
                             nid
                         }
                     }
@@ -4738,7 +4938,7 @@ fn exec_merge_pattern(
         patterns: vec![pattern.clone()],
         where_clause: None,
     };
-    let match_query = crate::cypher::ast::Query { clauses: vec![match_clause] };
+    let match_query = crate::cypher::ast::Query { clauses: vec![match_clause], union: None };
     let match_plan = plan(&match_query).map_err(|e| ExecError { message: e.message })?;
 
     for outer_row in input_rows {

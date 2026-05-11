@@ -16,6 +16,9 @@ pub struct OrderItem {
 #[derive(Debug, Clone)]
 pub struct Query {
     pub clauses: Vec<QueryClause>,
+    /// UNION or UNION ALL with the right-hand query.
+    /// `bool` = true → UNION ALL (no deduplication), false → UNION (deduplicate).
+    pub union: Option<(bool, Box<Query>)>,
 }
 
 /// A single clause in the query pipeline.

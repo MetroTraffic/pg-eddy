@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.18.0](#0180----quantifiers-pattern-comprehension-and-union) — Quantifiers, Pattern Comprehension, and UNION
 - [0.17.0](#0170----error-validation--named-paths) — Error Validation + Named Paths
 - [0.16.0](#0160----map-literal-expressions) — Map Literal Expressions
 - [0.15.0](#0150----storage-correctness-and-error-validation) — Storage Correctness and Error Validation
@@ -25,6 +26,72 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 - [0.3.0](#030--2026-05-09--edge-storage--adjacency-lists) — Edge Storage + Adjacency Lists
 - [0.2.0](#020--2026-05-09--node-storage) — Node Storage
 - [0.1.0](#010--2026-05-09--am-skeleton) — AM Skeleton
+
+---
+
+## [0.18.0] — Quantifiers, Pattern Comprehension, and UNION
+
+v0.18.0 adds quantifier functions (`any`, `none`, `all`, `single`), named
+pattern comprehension, inline pattern predicates in WHERE, `UNION` / `UNION ALL`,
+and a range of correctness fixes. TCK pass rate rises from 2260/3880 (58.2%)
+to **2391/3880 (61.6%)** — +131 scenarios.
+
+### What's New
+
+**Quantifier functions** — `any(x IN list WHERE pred)`, `none(x IN list WHERE
+pred)`, `all(x IN list WHERE pred)`, `single(x IN list WHERE pred)` are all
+implemented with correct three-valued null logic (null propagation per
+openCypher spec). Covers Quantifier1, 9, 11, 12 scenarios.
+
+**Named pattern comprehension** — `[p = (n)-->(m) | p]` now works. The parser
+detects the `ident =` prefix before the pattern, captures the path variable,
+and stores it in `PatternComprehension { path_variable: Some("p"), ... }`. The
+executor calls `exec_pattern_inline` which builds and executes a plan with a
+`NamedPath` wrapper, then stores the path in the path variable slot. Covers
+Pattern2 scenarios.
+
+**Inline pattern predicates** — `WHERE (a)-->(b)` (a pattern used as a
+boolean test) is now supported. The parser uses `looks_like_pattern_predicate()`
+to distinguish pattern predicates from expression predicates. Covers Pattern1
+scenarios.
+
+**UNION / UNION ALL** — the AST has `Query { union: Option<(bool, Box<Query>)>
+}`. The parser handles chained `A UNION B UNION C` right-recursively, detecting
+mismatches between `UNION` and `UNION ALL` at parse time
+(`SyntaxError::InvalidClauseComposition`). The planner validates column name
+parity (`SyntaxError::DifferentColumnsInUnion`). The executor concatenates
+result sets and deduplicates for plain `UNION`. Covers Union1/2/3 scenarios.
+
+**Correlated pattern comprehension** — variables from the outer MATCH row are
+injected into `inner_params` in `exec_pattern_inline`, so `(n)-->()` where `n`
+is from an outer MATCH correctly uses the outer binding rather than scanning all
+nodes. The `exec_expand` and `exec_var_length_expand` functions have a params
+fallback for `src_var` / `dst_var` lookup that enables this.
+
+**`IN` null semantics** — `x IN [null, 1, 2]` where x is null now correctly
+propagates null (ternary logic), instead of returning false. The `InList`
+evaluator was updated to use `compare_values()` with three-valued logic.
+
+**`MATCH (a)-[*]->(b)` with both ends bound** — `exec_var_length_expand` now
+reads `expected_dst_id` from both `input_row` and `params`, enabling correct
+BFS filtering when the destination variable is provided via the outer correlated
+context.
+
+**CREATE double-node fix** — when creating `(a)-[:T]->(:C)`, the anonymous
+destination node is pre-created in the Relationship arm and the `node_was_precreated`
+flag prevents the Node arm from creating a second copy.
+
+**MATCH (a),(b) cross-product via LabelScan** — the planner correctly emits
+a `CrossProduct` of two separate `LabelScan` plans when the first variable in a
+pattern is already bound in the outer scope, avoiding the `_none` source
+variable bug that caused `find_last_node_var(SingleRow)` to return `"_none"`.
+
+### TCK Result
+
+| Release | Pass  | Total | %     | Delta |
+|---------|-------|-------|-------|-------|
+| v0.17.0 | 2260  | 3880  | 58.2% | baseline |
+| v0.18.0 | **2391** | 3880 | **61.6%** | **+131** |
 
 ---
 

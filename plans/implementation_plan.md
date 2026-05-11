@@ -1696,34 +1696,34 @@ Match6 named-path scenarios pass; `shortestPath` returns correct result.
 **v0.18.0 — Quantifiers, Pattern Predicates, List Operations, UNION**:
 
 **Quantifiers** (~50 scenarios: Quantifier9/11/12):
-- [ ] `ANY(x IN list WHERE predicate)` → true if any element satisfies predicate
-- [ ] `NONE(x IN list WHERE predicate)` → true if no element satisfies
-- [ ] `ALL(x IN list WHERE predicate)` → true if all elements satisfy
-- [ ] `SINGLE(x IN list WHERE predicate)` → true if exactly one element satisfies
-- [ ] Quantifiers over relationship lists in path expressions
+- [x] `ANY(x IN list WHERE predicate)` → true if any element satisfies predicate
+- [x] `NONE(x IN list WHERE predicate)` → true if no element satisfies
+- [x] `ALL(x IN list WHERE predicate)` → true if all elements satisfy
+- [x] `SINGLE(x IN list WHERE predicate)` → true if exactly one element satisfies
+- [x] Quantifiers over relationship lists in path expressions
 
 **Pattern predicates and comprehension** (~33 scenarios: Pattern1/2):
-- [ ] `(a)-->(b)` as a boolean expression in WHERE (pattern predicate)
-- [ ] `[(a)-->(b) | b.name]` pattern comprehension → list of values
-- [ ] `[(a)-[r]->(b) WHERE predicate | expr]` with filter
+- [x] `(a)-->(b)` as a boolean expression in WHERE (pattern predicate)
+- [x] `[(a)-->(b) | b.name]` pattern comprehension → list of values
+- [x] `[(a)-[r]->(b) WHERE predicate | expr]` with filter
 
 **List operations** (~28 scenarios: List1/5):
-- [ ] List slice: `list[1..3]`, `list[..2]`, `list[1..]`
-- [ ] Negative indices: `list[-1]` → last element
-- [ ] `x IN list` edge cases: null semantics, empty list, nested lists
+- [x] List slice: `list[1..3]`, `list[..2]`, `list[1..]`
+- [x] Negative indices: `list[-1]` → last element
+- [x] `x IN list` edge cases: null semantics, empty list, nested lists
 
 **COUNT {} subquery** (~7 scenarios: CountingSubgraphMatches1):
-- [ ] `COUNT { MATCH (a)-->(b) }` as an expression in RETURN/WHERE
+- [x] `COUNT { MATCH (a)-->(b) }` as an expression in RETURN/WHERE
 
 **UNION / UNION ALL** (~12 skipped):
-- [ ] `MATCH ... RETURN ... UNION MATCH ... RETURN ...` — combine result sets
-- [ ] `UNION ALL` — no deduplication
-- [ ] Column name matching validation
+- [x] `MATCH ... RETURN ... UNION MATCH ... RETURN ...` — combine result sets
+- [x] `UNION ALL` — no deduplication
+- [x] Column name matching validation
 
-**Target**: TCK ≥ 74% (+~130 scenarios).
+**Target**: TCK ≥ 74% (+~130 scenarios). **Achieved: 61.6% (2391/3880) +131 scenarios.**
 
 **Exit criteria**: Quantifier9/11/12 pass; Pattern1/2 pass; List1/5 pass;
-UNION works for basic cases.
+UNION works for basic cases. ✅
 
 ---
 
