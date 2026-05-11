@@ -1315,10 +1315,24 @@ fn plan_pattern_onto(
                 } else {
                     None
                 };
+                // If the relationship has inline property predicates, we need a
+                // rel list variable so we can apply an `all(r IN rels WHERE …)`
+                // filter post-BFS. Synthesize one if the pattern does not name
+                // the relationship explicitly.
+                let synth_rel_var = if !rel.properties.is_empty() && rel.variable.is_none() && !is_named {
+                    Some(format!("_anon_vrel_{}", i))
+                } else {
+                    None
+                };
+                let effective_rel_var = if is_named {
+                    None
+                } else {
+                    rel.variable.clone().or_else(|| synth_rel_var.clone())
+                };
                 plan = LogicalPlan::VarLengthExpand {
                     input: Box::new(plan),
                     src_var,
-                    rel_var: if is_named { None } else { rel.variable.clone() },
+                    rel_var: effective_rel_var.clone(),
                     dst_var: dst_var.clone(),
                     rel_types: rel.rel_types.clone(),
                     direction: rel.direction,
@@ -1327,6 +1341,38 @@ fn plan_pattern_onto(
                     optional,
                     path_carry_var: path_carry,
                 };
+                // Apply relationship property predicates: each edge in the path
+                // must satisfy the inline property map. Emit as
+                // `all(_r IN rel_var WHERE _r.key = value AND ...)`.
+                if !rel.properties.is_empty()
+                    && let Some(rv) = effective_rel_var.as_ref()
+                {
+                    let iter_var = format!("_r_{}", i);
+                    let mut pred: Option<Expr> = None;
+                    for (key, val_expr) in &rel.properties {
+                        let cmp = Expr::Compare(
+                            Box::new(Expr::Property(
+                                Box::new(Expr::Variable(iter_var.clone())),
+                                key.clone(),
+                            )),
+                            CmpOp::Eq,
+                            Box::new(val_expr.clone()),
+                        );
+                        pred = Some(match pred {
+                            Some(p) => Expr::And(Box::new(p), Box::new(cmp)),
+                            None => cmp,
+                        });
+                    }
+                    if let Some(predicate) = pred {
+                        let all_expr = Expr::ListPredicate {
+                            kind: crate::cypher::ast::ListPredicateKind::All,
+                            variable: iter_var,
+                            list_expr: Box::new(Expr::Variable(rv.clone())),
+                            predicate: Box::new(predicate),
+                        };
+                        plan = LogicalPlan::Filter { input: Box::new(plan), predicate: all_expr };
+                    }
+                }
                 // Var-length expand does not apply dst node label/property predicates.
                 // Emit explicit filter expressions on the bound destination so they
                 // are enforced post-traversal.
