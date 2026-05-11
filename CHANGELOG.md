@@ -45,6 +45,10 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ### Cypher Correctness
 
+- **WHERE expression must be boolean** (Pattern1 [11], 1 TCK scenario):
+  `MATCH (n) WHERE (n) RETURN n` now raises `SyntaxError: InvalidArgumentType`
+  at compile time, matching openCypher 9 semantics — a bare graph-entity
+  variable is not a boolean predicate.
 - **Quantifier type-mismatch detection** (Quantifier1–4 [15], 12 TCK scenarios):
   When the list argument of `any/all/none/single` is a homogeneous literal list
   of strings or booleans, and the predicate applies arithmetic to the iteration
@@ -53,7 +57,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ### TCK
 
-- Pass rate: 3006 → 3018 / 3880 (77.5% → 77.8%, +12).
+- Pass rate: 3006 → 3019 / 3880 (77.5% → 77.8%, +13).
 
 ---
 

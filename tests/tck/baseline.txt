@@ -1,4 +1,4 @@
 # TCK regression floor — minimum pass count that must be maintained.
 # Increment this file when a release improves the pass rate; never decrement.
 # See plans/rs-polygraph-analysis.md §4.3 for rationale.
-3018
+3019

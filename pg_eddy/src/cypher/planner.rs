@@ -1110,6 +1110,7 @@ fn plan_match_clause(
             });
         }
         check_path_property_access(wc, var_kinds)?;
+        check_where_is_boolean(wc, var_kinds)?;
     }
 
     // Relationship isomorphism: different relationship variables in the same MATCH clause
@@ -1852,6 +1853,28 @@ fn predicate_arith_on_var(expr: &Expr, var: &str) -> bool {
 
 fn is_var_ref(expr: &Expr, var: &str) -> bool {
     matches!(expr, Expr::Variable(v) if v == var)
+}
+
+/// Reject a WHERE expression that is statically known to evaluate to a graph
+/// entity (Node, Relationship, Path) rather than a boolean. Currently fires
+/// when the top-level expression is a bare `Variable` reference to such a
+/// binding — e.g., `MATCH (n) WHERE (n) RETURN n` (Pattern1 [11]).
+fn check_where_is_boolean(
+    expr: &Expr,
+    var_kinds: &HashMap<String, VarKind>,
+) -> Result<(), PlanError> {
+    if let Expr::Variable(name) = expr
+        && let Some(kind) = var_kinds.get(name)
+        && matches!(kind, VarKind::Node | VarKind::Rel | VarKind::Path)
+    {
+        return Err(PlanError {
+            message: format!(
+                "SyntaxError: InvalidArgumentType — \
+                 WHERE expression '{name}' refers to a graph entity, not a boolean"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Null-safe: `r1 IS NULL OR r2 IS NULL OR id(r1) != id(r2)`.
