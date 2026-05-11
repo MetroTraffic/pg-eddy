@@ -448,14 +448,16 @@ sub compare_results {
 
 sub match_row {
     my ($exp_cells, $actual, $hdrs) = @_;
-    # Build a case-insensitive, space-normalized lookup of actual keys.
+    # Build a case-insensitive, space-and-paren-normalized lookup of actual keys.
     my %norm_actual;
     for my $k (keys %$actual) {
         (my $nk = lc($k)) =~ s/\s+//g;
+        $nk =~ s/[()]//g;  # strip parens: (list[1]).prop == list[1].prop
         $norm_actual{$nk} = $actual->{$k};
     }
     for my $i (0..$#$hdrs) {
         (my $norm_hdr = lc($hdrs->[$i])) =~ s/\s+//g;
+        $norm_hdr =~ s/[()]//g;  # strip parens for matching
         my $act_val = exists $actual->{$hdrs->[$i]} ? $actual->{$hdrs->[$i]} : $norm_actual{$norm_hdr};
         my $err = cell_match($exp_cells->[$i] // '', $act_val);
         return "col '$hdrs->[$i]': $err" if $err;
@@ -564,7 +566,11 @@ sub node_display_matches {
     push @exp_labels, $1 while $inner =~ s/^:(\w+)//;
     $inner =~ s/^\s+//;
     my %al = map { $_ => 1 } @{$actual->{labels}};
+    # All expected labels must be present.
     for my $l (@exp_labels) { return 0 unless $al{$l}; }
+    # When labels are explicitly specified, the count must match exactly
+    # (otherwise (:A:B) would greedily match (:A:B:C) nodes).
+    return 0 if @exp_labels && scalar(@exp_labels) != scalar(@{$actual->{labels}});
     if ($inner =~ /^\{(.+)\}$/) {
         my %ep = parse_prop_display($1);
         my $ap = $actual->{properties} // {};

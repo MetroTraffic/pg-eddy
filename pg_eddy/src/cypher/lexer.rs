@@ -48,6 +48,9 @@ pub enum Token {
     Ident(String),
     StringLit(String),
     IntLit(i64),
+    /// Integer literal that is exactly 9223372036854775808 (i64::MIN negated).
+    /// Only valid when preceded by a unary minus, yielding i64::MIN.
+    IntLitBig,
     FloatLit(f64),
     Parameter(String), // $paramName
 
@@ -172,6 +175,30 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
                         b'\\' => s.push('\\'),
                         b'\'' => s.push('\''),
                         b'"' => s.push('"'),
+                        b'/' => s.push('/'),
+                        b'b' => s.push('\x08'),
+                        b'f' => s.push('\x0C'),
+                        b'u' => {
+                            // Unicode escape: \uXXXX (4 hex digits required)
+                            pos += 1;
+                            if pos + 4 > len {
+                                return Err(LexError {
+                                    message: "SyntaxError: InvalidUnicodeLiteral — \\u escape requires 4 hex digits".into(),
+                                    offset: start,
+                                });
+                            }
+                            let hex_str = std::str::from_utf8(&bytes[pos..pos+4]).unwrap_or("");
+                            let codepoint = u32::from_str_radix(hex_str, 16).map_err(|_| LexError {
+                                message: "SyntaxError: InvalidUnicodeLiteral — invalid hex digits in \\u escape".into(),
+                                offset: start,
+                            })?;
+                            let ch = char::from_u32(codepoint).ok_or_else(|| LexError {
+                                message: "SyntaxError: InvalidUnicodeLiteral — invalid Unicode codepoint".into(),
+                                offset: start,
+                            })?;
+                            s.push(ch);
+                            pos += 3; // +1 will be added below
+                        }
                         _ => {
                             s.push('\\');
                             s.push(bytes[pos] as char);
@@ -200,6 +227,30 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
                         b'r' => s.push('\r'),
                         b'\\' => s.push('\\'),
                         b'"' => s.push('"'),
+                        b'/' => s.push('/'),
+                        b'b' => s.push('\x08'),
+                        b'f' => s.push('\x0C'),
+                        b'u' => {
+                            // Unicode escape: \uXXXX (4 hex digits required)
+                            pos += 1;
+                            if pos + 4 > len {
+                                return Err(LexError {
+                                    message: "SyntaxError: InvalidUnicodeLiteral — \\u escape requires 4 hex digits".into(),
+                                    offset: start,
+                                });
+                            }
+                            let hex_str = std::str::from_utf8(&bytes[pos..pos+4]).unwrap_or("");
+                            let codepoint = u32::from_str_radix(hex_str, 16).map_err(|_| LexError {
+                                message: "SyntaxError: InvalidUnicodeLiteral — invalid hex digits in \\u escape".into(),
+                                offset: start,
+                            })?;
+                            let ch = char::from_u32(codepoint).ok_or_else(|| LexError {
+                                message: "SyntaxError: InvalidUnicodeLiteral — invalid Unicode codepoint".into(),
+                                offset: start,
+                            })?;
+                            s.push(ch);
+                            pos += 3; // +1 at end of loop
+                        }
                         _ => {
                             s.push('\\');
                             s.push(bytes[pos] as char);
@@ -245,11 +296,20 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
                 if hex_str.is_empty() {
                     return Err(LexError { message: "incomplete hexadecimal integer".into(), offset: start });
                 }
-                // Parse as u64 first to handle 0x8000000000000000 (i64::MIN after negation).
+                // Parse as u64 first to detect overflow.
+                // Only 0x8000000000000000 (= i64::MAX+1) is allowed to pass
+                // through as IntLitBig so it can be negated to i64::MIN.
                 let val = if let Ok(v) = u64::from_str_radix(hex_str, 16) {
-                    v as i64 // wrapping cast: handles i64::MIN case (0x8000000000000000)
+                    if v > 0x8000000000000000u64 {
+                        return Err(LexError { message: "SyntaxError: IntegerOverflow — integer literal out of range for i64".into(), offset: start });
+                    } else if v == 0x8000000000000000u64 {
+                        tokens.push(SpannedToken { token: Token::IntLitBig, offset: start });
+                        continue;
+                    } else {
+                        v as i64
+                    }
                 } else {
-                    return Err(LexError { message: "hexadecimal integer overflow".into(), offset: start });
+                    return Err(LexError { message: "SyntaxError: IntegerOverflow — integer literal out of range for i64".into(), offset: start });
                 };
                 tokens.push(SpannedToken { token: Token::IntLit(val), offset: start });
                 continue;
@@ -265,10 +325,21 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
                 if oct_str.is_empty() {
                     return Err(LexError { message: "incomplete octal integer".into(), offset: start });
                 }
+                // Parse as u64 first to detect overflow.
+                // Only value 9223372036854775808 (0o1000000000000000000000) is
+                // allowed as IntLitBig (valid only when preceded by unary minus).
+                const OCT_OVERFLOW: u64 = 0x8000000000000000u64; // i64::MAX + 1
                 let val = if let Ok(v) = u64::from_str_radix(oct_str, 8) {
-                    v as i64 // wrapping cast: handles i64::MIN case
+                    if v > OCT_OVERFLOW {
+                        return Err(LexError { message: "SyntaxError: IntegerOverflow — integer literal out of range for i64".into(), offset: start });
+                    } else if v == OCT_OVERFLOW {
+                        tokens.push(SpannedToken { token: Token::IntLitBig, offset: start });
+                        continue;
+                    } else {
+                        v as i64
+                    }
                 } else {
-                    return Err(LexError { message: "octal integer overflow".into(), offset: start });
+                    return Err(LexError { message: "SyntaxError: IntegerOverflow — integer literal out of range for i64".into(), offset: start });
                 };
                 tokens.push(SpannedToken { token: Token::IntLit(val), offset: start });
                 continue;
@@ -306,16 +377,26 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
                     message: format!("invalid float literal: {num_str}"),
                     offset: start,
                 })?;
+                if val.is_infinite() {
+                    return Err(LexError {
+                        message: "SyntaxError: FloatingPointOverflow — float literal out of range".into(),
+                        offset: start,
+                    });
+                }
                 tokens.push(SpannedToken { token: Token::FloatLit(val), offset: start });
             } else {
-                // Parse as i64; overflow (e.g. 9223372036854775808 = i64::MAX+1)
-                // is stored as FloatLit to avoid a hard parse error.
+                // Parse as i64; overflow is a SyntaxError: IntegerOverflow.
+                // Special case: 9223372036854775808 = i64::MAX+1 = (-i64::MIN),
+                // which is valid only when preceded by a unary minus (giving i64::MIN).
                 match num_str.parse::<i64>() {
                     Ok(val) => tokens.push(SpannedToken { token: Token::IntLit(val), offset: start }),
                     Err(_) => {
-                        // Try as u64 first (for very large positives), then as f64.
-                        let fval: f64 = num_str.parse().unwrap_or(f64::INFINITY);
-                        tokens.push(SpannedToken { token: Token::FloatLit(fval), offset: start });
+                        // Check for the special i64::MIN case
+                        if num_str == "9223372036854775808" {
+                            tokens.push(SpannedToken { token: Token::IntLitBig, offset: start });
+                        } else {
+                            return Err(LexError { message: "SyntaxError: IntegerOverflow — integer literal out of range for i64".into(), offset: start });
+                        }
                     }
                 }
             }

@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.19.0](#0190----cypher-correctness-and-ordering-improvements) — Cypher Correctness and Ordering Improvements
 - [0.18.0](#0180----quantifiers-pattern-comprehension-and-union) — Quantifiers, Pattern Comprehension, and UNION
 - [0.17.0](#0170----error-validation--named-paths) — Error Validation + Named Paths
 - [0.16.0](#0160----map-literal-expressions) — Map Literal Expressions
@@ -26,6 +27,71 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 - [0.3.0](#030--2026-05-09--edge-storage--adjacency-lists) — Edge Storage + Adjacency Lists
 - [0.2.0](#020--2026-05-09--node-storage) — Node Storage
 - [0.1.0](#010--2026-05-09--am-skeleton) — AM Skeleton
+
+---
+
+## [0.19.0] — Cypher Correctness and Ordering Improvements
+
+v0.19.0 is a focused correctness release. No new Cypher clauses are added;
+instead, a broad sweep of engine bugs are fixed so that existing features
+behave according to the openCypher specification. TCK pass rate rises from
+2391/3880 (61.6%) to **2974/3880 (76.6%)** — +583 scenarios.
+
+### What's New
+
+**WITH post-aggregation WHERE (HAVING semantics)** — when a `WITH` clause
+contains an aggregation in its projection list, any `WHERE` on that `WITH` is
+now evaluated *after* aggregation (i.e., acts as a `HAVING` filter). Previously
+the WHERE was applied before aggregation, giving wrong results for queries like
+`WITH count(*) AS c WHERE c > 1`.
+
+**Bound relationship variable forwarding** — a relationship variable bound in a
+prior `WITH` can now be passed through and used as a filter in a subsequent
+`MATCH`. The `exec_expand` step checks whether the relationship variable already
+has a value in the current row and, if so, only keeps edges whose `edge_id`
+matches that binding. Fixes `WITH … MATCH (a)-[r]->(b)` after a `WITH r`.
+
+**Named path null propagation** — when a named path `p = (a)-[r]->(b)` is
+inside an `OPTIONAL MATCH` that finds no results, the relationship slot `r` is
+null. The `exec_named_path` step now detects a null relationship slot and sets
+the path variable to null rather than constructing a malformed one-node path.
+Fixes all "optionally matching named paths" scenarios.
+
+**Correct openCypher type ordering** — `ORDER BY` and `min()`/`max()` now use
+the openCypher-specified ascending type order:
+Map < Node < Relationship < List < Path < String < Boolean < Number < NaN < Null.
+Previously the implementation used an ad-hoc ordering that mixed types
+incorrectly. Fixes `Aggregation2[11,12]`, `ReturnOrderBy1[11,12]`,
+`WithOrderBy1[21,22]`.
+
+**ListPredicate over aggregate expressions** — `ALL(x IN collect(…) WHERE …)`
+and its siblings (`ANY`, `NONE`, `SINGLE`) now work correctly when the list
+argument is an aggregate expression produced by `collect()`. The
+`eval_with_agg` path was missing a handler for `ListPredicate`; it is now
+present with the same three-valued logic as the normal evaluator.
+
+**Edge and path equality** — two relationships (edges) can now be compared with
+`=` and `<>`: they are equal iff they share the same internal `edge_id`. Two
+paths are equal iff they have the same sequence of nodes and the same sequence
+of relationships. Previously both fell to the type-mismatch arm and were always
+unequal.
+
+**Strict type checking in planner** — `labels()` applied to a path or
+relationship, `type()` applied to a node or path, and `length()` applied to a
+node or relationship now raise `InvalidArgumentType` at plan time instead of
+returning wrong results at run time.
+
+**DISTINCT + ORDER BY validation** — `RETURN DISTINCT … ORDER BY x` where `x`
+is not in the projection now correctly raises `UndefinedVariable`. Similarly,
+an aggregation in `ORDER BY` when `RETURN` contains no aggregation now raises
+`InvalidAggregation`.
+
+### TCK Result
+
+| Release | Pass  | Total | %     | Delta |
+|---------|-------|-------|-------|-------|
+| v0.18.0 | 2391  | 3880  | 61.6% | baseline |
+| v0.19.0 | **2974** | 3880 | **76.6%** | **+583** |
 
 ---
 

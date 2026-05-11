@@ -221,6 +221,18 @@ fn plan_single(query: &Query) -> Result<LogicalPlan, PlanError> {
     plan_clauses(&query.clauses, LogicalPlan::SingleRow, &mut bound_vars, &mut var_kinds)
 }
 
+/// Plan a subquery with knowledge of outer-scope bound variables.
+/// Used for EXISTS { MATCH...RETURN } subqueries where outer vars like `n` are bound.
+pub fn plan_with_outer(query: &Query, outer_vars: &HashSet<String>) -> Result<LogicalPlan, PlanError> {
+    let mut bound_vars: HashSet<String> = outer_vars.clone();
+    let mut var_kinds: HashMap<String, VarKind> = HashMap::new();
+    // Outer vars are treated as Scalar (generic) — the executor provides the actual value.
+    for v in outer_vars {
+        var_kinds.insert(v.clone(), VarKind::Scalar);
+    }
+    plan_clauses(&query.clauses, LogicalPlan::SingleRow, &mut bound_vars, &mut var_kinds)
+}
+
 fn plan_clauses(
     clauses: &[QueryClause],
     seed: LogicalPlan,
@@ -320,18 +332,23 @@ fn plan_clauses(
                         }
                     }
                 }
-                // WITH WHERE: filter BEFORE projection so pre-projected variables are in scope.
-                // Additionally substitute projection aliases so that WHERE can also reference
-                // aliases defined in THIS WITH clause (e.g. `WITH a+b AS c WHERE c > 0`).
+                // WITH WHERE handling:
+                // - If the WITH has aggregation (e.g. count(*) AS c), the WHERE is a
+                //   post-aggregation filter (HAVING) and must be applied AFTER projection.
+                // - Otherwise, apply the WHERE BEFORE projection so pre-projected variables
+                //   are in scope, and substitute projection aliases (e.g. `WITH a+b AS c WHERE c > 0`).
                 if let Some(wh) = where_clause {
-                    // Build alias map: alias -> expression, for substitution.
-                    let alias_map: HashMap<String, Expr> = items.iter()
-                        .filter_map(|item| {
-                            item.alias.as_ref().map(|alias| (alias.clone(), item.expr.clone()))
-                        })
-                        .collect();
-                    let rewritten_wh = substitute_aliases_in_expr(wh, &alias_map);
-                    current = LogicalPlan::Filter { input: Box::new(current), predicate: rewritten_wh };
+                    if !proj_has_agg {
+                        // Non-aggregating WITH: substitute aliases and filter before projection.
+                        let alias_map: HashMap<String, Expr> = items.iter()
+                            .filter_map(|item| {
+                                item.alias.as_ref().map(|alias| (alias.clone(), item.expr.clone()))
+                            })
+                            .collect();
+                        let rewritten_wh = substitute_aliases_in_expr(wh, &alias_map);
+                        current = LogicalPlan::Filter { input: Box::new(current), predicate: rewritten_wh };
+                    }
+                    // For aggregating WITH: WHERE will be added AFTER projection below.
                 }
                 current = LogicalPlan::Project {
                     input: Box::new(current),
@@ -354,8 +371,75 @@ fn plan_clauses(
                         var_kinds.insert(v, kind);
                     }
                 }
+                // For aggregating WITH with WHERE: apply the WHERE as a post-aggregation
+                // filter (HAVING) now that projected columns are in scope.
+                if proj_has_agg {
+                    if let Some(wh) = where_clause {
+                        current = LogicalPlan::Filter { input: Box::new(current), predicate: wh.clone() };
+                    }
+                }
             }
             QueryClause::Return { distinct, items, order_by, skip, limit } => {
+                // Check for RETURN * with no non-anonymous variables in scope.
+                let has_star = items.iter().any(|i| matches!(i.expr, Expr::Star));
+                if has_star {
+                    let has_visible_vars = bound_vars.iter().any(|v| !v.starts_with('_'));
+                    if !has_visible_vars {
+                        return Err(PlanError {
+                            message: "SyntaxError: NoVariablesInScope — \
+                                      RETURN * requires at least one named variable in scope".to_string(),
+                        });
+                    }
+                }
+                // Check for undefined variable references in RETURN items.
+                for item in items.iter() {
+                    if let Expr::Variable(v) = &item.expr {
+                        if !bound_vars.contains(v) {
+                            return Err(PlanError {
+                                message: format!(
+                                    "SyntaxError: UndefinedVariable — \
+                                     variable '{v}' not defined"
+                                ),
+                            });
+                        }
+                    }
+                }
+                // Check for nested aggregation in RETURN items.
+                for item in items.iter() {
+                    if let Err(e) = check_nested_aggregation(&item.expr, false) {
+                        return Err(e);
+                    }
+                }
+                // Check: aggregation in ORDER BY without aggregation in RETURN projection
+                // is a SyntaxError (InvalidAggregation). Mirrors the same check for WITH.
+                {
+                    let ret_has_agg = items.iter().any(|it| expr_contains_aggregation(&it.expr));
+                    if !ret_has_agg {
+                        for ob_item in order_by {
+                            if expr_contains_aggregation(&ob_item.expr) {
+                                return Err(PlanError {
+                                    message: "SyntaxError: InvalidAggregation — aggregation in ORDER BY \
+                                        without corresponding aggregation in RETURN projection".into(),
+                                });
+                            }
+                        }
+                    }
+                }
+                // Check: RETURN DISTINCT + ORDER BY can only reference projected variables.
+                if *distinct && !order_by.is_empty() {
+                    let mut projected_keys: HashSet<String> = HashSet::new();
+                    for item in items.iter() {
+                        if let Some(ref alias) = item.alias {
+                            projected_keys.insert(alias.clone());
+                        }
+                        if let Expr::Variable(ref v) = item.expr {
+                            projected_keys.insert(v.clone());
+                        }
+                    }
+                    for ob_item in order_by {
+                        check_expr_vars(&ob_item.expr, &projected_keys)?;
+                    }
+                }
                 // Pattern predicates in RETURN/WITH projection are not allowed.
                 for item in items.iter() {
                     if expr_has_inline_pattern(&item.expr) {
@@ -365,16 +449,36 @@ fn plan_clauses(
                         });
                     }
                     // size(path_var) is InvalidArgumentType.
+                    // labels(path|edge) is InvalidArgumentType.
+                    // type(node|path) is InvalidArgumentType.
+                    // length(node|edge) is InvalidArgumentType.
                     if let Expr::FunctionCall(ref fname, ref args) = item.expr {
-                        if fname.eq_ignore_ascii_case("size") && args.len() == 1 {
+                        let lname = fname.to_ascii_lowercase();
+                        if args.len() == 1 {
                             if let Expr::Variable(ref v) = args[0] {
-                                if matches!(var_kinds.get(v), Some(VarKind::Path)) {
-                                    return Err(PlanError {
-                                        message: format!(
-                                            "SyntaxError::InvalidArgumentType: size() \
-                                             cannot be used on path variable '{v}'"
-                                        ),
-                                    });
+                                let vk = var_kinds.get(v);
+                                match lname.as_str() {
+                                    "size" if matches!(vk, Some(VarKind::Path)) => {
+                                        return Err(PlanError { message: format!(
+                                            "SyntaxError::InvalidArgumentType: size() cannot be used on path variable '{v}'"
+                                        )});
+                                    }
+                                    "labels" if matches!(vk, Some(VarKind::Path | VarKind::Rel)) => {
+                                        return Err(PlanError { message: format!(
+                                            "SyntaxError: InvalidArgumentType — labels() cannot be used on path or relationship variable '{v}'"
+                                        )});
+                                    }
+                                    "type" if matches!(vk, Some(VarKind::Node | VarKind::Path)) => {
+                                        return Err(PlanError { message: format!(
+                                            "SyntaxError: InvalidArgumentType — type() cannot be used on node or path variable '{v}'"
+                                        )});
+                                    }
+                                    "length" if matches!(vk, Some(VarKind::Node | VarKind::Rel)) => {
+                                        return Err(PlanError { message: format!(
+                                            "SyntaxError: InvalidArgumentType — length() cannot be used on node or relationship variable '{v}'"
+                                        )});
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -421,6 +525,9 @@ fn plan_clauses(
             QueryClause::Create { patterns } => {
                 // Validate and bind CREATE patterns.
                 for pattern in patterns {
+                    // Track vars bound within this pattern (for multi-node chains like
+                    // CREATE (a)-[:R]->(b {name: a.name}) where a is used in b's props).
+                    let mut pattern_bound = bound_vars.clone();
                     for elem in &pattern.elements {
                         if let PatternElement::Relationship(r) = elem {
                             // Validate relationship type constraints for CREATE.
@@ -442,28 +549,38 @@ fn plan_clauses(
                                               CREATE does not support variable-length relationships".to_string(),
                                 });
                             }
+                            // Validate inline property expressions use defined vars.
+                            for (_, expr) in &r.properties {
+                                check_expr_vars(expr, &pattern_bound)?;
+                            }
                             if let Some(v) = &r.variable {
                                 bound_vars.insert(v.clone());
+                                pattern_bound.insert(v.clone());
                             }
                         }
-                        if let PatternElement::Node(n) = elem
-                            && let Some(v) = &n.variable
-                        {
-                            if bound_vars.contains(v) {
-                                // Already bound: error if node re-declares labels/props or standalone
-                                let has_labels = !n.labels.is_empty();
-                                let has_props = !n.properties.is_empty();
-                                let is_standalone = pattern.elements.len() == 1;
-                                if has_labels || has_props || is_standalone {
-                                    return Err(PlanError {
-                                        message: format!(
-                                            "SyntaxError: VariableAlreadyBound — \
-                                             cannot CREATE node '{v}' that is already bound"
-                                        ),
-                                    });
+                        if let PatternElement::Node(n) = elem {
+                            // Validate inline property expressions use defined vars.
+                            for (_, expr) in &n.properties {
+                                check_expr_vars(expr, &pattern_bound)?;
+                            }
+                            if let Some(v) = &n.variable {
+                                if bound_vars.contains(v) {
+                                    // Already bound: error if node re-declares labels/props/map or is standalone
+                                    let has_labels = !n.labels.is_empty();
+                                    let has_props = !n.properties.is_empty() || n.has_explicit_map;
+                                    let is_standalone = pattern.elements.len() == 1;
+                                    if has_labels || has_props || is_standalone {
+                                        return Err(PlanError {
+                                            message: format!(
+                                                "SyntaxError: VariableAlreadyBound — \
+                                                 cannot CREATE node '{v}' that is already bound"
+                                            ),
+                                        });
+                                    }
+                                } else {
+                                    bound_vars.insert(v.clone());
+                                    pattern_bound.insert(v.clone());
                                 }
-                            } else {
-                                bound_vars.insert(v.clone());
                             }
                         }
                     }
@@ -474,6 +591,32 @@ fn plan_clauses(
                 };
             }
             QueryClause::Set { items } => {
+                // Validate that all variable references in SET expressions are bound.
+                for item in items {
+                    match item {
+                        crate::cypher::ast::SetItem::Property(target, value) => {
+                            check_expr_vars(target, bound_vars)?;
+                            check_expr_vars(value, bound_vars)?;
+                        }
+                        crate::cypher::ast::SetItem::Variable(var, value) => {
+                            if !bound_vars.contains(var) {
+                                return Err(PlanError { message: format!("SyntaxError: UndefinedVariable — variable '{var}' not defined") });
+                            }
+                            check_expr_vars(value, bound_vars)?;
+                        }
+                        crate::cypher::ast::SetItem::MergeMap(var, value) => {
+                            if !bound_vars.contains(var) {
+                                return Err(PlanError { message: format!("SyntaxError: UndefinedVariable — variable '{var}' not defined") });
+                            }
+                            check_expr_vars(value, bound_vars)?;
+                        }
+                        crate::cypher::ast::SetItem::Label(var, _) => {
+                            if !bound_vars.contains(var) {
+                                return Err(PlanError { message: format!("SyntaxError: UndefinedVariable — variable '{var}' not defined") });
+                            }
+                        }
+                    }
+                }
                 current = LogicalPlan::SetProp {
                     input: Box::new(current),
                     items: items.clone(),
@@ -507,8 +650,29 @@ fn plan_clauses(
                                           DELETE expression must be a variable (node or relationship)".into(),
                             });
                         }
-                        // Subscript (list[i]), Property (map.key), function calls, etc.
-                        // are evaluated at runtime — allow them.
+                        // HasLabel (e.g. DELETE n:Person) — cannot delete a label predicate.
+                        Expr::HasLabel(_, _) => {
+                            return Err(PlanError {
+                                message: "SyntaxError: InvalidDelete — \
+                                          cannot DELETE a label predicate; use REMOVE to remove labels".into(),
+                            });
+                        }
+                        // Property access, function calls, subscript and other expressions
+                        // that might yield nodes/rels are evaluated at runtime.
+                        Expr::Property(_, _) | Expr::FunctionCall(_, _)
+                        | Expr::Subscript(_, _) => {}
+                        // Arithmetic, comparisons, literals — definitely not a node/rel.
+                        Expr::Arith(_, _, _) | Expr::IntLit(_) | Expr::FloatLit(_)
+                        | Expr::StringLit(_) | Expr::BoolLit(_) | Expr::NullLit
+                        | Expr::List(_) | Expr::MapLiteral(_)
+                        | Expr::Compare(_, _, _) | Expr::And(_, _) | Expr::Or(_, _)
+                        | Expr::Not(_) | Expr::Neg(_) => {
+                            return Err(PlanError {
+                                message: "SyntaxError: InvalidArgumentType — \
+                                          DELETE expression must be a node or relationship variable".into(),
+                            });
+                        }
+                        // Other complex expressions are evaluated at runtime.
                         _ => {}
                     }
                 }
@@ -552,14 +716,15 @@ fn plan_clauses(
                             }
                         }
                     }
-                    // Check node vars: if re-bound with new labels, it's VariableAlreadyBound.
+                    // Check node vars: if re-bound standalone or with new labels, it's VariableAlreadyBound.
                     if let PatternElement::Node(n) = elem {
                         if let Some(ref v) = n.variable {
-                            if bound_vars.contains(v) && !n.labels.is_empty() {
+                            let is_standalone = pattern.elements.len() == 1;
+                            if bound_vars.contains(v) && (is_standalone || !n.labels.is_empty()) {
                                 return Err(PlanError {
                                     message: format!(
                                         "SyntaxError: VariableAlreadyBound — \
-                                         cannot MERGE node '{v}' that is already bound with new labels"
+                                         cannot MERGE node '{v}' that is already bound"
                                     ),
                                 });
                             }
@@ -576,6 +741,45 @@ fn plan_clauses(
                         && let Some(v) = &r.variable {
                             bound_vars.insert(v.clone());
                         }
+                }
+                // Path variable from MERGE p = (...) comes into scope.
+                if let Some(ref pvar) = pattern.variable {
+                    bound_vars.insert(pvar.clone());
+                    var_kinds.insert(pvar.clone(), VarKind::Path);
+                }
+                // Validate ON CREATE and ON MATCH SET items.
+                // Variables from the MERGE pattern are in scope for these items.
+                let merge_bound = bound_vars.clone();
+                for item in on_create.iter().chain(on_match.iter()) {
+                    match item {
+                        crate::cypher::ast::SetItem::Property(target, value) => {
+                            check_expr_vars(target, &merge_bound)?;
+                            check_expr_vars(value, &merge_bound)?;
+                        }
+                        crate::cypher::ast::SetItem::Variable(var, value) => {
+                            if !merge_bound.contains(var) {
+                                return Err(PlanError {
+                                    message: format!("SyntaxError: UndefinedVariable — variable '{var}' not defined"),
+                                });
+                            }
+                            check_expr_vars(value, &merge_bound)?;
+                        }
+                        crate::cypher::ast::SetItem::MergeMap(var, value) => {
+                            if !merge_bound.contains(var) {
+                                return Err(PlanError {
+                                    message: format!("SyntaxError: UndefinedVariable — variable '{var}' not defined"),
+                                });
+                            }
+                            check_expr_vars(value, &merge_bound)?;
+                        }
+                        crate::cypher::ast::SetItem::Label(var, _) => {
+                            if !merge_bound.contains(var) {
+                                return Err(PlanError {
+                                    message: format!("SyntaxError: UndefinedVariable — variable '{var}' not defined"),
+                                });
+                            }
+                        }
+                    }
                 }
                 current = LogicalPlan::MergePattern {
                     input: Box::new(current),
@@ -665,8 +869,7 @@ fn plan_optional_match_left_join(
 /// Return true if the expression contains an inline pattern predicate (Exists wrapping a MATCH).
 fn expr_has_inline_pattern(expr: &Expr) -> bool {
     match expr {
-        Expr::Exists { subquery } => {
-            // An inline pattern predicate has a single MATCH clause (no explicit RETURN).
+        Expr::Exists { subquery, .. } => {
             subquery.clauses.len() == 1 && matches!(subquery.clauses[0], QueryClause::Match { .. })
         }
         Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
@@ -708,33 +911,59 @@ fn collect_pattern_named_vars(pattern: &Pattern) -> Vec<String> {
 /// Also validates that single-node-only patterns are rejected (InvalidArgumentType).
 fn validate_inline_patterns_in_expr(expr: &Expr, bound_vars: &HashSet<String>) -> Result<(), PlanError> {
     match expr {
-        Expr::Exists { subquery } => {
+        Expr::Exists { subquery, implicit } => {
             // Check each MATCH clause in the subquery.
             for clause in &subquery.clauses {
+                // Reject write clauses inside full EXISTS subqueries.
+                if !*implicit && matches!(clause, QueryClause::Create { .. }
+                    | QueryClause::Delete { .. }
+                    | QueryClause::Set { .. }
+                    | QueryClause::Remove { .. }
+                    | QueryClause::Merge { .. }
+                    | QueryClause::Foreach { .. })
+                {
+                    return Err(PlanError {
+                        message: "SyntaxError: InvalidClauseComposition — \
+                                  write clauses (CREATE/SET/DELETE/MERGE) are not \
+                                  allowed inside an existential subquery".into(),
+                    });
+                }
                 if let QueryClause::Match { patterns, where_clause, .. } = clause {
+                    // Collect variables that are locally introduced by the patterns.
+                    let mut local_vars: HashSet<String> = bound_vars.clone();
                     for pattern in patterns {
-                        // Single-node pattern with no rels → InvalidArgumentType.
-                        let has_rel = pattern.elements.iter().any(|e| matches!(e, PatternElement::Relationship(_)));
-                        if !has_rel {
-                            return Err(PlanError {
-                                message: "SyntaxError::InvalidArgumentType: a single node pattern \
-                                          is not a valid existential predicate".into(),
-                            });
-                        }
-                        // Check for new named variables.
-                        for var in collect_pattern_named_vars(pattern) {
-                            if !bound_vars.contains(&var) {
+                        if *implicit {
+                            // Implicit pattern predicates (inline `WHERE (n)-->(a)` form):
+                            // Single-node patterns and new named variables are NOT allowed.
+                            let has_rel = pattern.elements.iter().any(|e| matches!(e, PatternElement::Relationship(_)));
+                            if !has_rel {
                                 return Err(PlanError {
-                                    message: format!(
-                                        "SyntaxError::UndefinedVariable: variable '{var}' \
-                                         is not defined in the outer scope of a pattern predicate"
-                                    ),
+                                    message: "SyntaxError::InvalidArgumentType: a single node pattern \
+                                              is not a valid existential predicate".into(),
                                 });
+                            }
+                            // named NEW variables in the pattern are NOT allowed — they must
+                            // already be in outer scope (openCypher Pattern1 rule).
+                            for var in collect_pattern_named_vars(pattern) {
+                                if !bound_vars.contains(&var) {
+                                    return Err(PlanError {
+                                        message: format!(
+                                            "SyntaxError::UndefinedVariable: variable '{var}' \
+                                             is not defined in the outer scope of a pattern predicate"
+                                        ),
+                                    });
+                                }
+                            }
+                        } else {
+                            // Explicit EXISTS { MATCH pattern WHERE clause } form:
+                            // variables introduced by the pattern ARE in scope for the WHERE.
+                            for var in collect_pattern_named_vars(pattern) {
+                                local_vars.insert(var);
                             }
                         }
                     }
                     if let Some(wc) = where_clause {
-                        validate_inline_patterns_in_expr(wc, bound_vars)?;
+                        validate_inline_patterns_in_expr(wc, &local_vars)?;
                     }
                 }
             }
@@ -836,9 +1065,18 @@ fn plan_match_clause(
         plan = new_plan;
     }
 
-    // Validate WHERE clause: no new named vars in inline pattern predicates.
+    // Validate WHERE clause: no new named vars in inline pattern predicates;
+    // also check that all variable references are bound, no aggregations, no path property access.
     if let Some(wc) = where_clause {
         validate_inline_patterns_in_expr(wc, bound_vars)?;
+        check_expr_vars(wc, bound_vars)?;
+        if contains_aggregation(wc) {
+            return Err(PlanError {
+                message: "SyntaxError: InvalidAggregation — \
+                          aggregation functions are not allowed in WHERE".to_string(),
+            });
+        }
+        check_path_property_access(wc, var_kinds)?;
     }
 
     // Relationship isomorphism: different relationship variables in the same MATCH clause
@@ -1288,6 +1526,181 @@ fn expr_is_definitely_not_node(expr: &Expr, kinds: &HashMap<String, VarKind>) ->
         Expr::Variable(v) => matches!(kinds.get(v), Some(VarKind::NotNode | VarKind::Rel | VarKind::Path)),
         // Everything else (function calls, CASE, property access, coalesce, etc.) might be a node
         _ => false,
+    }
+}
+
+/// Recursively check that all `Expr::Variable` references in an expression
+/// are present in `bound_vars`. Ignores internal anonymous vars (`_anon_*`).
+fn check_expr_vars(expr: &Expr, bound_vars: &HashSet<String>) -> Result<(), PlanError> {
+    match expr {
+        Expr::Variable(v) => {
+            if !v.starts_with("_anon_") && !v.starts_with("_pr_") && !bound_vars.contains(v) {
+                return Err(PlanError {
+                    message: format!("SyntaxError: UndefinedVariable — variable '{v}' not defined"),
+                });
+            }
+            Ok(())
+        }
+        Expr::Property(base, _) => check_expr_vars(base, bound_vars),
+        Expr::Arith(l, _, r) | Expr::Compare(l, _, r) | Expr::And(l, r)
+        | Expr::Or(l, r) | Expr::Xor(l, r) | Expr::StartsWith(l, r)
+        | Expr::EndsWith(l, r) | Expr::Contains(l, r) => {
+            check_expr_vars(l, bound_vars)?;
+            check_expr_vars(r, bound_vars)
+        }
+        Expr::Not(e) | Expr::Neg(e) | Expr::IsNull(e) | Expr::IsNotNull(e)
+        | Expr::HasLabel(e, _) => check_expr_vars(e, bound_vars),
+        Expr::FunctionCall(_, args) => {
+            for a in args { check_expr_vars(a, bound_vars)?; }
+            Ok(())
+        }
+        Expr::List(items) => {
+            for i in items { check_expr_vars(i, bound_vars)?; }
+            Ok(())
+        }
+        Expr::MapLiteral(pairs) => {
+            for (_, v) in pairs { check_expr_vars(v, bound_vars)?; }
+            Ok(())
+        }
+        Expr::Subscript(base, idx) | Expr::ListSlice { list_expr: base, from: Some(idx), .. } => {
+            check_expr_vars(base, bound_vars)?;
+            check_expr_vars(idx, bound_vars)
+        }
+        Expr::ListSlice { list_expr, to: Some(t), .. } => {
+            check_expr_vars(list_expr, bound_vars)?;
+            check_expr_vars(t, bound_vars)
+        }
+        Expr::ListSlice { list_expr, .. } => check_expr_vars(list_expr, bound_vars),
+        Expr::CaseSearched { branches, else_ } => {
+            for (c, t) in branches { check_expr_vars(c, bound_vars)?; check_expr_vars(t, bound_vars)?; }
+            if let Some(e) = else_ { check_expr_vars(e, bound_vars)?; }
+            Ok(())
+        }
+        Expr::CaseSimple { test, branches, else_ } => {
+            check_expr_vars(test, bound_vars)?;
+            for (w, t) in branches { check_expr_vars(w, bound_vars)?; check_expr_vars(t, bound_vars)?; }
+            if let Some(e) = else_ { check_expr_vars(e, bound_vars)?; }
+            Ok(())
+        }
+        // Literals and structural keywords — no variables
+        _ => Ok(()),
+    }
+}
+
+/// Return true if `expr` contains an aggregation function call at any depth.
+fn contains_aggregation(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall(name, args) => {
+            if is_aggregate_fn(name) { return true; }
+            args.iter().any(contains_aggregation)
+        }
+        Expr::Arith(l, _, r) | Expr::Compare(l, _, r) | Expr::And(l, r)
+        | Expr::Or(l, r) | Expr::Xor(l, r) | Expr::StartsWith(l, r)
+        | Expr::EndsWith(l, r) | Expr::Contains(l, r) | Expr::InList(l, r) => {
+            contains_aggregation(l) || contains_aggregation(r)
+        }
+        Expr::Not(e) | Expr::Neg(e) | Expr::IsNull(e) | Expr::IsNotNull(e)
+        | Expr::HasLabel(e, _) | Expr::Property(e, _) => contains_aggregation(e),
+        Expr::List(items) => items.iter().any(contains_aggregation),
+        Expr::MapLiteral(pairs) => pairs.iter().any(|(_, v)| contains_aggregation(v)),
+        Expr::Subscript(b, i) => contains_aggregation(b) || contains_aggregation(i),
+        _ => false,
+    }
+}
+
+/// Return whether a function name is an aggregate function.
+fn is_aggregate_fn(name: &str) -> bool {
+    let lc = name.to_ascii_lowercase();
+    matches!(lc.as_str(),
+        "count" | "count_distinct" | "sum" | "sum_distinct"
+        | "avg" | "avg_distinct" | "min" | "max"
+        | "collect" | "collect_distinct" | "stdev" | "stdevp"
+        | "percentilecont" | "percentiledisc"
+    )
+}
+
+/// Check that a property access like `r.name` doesn't target a path variable.
+fn check_path_property_access(expr: &Expr, var_kinds: &HashMap<String, VarKind>) -> Result<(), PlanError> {
+    match expr {
+        Expr::Property(base, _) => {
+            if let Expr::Variable(v) = base.as_ref() {
+                if matches!(var_kinds.get(v), Some(VarKind::Path)) {
+                    return Err(PlanError {
+                        message: format!(
+                            "SyntaxError: InvalidArgumentType — \
+                             property access on path variable '{v}' is not supported"
+                        ),
+                    });
+                }
+            }
+            check_path_property_access(base, var_kinds)
+        }
+        Expr::Arith(l, _, r) | Expr::Compare(l, _, r) | Expr::And(l, r)
+        | Expr::Or(l, r) | Expr::Xor(l, r) | Expr::StartsWith(l, r)
+        | Expr::EndsWith(l, r) | Expr::Contains(l, r) | Expr::InList(l, r) => {
+            check_path_property_access(l, var_kinds)?;
+            check_path_property_access(r, var_kinds)
+        }
+        Expr::Not(e) | Expr::Neg(e) | Expr::IsNull(e) | Expr::IsNotNull(e)
+        | Expr::HasLabel(e, _) => check_path_property_access(e, var_kinds),
+        Expr::FunctionCall(_, args) => {
+            for a in args { check_path_property_access(a, var_kinds)?; }
+            Ok(())
+        }
+        Expr::List(items) => {
+            for i in items { check_path_property_access(i, var_kinds)?; }
+            Ok(())
+        }
+        Expr::MapLiteral(pairs) => {
+            for (_, v) in pairs { check_path_property_access(v, var_kinds)?; }
+            Ok(())
+        }
+        Expr::Subscript(b, i) => {
+            check_path_property_access(b, var_kinds)?;
+            check_path_property_access(i, var_kinds)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Check for nested aggregation: aggregation inside aggregation args → NestedAggregation.
+/// `inside_agg` is true when we're already inside an aggregation function call.
+fn check_nested_aggregation(expr: &Expr, inside_agg: bool) -> Result<(), PlanError> {
+    match expr {
+        Expr::FunctionCall(name, args) => {
+            let is_agg = is_aggregate_fn(name);
+            if is_agg && inside_agg {
+                return Err(PlanError {
+                    message: "SyntaxError: NestedAggregation — \
+                              aggregation functions cannot be nested".to_string(),
+                });
+            }
+            for a in args {
+                check_nested_aggregation(a, inside_agg || is_agg)?;
+            }
+            Ok(())
+        }
+        Expr::Arith(l, _, r) | Expr::Compare(l, _, r) | Expr::And(l, r)
+        | Expr::Or(l, r) | Expr::Xor(l, r) | Expr::StartsWith(l, r)
+        | Expr::EndsWith(l, r) | Expr::Contains(l, r) | Expr::InList(l, r) => {
+            check_nested_aggregation(l, inside_agg)?;
+            check_nested_aggregation(r, inside_agg)
+        }
+        Expr::Not(e) | Expr::Neg(e) | Expr::IsNull(e) | Expr::IsNotNull(e)
+        | Expr::HasLabel(e, _) | Expr::Property(e, _) => check_nested_aggregation(e, inside_agg),
+        Expr::List(items) => {
+            for i in items { check_nested_aggregation(i, inside_agg)?; }
+            Ok(())
+        }
+        Expr::MapLiteral(pairs) => {
+            for (_, v) in pairs { check_nested_aggregation(v, inside_agg)?; }
+            Ok(())
+        }
+        Expr::Subscript(b, i) => {
+            check_nested_aggregation(b, inside_agg)?;
+            check_nested_aggregation(i, inside_agg)
+        }
+        _ => Ok(()),
     }
 }
 

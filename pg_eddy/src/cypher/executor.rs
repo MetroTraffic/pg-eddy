@@ -1463,10 +1463,27 @@ fn exec_expand(
                 }
             }
 
+            // If rel_var is already bound in the input row (forwarded from a previous WITH),
+            // only keep edges whose edge_id matches the existing binding.
+            if let Some(rv) = rel_var {
+                if let Some(existing_rel) = input_row.get(rv) {
+                    if !matches!(existing_rel, Value::Null) {
+                        match (existing_rel.edge_id(), edge_val.edge_id()) {
+                            (Some(e1), Some(e2)) if e1 == e2 => { /* edge matches */ }
+                            _ => continue, // edge doesn't match the bound rel_var
+                        }
+                    }
+                }
+            }
+
             // Self-loop / variable reuse check: if dst_var is already bound in the input row
-            // (same variable appears on both ends of the pattern), only keep rows where the
-            // found destination matches the existing binding.
-            if let Some(existing_dst) = input_row.get(dst_var)
+            // OR in params (correlated subquery / LeftJoin outer binding), only keep rows
+            // where the found destination matches the existing binding.
+            // Only check params for user-named variables (not anonymous `_anon_*` vars) to
+            // avoid collisions when pattern comprehensions inject outer row bindings as params.
+            let existing_dst_val = input_row.get(dst_var).cloned()
+                .or_else(|| if !dst_var.starts_with("_anon_") { params.get(dst_var).map(json_to_value) } else { None });
+            if let Some(existing_dst) = existing_dst_val
                 && !matches!(existing_dst, Value::Null)
                 && existing_dst.node_id() != dst_val.node_id()
             {
@@ -1755,10 +1772,11 @@ fn exec_var_length_expand(
 
         // If dst_var is already bound in the input row or in params (correlated pattern),
         // filter BFS results to only paths ending at that node.
+        // Only check params for user-named variables (not anonymous `_anon_*` vars).
         let expected_dst_id: Option<i64> = {
             let bound_dst = input_row.get(dst_var)
                 .cloned()
-                .or_else(|| params.get(dst_var).map(json_to_value));
+                .or_else(|| if !dst_var.starts_with("_anon_") { params.get(dst_var).map(json_to_value) } else { None });
             if let Some(Value::Node { node_id, .. }) = bound_dst { Some(node_id) } else { None }
         };
 
@@ -1945,6 +1963,17 @@ fn exec_named_path(
             let node = row.get(&element_vars[0]).cloned().unwrap_or(Value::Null);
             let path = Value::Path { nodes: vec![node], rels: vec![] };
             row.insert(path_var.to_string(), path);
+            result.push(row);
+            continue;
+        }
+
+        // If any relationship slot (odd index in element_vars) is null, the optional
+        // match found no result → the path variable should be null, not a partial path.
+        let has_null_rel = (1..element_vars.len()).step_by(2).any(|i| {
+            matches!(row.get(&element_vars[i]), Some(Value::Null) | None)
+        });
+        if has_null_rel {
+            row.insert(path_var.to_string(), Value::Null);
             result.push(row);
             continue;
         }
@@ -2442,8 +2471,22 @@ fn eval_with_agg(
                 None => Ok(Value::Null),
             }
         }
+        Expr::MapLiteral(pairs) => {
+            let mut map = serde_json::Map::new();
+            for (k, v) in pairs {
+                let val = eval_with_agg(v, group_rows, fallback_row, params)?;
+                map.insert(k.clone(), val.to_json());
+            }
+            Ok(Value::Json(serde_json::Value::Object(map)))
+        }
+        Expr::List(items) => {
+            let mut arr = Vec::new();
+            for item in items {
+                arr.push(eval_with_agg(item, group_rows, fallback_row, params)?.to_json());
+            }
+            Ok(Value::Json(serde_json::Value::Array(arr)))
+        }
         Expr::ListComprehension { variable, list_expr, predicate, projection } => {
-            // Evaluate the list source with potential aggregation
             let list_val = eval_with_agg(list_expr, group_rows, fallback_row, params)?;
             let items = match &list_val {
                 Value::Json(serde_json::Value::Array(arr)) => arr.clone(),
@@ -2470,6 +2513,55 @@ fn eval_with_agg(
                 result.push(proj_val.to_json());
             }
             Ok(Value::Json(serde_json::Value::Array(result)))
+        }
+        Expr::ListPredicate { kind, variable, list_expr, predicate } => {
+            use crate::cypher::ast::ListPredicateKind;
+            // Evaluate the list expression with aggregation (e.g., collect() inside ALL()).
+            let list_val = eval_with_agg(list_expr, group_rows, fallback_row, params)?;
+            let arr = match list_val {
+                Value::Json(serde_json::Value::Array(a)) => a,
+                Value::Null => return Ok(Value::Null),
+                _ => return Ok(Value::Bool(false)),
+            };
+            let base_row = group_rows.first().unwrap_or(fallback_row);
+            let mut true_count = 0usize;
+            let mut null_count = 0usize;
+            for item in &arr {
+                let mut inner_row = base_row.clone();
+                inner_row.insert(variable.clone(), json_to_value(item));
+                let pv = eval_expr(predicate, &inner_row, params)?;
+                match truthy3(&pv) {
+                    Some(true) => true_count += 1,
+                    None => null_count += 1,
+                    Some(false) => {}
+                }
+            }
+            let total = arr.len();
+            let false_count = total - true_count - null_count;
+            let has_null = null_count > 0;
+            match kind {
+                ListPredicateKind::Any => {
+                    if true_count > 0 { Ok(Value::Bool(true)) }
+                    else if has_null { Ok(Value::Null) }
+                    else { Ok(Value::Bool(false)) }
+                }
+                ListPredicateKind::All => {
+                    if false_count > 0 { Ok(Value::Bool(false)) }
+                    else if has_null { Ok(Value::Null) }
+                    else { Ok(Value::Bool(true)) }
+                }
+                ListPredicateKind::None_ => {
+                    if true_count > 0 { Ok(Value::Bool(false)) }
+                    else if has_null { Ok(Value::Null) }
+                    else { Ok(Value::Bool(true)) }
+                }
+                ListPredicateKind::Single => {
+                    if true_count > 1 { Ok(Value::Bool(false)) }
+                    else if true_count == 1 && !has_null { Ok(Value::Bool(true)) }
+                    else if true_count == 0 && !has_null { Ok(Value::Bool(false)) }
+                    else { Ok(Value::Null) }
+                }
+            }
         }
         // For other compound expressions fall back to evaluating on first row
         other => {
@@ -2667,14 +2759,20 @@ fn eval_percentile(
     if args.len() < 2 {
         return Err(ExecError { message: "percentile functions require 2 arguments".into() });
     }
-    let pct_val = eval_expr(&args[1], &Row::new(), params).unwrap_or(Value::Null);
+    let pct_val = {
+        // Percentile arg should be a constant or scalar expression — evaluate against
+        // the first group row so scalar variables (group keys) are resolved.
+        let ref_row = group_rows.first().map(|r| r as &Row);
+        let empty = Row::new();
+        eval_expr(&args[1], ref_row.unwrap_or(&empty), params).unwrap_or(Value::Null)
+    };
     let pct = match pct_val {
         Value::Float(f) => f,
         Value::Int(i) => i as f64,
         _ => return Ok(Value::Null),
     };
     if !(0.0..=1.0).contains(&pct) {
-        return Err(ExecError { message: "percentile must be between 0.0 and 1.0".into() });
+        return Err(ExecError { message: "ArgumentError: NumberOutOfRange — percentile must be between 0.0 and 1.0".into() });
     }
     let mut vals: Vec<f64> = group_rows.iter()
         .filter_map(|row| eval_expr(&args[0], row, params).ok())
@@ -3264,19 +3362,21 @@ pub fn eval_expr(
             }
             Ok(Value::Json(serde_json::Value::Array(result_arr)))
         }
-        Expr::Exists { subquery } => {
-            // Execute the subquery in the context of the current row.
-            // Inject outer-scope variables as bindings.
+        Expr::Exists { subquery, .. } => {
+            // Plan the subquery with outer-scope variables known as bound.
+            // This ensures `MATCH (n)-->()` (where n is outer) uses n as a
+            // bound variable rather than scanning all nodes.
             use crate::cypher::planner;
-            let plan = planner::plan(subquery)
+            let outer_vars: std::collections::HashSet<String> = row.keys().cloned().collect();
+            let plan = planner::plan_with_outer(subquery, &outer_vars)
                 .map_err(|e| ExecError { message: e.message })?;
-            // Merge outer row vars into params for the inner execution.
+            // Inject outer row vars into params so the inner plan can look them up.
             let mut inner_params = params.clone();
             for (k, v) in row {
                 inner_params.insert(k.clone(), v.to_json());
             }
             let inner_rows = execute(&plan, &inner_params)?;
-            // Filter inner rows to those that are compatible with outer bindings.
+            // EXISTS is true if any inner row is compatible with outer bindings.
             // A row is compatible if all outer-scope variables present in the inner
             // row match the outer values.
             let found = inner_rows.into_iter().any(|inner_row| {
@@ -3383,6 +3483,26 @@ fn compare_values(left: &Value, op: &CmpOp, right: &Value) -> Option<bool> {
             })
         }
         (Value::Node { node_id: a, .. }, Value::Node { node_id: b, .. }) => Some(int_cmp(*a, op, *b)),
+        // Edge (relationship) equality: two edges are equal iff they have the same edge_id.
+        (Value::Edge { edge_id: a, .. }, Value::Edge { edge_id: b, .. }) => Some(int_cmp(*a, op, *b)),
+        // Path equality: two paths are equal iff they have the same node sequence and edge sequence.
+        (Value::Path { nodes: an, rels: ar }, Value::Path { nodes: bn, rels: br }) => {
+            match op {
+                CmpOp::Eq | CmpOp::Neq => {
+                    if an.len() != bn.len() || ar.len() != br.len() {
+                        return Some(matches!(op, CmpOp::Neq));
+                    }
+                    for (a, b) in an.iter().zip(bn.iter()) {
+                        if !values_equal(a, b) { return Some(matches!(op, CmpOp::Neq)); }
+                    }
+                    for (a, b) in ar.iter().zip(br.iter()) {
+                        if !values_equal(a, b) { return Some(matches!(op, CmpOp::Neq)); }
+                    }
+                    Some(matches!(op, CmpOp::Eq))
+                }
+                _ => None,
+            }
+        }
         // Temporal comparison: compare by canonical ISO string (lexicographic ≈ chronological for same-kind)
         (Value::Temporal(a), Value::Temporal(b)) => Some(str_cmp(&a.iso, op, &b.iso)),
         (Value::Temporal(a), Value::Str(b)) => Some(str_cmp(&a.iso, op, b)),
@@ -4201,6 +4321,60 @@ fn eval_function(
             let val = eval_expr(&args[1], row, params)?;
             Ok(val)
         }
+        // startNode(r) / endNode(r) — return source/target node of a relationship
+        "startnode" | "startNode" if args.len() == 1 => {
+            let rel_val = eval_expr(&args[0], row, params)?;
+            match rel_val {
+                Value::Edge { source, .. } => {
+                    // Look up the source node.
+                    use crate::catalog::labels::{label_name, prop_key_name};
+                    use crate::storage::prop_store;
+                    let record = unsafe {
+                        let rel = crate::open_nodes_relation();
+                        let snapshot = pgrx::pg_sys::GetActiveSnapshot();
+                        let r = crate::storage::node_store::find_node_by_id(rel, source, snapshot);
+                        pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                        r
+                    };
+                    match record {
+                        Some(r) => {
+                            let labels: Vec<String> = r.label_ids.iter().map(|id| label_name(*id)).collect();
+                            let properties = prop_store::decode(&r.prop_bytes, prop_key_name);
+                            Ok(Value::Node { node_id: source, labels, properties })
+                        }
+                        None => Ok(Value::Null),
+                    }
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Err(ExecError { message: "startNode() requires a relationship value".into() }),
+            }
+        }
+        "endnode" | "endNode" if args.len() == 1 => {
+            let rel_val = eval_expr(&args[0], row, params)?;
+            match rel_val {
+                Value::Edge { target, .. } => {
+                    use crate::catalog::labels::{label_name, prop_key_name};
+                    use crate::storage::prop_store;
+                    let record = unsafe {
+                        let rel = crate::open_nodes_relation();
+                        let snapshot = pgrx::pg_sys::GetActiveSnapshot();
+                        let r = crate::storage::node_store::find_node_by_id(rel, target, snapshot);
+                        pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                        r
+                    };
+                    match record {
+                        Some(r) => {
+                            let labels: Vec<String> = r.label_ids.iter().map(|id| label_name(*id)).collect();
+                            let properties = prop_store::decode(&r.prop_bytes, prop_key_name);
+                            Ok(Value::Node { node_id: target, labels, properties })
+                        }
+                        None => Ok(Value::Null),
+                    }
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Err(ExecError { message: "endNode() requires a relationship value".into() }),
+            }
+        }
         _ => Err(ExecError {
             message: format!("unknown function: {name}()"),
         }),
@@ -4367,6 +4541,16 @@ fn expr_default_name(expr: &Expr, idx: usize) -> String {
                 .collect();
             format!("[{}]", parts.join(", "))
         }
+        Expr::HasLabel(inner, labels) => {
+            // (n:Foo) → "n:Foo" — matches TCK column header `(n:Foo)` after paren stripping.
+            format!("{}:{}", expr_default_name(inner, idx), labels.join(":"))
+        }
+        Expr::MapLiteral(pairs) => {
+            let parts: Vec<String> = pairs.iter()
+                .map(|(k, v)| format!("{k}: {}", expr_default_name(v, idx)))
+                .collect();
+            format!("{{{}}}", parts.join(", "))
+        }
         _ => format!("_col{idx}"),
     }
 }
@@ -4384,28 +4568,52 @@ fn row_fingerprint(row: &Row) -> String {
 /// Cross-type ordering (openCypher): null > list > number > string > boolean
 fn value_ordering(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering::{Equal, Greater, Less};
+
+    // openCypher ascending type ordering (smallest to largest):
+    // Map < Node < Rel < List < Path < String < Boolean < Number < NaN < Null
+    fn type_rank(v: &Value) -> i32 {
+        match v {
+            Value::Json(serde_json::Value::Object(_)) => 0,  // Map
+            Value::Node { .. } => 1,
+            Value::Edge { .. } => 2,
+            Value::Json(serde_json::Value::Array(_)) => 3,  // List
+            Value::Path { .. } => 4,
+            Value::Str(_) => 5,
+            Value::Bool(_) => 6,
+            Value::Float(f) if f.is_nan() => 8,  // NaN > numbers but < null
+            Value::Int(_) | Value::Float(_) => 7,
+            Value::Null => 9,
+            _ => 5,
+        }
+    }
+
     match (a, b) {
         (Value::Null, Value::Null) => Equal,
         (Value::Null, _) => Greater,
         (_, Value::Null) => Less,
+        // Same-type comparisons
         (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Equal),
-        (Value::Int(x), Value::Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(Equal),
-        (Value::Float(x), Value::Int(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Equal),
+        (Value::Float(x), Value::Float(y)) => {
+            if x.is_nan() && y.is_nan() { return Equal; }
+            if x.is_nan() { return Greater; }  // NaN > regular floats
+            if y.is_nan() { return Less; }
+            x.partial_cmp(y).unwrap_or(Equal)
+        }
+        (Value::Int(x), Value::Float(y)) => {
+            if y.is_nan() { return Less; }
+            (*x as f64).partial_cmp(y).unwrap_or(Equal)
+        }
+        (Value::Float(x), Value::Int(y)) => {
+            if x.is_nan() { return Greater; }
+            x.partial_cmp(&(*y as f64)).unwrap_or(Equal)
+        }
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        // List ordering: lexicographic, with null elements sorting highest within a list.
         (Value::Json(serde_json::Value::Array(xa)), Value::Json(serde_json::Value::Array(ya))) => {
             list_ordering(xa, ya)
         }
-        // Cross-type: lists > numbers > strings > booleans (matching Neo4j/openCypher TCK)
-        (Value::Json(serde_json::Value::Array(_)), _) => Greater,
-        (_, Value::Json(serde_json::Value::Array(_))) => Less,
-        (Value::Int(_) | Value::Float(_), Value::Str(_) | Value::Bool(_)) => Greater,
-        (Value::Str(_) | Value::Bool(_), Value::Int(_) | Value::Float(_)) => Less,
-        (Value::Str(_), Value::Bool(_)) => Greater,
-        (Value::Bool(_), Value::Str(_)) => Less,
-        _ => Equal,
+        // Cross-type: use the openCypher type rank
+        _ => type_rank(a).cmp(&type_rank(b)),
     }
 }
 
@@ -4802,6 +5010,15 @@ fn create_pattern_in_row(
                 }
             }
         }
+    }
+    // Build path value if pattern has a path variable.
+    if let Some(ref pvar) = pattern.variable {
+        let elem_vars: Vec<String> = pattern.elements.iter().map(|e| match e {
+            PatternElement::Node(n) => n.variable.clone().unwrap_or_else(|| "_anon_n0".to_string()),
+            PatternElement::Relationship(r) => r.variable.clone().unwrap_or_else(|| "_anon_r".to_string()),
+        }).collect();
+        let path_val = build_path_from_elem_vars(&elem_vars, row);
+        row.insert(pvar.clone(), path_val);
     }
     Ok(())
 }
@@ -5288,9 +5505,53 @@ fn exec_delete_nodes(
                     deleted_edges.insert(edge_id);
                 }
                 other => {
-                    return Err(ExecError {
-                        message: format!("DELETE: expected a node, got {:?}", other),
-                    });
+                    // Handle Path: when DETACH DELETE is used with a path variable,
+                    // delete all nodes and edges in the path.
+                    if let Value::Path { nodes, rels } = other {
+                        if !detach {
+                            return Err(ExecError {
+                                message: "DELETE on a path requires DETACH DELETE".into(),
+                            });
+                        }
+                        for rel in &rels {
+                            if let Value::Edge { edge_id, .. } = rel {
+                                if deleted_edges.contains(edge_id) { continue; }
+                                unsafe {
+                                    let edge_rel = crate::open_edges_relation();
+                                    delete_edge(edge_rel, *edge_id);
+                                    pgrx::pg_sys::table_close(edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                                }
+                                pgrx::Spi::run_with_args(
+                                    "DELETE FROM _pg_eddy.edge_type_src WHERE edge_id = $1",
+                                    &[pgrx::datum::DatumWithOid::from(*edge_id)],
+                                ).unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_src delete: {e}"));
+                                pgrx::Spi::run_with_args(
+                                    "DELETE FROM _pg_eddy.edge_type_dst WHERE edge_id = $1",
+                                    &[pgrx::datum::DatumWithOid::from(*edge_id)],
+                                ).unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_dst delete: {e}"));
+                                deleted_edges.insert(*edge_id);
+                            }
+                        }
+                        for node_val in &nodes {
+                            if let Value::Node { node_id, .. } = node_val {
+                                if deleted_nodes.contains(node_id) { continue; }
+                                unsafe {
+                                    let rel = crate::open_nodes_relation();
+                                    delete_node_by_id(rel, *node_id);
+                                    pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                                }
+                                pgrx::Spi::run_with_args(
+                                    "DELETE FROM _pg_eddy.label_index WHERE node_id = $1",
+                                    &[pgrx::datum::DatumWithOid::from(*node_id)],
+                                ).unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index delete: {e}"));
+                                deleted_nodes.insert(*node_id);
+                            }
+                        }
+                    } else {
+                        return Err(ExecError {
+                            message: format!("DELETE: expected a node, got {:?}", other),
+                        });
+                    }
                 }
             }
         }
@@ -5368,14 +5629,42 @@ fn exec_merge_pattern(
             merged_params.insert(k.clone(), v.to_json());
         }
 
+        // Check for null properties in the MERGE pattern (SemanticError: MergeReadOwnWrites).
+        for elem in &pattern.elements {
+            let props = match elem {
+                PatternElement::Node(n) => &n.properties,
+                PatternElement::Relationship(r) => &r.properties,
+            };
+            for (key, expr) in props {
+                let val = eval_expr(expr, &outer_row, &merged_params)?;
+                if matches!(val, Value::Null) {
+                    return Err(ExecError {
+                        message: format!(
+                            "SemanticError: MergeReadOwnWrites — \
+                             MERGE pattern property '{key}' cannot be null"
+                        ),
+                    });
+                }
+            }
+        }
+
         // Try to match the pattern.
         let matches = execute(&match_plan, &merged_params)?;
 
         if matches.is_empty() {
             // Pattern not found — CREATE it.
+            // Normalize undirected relationships to OUT (openCypher MERGE semantics).
+            let mut create_pattern = pattern.clone();
+            for elem in &mut create_pattern.elements {
+                if let PatternElement::Relationship(r) = elem {
+                    if r.direction == crate::cypher::ast::RelDirection::Both {
+                        r.direction = crate::cypher::ast::RelDirection::Out;
+                    }
+                }
+            }
             let mut new_row = outer_row.clone();
             let mut buf = CatalogWriteBuffer::default();
-            create_pattern_in_row(pattern, &mut new_row, params, &mut buf)?;
+            create_pattern_in_row(&create_pattern, &mut new_row, &merged_params, &mut buf)?;
             buf.flush();
             // Apply ON CREATE SET.
             if !on_create.is_empty() {
@@ -5419,6 +5708,15 @@ fn exec_merge_pattern(
                             match_row.insert(k, v);
                         }
                     }
+                }
+                // Build path value if pattern has a path variable.
+                if let Some(ref pvar) = pattern.variable {
+                    let elem_vars: Vec<String> = pattern.elements.iter().map(|e| match e {
+                        PatternElement::Node(n) => n.variable.clone().unwrap_or_else(|| "_anon_n0".to_string()),
+                        PatternElement::Relationship(r) => r.variable.clone().unwrap_or_else(|| "_anon_r".to_string()),
+                    }).collect();
+                    let path_val = build_path_from_elem_vars(&elem_vars, &match_row);
+                    match_row.insert(pvar.clone(), path_val);
                 }
                 result.push(match_row);
             }

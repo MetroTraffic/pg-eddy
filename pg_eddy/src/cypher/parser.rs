@@ -652,7 +652,8 @@ impl Parser {
         }
 
         // Optional properties: {key: value, ...}
-        if *self.peek() == Token::LBrace {
+        let has_explicit_map = *self.peek() == Token::LBrace;
+        if has_explicit_map {
             properties = self.parse_property_map()?;
         }
 
@@ -662,6 +663,7 @@ impl Parser {
             variable,
             labels,
             properties,
+            has_explicit_map,
         })
     }
 
@@ -750,12 +752,8 @@ impl Parser {
             (false, true) => RelDirection::Out,
             (true, false) => RelDirection::In,
             (false, false) => RelDirection::Both,
-            (true, true) => {
-                return Err(ParseError {
-                    message: "bidirectional arrow <-[]--> is not valid".into(),
-                    offset: self.offset(),
-                })
-            }
+            // <--> and <-[r]-> are valid openCypher for undirected matching
+            (true, true) => RelDirection::Both,
         };
 
         let node = self.parse_node_pattern()?;
@@ -1223,6 +1221,12 @@ impl Parser {
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
         if *self.peek() == Token::Dash {
             self.advance();
+            // Special case: -9223372036854775808 = i64::MIN (the only negative
+            // Cypher integer that can't be represented as a positive literal)
+            if *self.peek() == Token::IntLitBig {
+                self.advance();
+                return Ok(Expr::IntLit(i64::MIN));
+            }
             let expr = self.parse_unary()?;
             Ok(Expr::Neg(Box::new(expr)))
         } else {
@@ -1235,6 +1239,14 @@ impl Parser {
             Token::IntLit(v) => {
                 self.advance();
                 Expr::IntLit(v)
+            }
+            Token::IntLitBig => {
+                // 9223372036854775808 without a preceding minus is an overflow.
+                let off = self.tokens[self.pos].offset;
+                return Err(ParseError {
+                    message: "SyntaxError: IntegerOverflow — integer literal out of range for i64".into(),
+                    offset: off,
+                });
             }
             Token::FloatLit(v) => {
                 self.advance();
@@ -1272,6 +1284,7 @@ impl Parser {
                         None
                     };
                     Expr::Exists {
+                        implicit: true,
                         subquery: Box::new(Query {
                             clauses: vec![QueryClause::Match {
                                 optional: false,
@@ -1387,15 +1400,17 @@ impl Parser {
                     self.advance(); // consume {
                     // The subquery is a full Cypher query (MATCH ... [RETURN]) or a pattern-only form
                     // Pattern-only: exists { (n)-->() } which has no RETURN
-                    // We need to handle the simple pattern-only form too:
-                    //   Treat it as MATCH pattern
-                    let subquery = if matches!(self.peek(), Token::LParen | Token::Match | Token::OptionalMatch) {
+                    // Full form: exists { MATCH (n)-->() RETURN ... } or exists { MATCH ... WITH ... RETURN }
+                    let subquery = if *self.peek() == Token::LParen {
+                        // Pattern-only form starting with '(' — no MATCH keyword
                         self.parse_exists_subquery()?
                     } else {
+                        // MATCH keyword present, or already a full query — use parse_query
+                        // which handles MATCH...RETURN and MATCH-only (stops at RBrace/Eof)
                         self.parse_query()?
                     };
                     self.expect(&Token::RBrace)?;
-                    return Ok(Expr::Exists { subquery: Box::new(subquery) });
+                    return Ok(Expr::Exists { implicit: false, subquery: Box::new(subquery) });
                 }
                 // Check for function call: name(...)
                 if *self.peek() == Token::LParen {
@@ -1895,8 +1910,7 @@ mod tests {
         // exists { (n)-->() } — pattern-only form
         let q = parse("MATCH (n) WHERE exists { (n)-->() } RETURN n").unwrap();
         match first_where(&q) {
-            Some(Expr::Exists { subquery }) => {
-                assert_eq!(subquery.clauses.len(), 1);
+            Some(Expr::Exists { subquery, .. }) => {
                 assert!(matches!(&subquery.clauses[0], QueryClause::Match { .. }));
             }
             other => panic!("expected Exists, got {other:?}"),
@@ -1908,7 +1922,7 @@ mod tests {
         // exists { MATCH (n)-[:R]->(m) WHERE m.val > 5 }
         let q = parse("MATCH (n) WHERE exists { MATCH (n)-[:R]->(m) WHERE m.val > 5 } RETURN n").unwrap();
         match first_where(&q) {
-            Some(Expr::Exists { subquery }) => {
+            Some(Expr::Exists { subquery, .. }) => {
                 match &subquery.clauses[0] {
                     QueryClause::Match { where_clause, .. } => assert!(where_clause.is_some()),
                     other => panic!("expected Match clause, got {other:?}"),

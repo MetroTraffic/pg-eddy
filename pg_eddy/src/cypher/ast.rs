@@ -145,6 +145,8 @@ pub struct NodePattern {
     pub variable: Option<String>,
     pub labels: Vec<String>,
     pub properties: Vec<(String, Expr)>,
+    /// True if an explicit property map `{}` was written (even if empty).
+    pub has_explicit_map: bool,
 }
 
 /// A relationship pattern: `-[variable:TYPE {prop: value}]->`.
@@ -284,8 +286,12 @@ pub enum Expr {
     },
     /// EXISTS { pattern } — existential subquery predicate (v0.11.0).
     /// Returns true if at least one result exists for the inner pattern query.
+    /// `implicit` = true when this was parsed as an inline pattern predicate
+    /// (e.g. `WHERE (n)-->(m)`) rather than an explicit `exists { ... }` block.
+    /// Implicit pattern predicates reject new named variables in the pattern.
     Exists {
         subquery: Box<Query>,
+        implicit: bool,
     },
     /// Label test: `n:Label` or `n:A:B` — true if node/rel has all listed labels/type
     HasLabel(Box<Expr>, Vec<String>),
