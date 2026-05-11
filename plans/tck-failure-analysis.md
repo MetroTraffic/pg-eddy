@@ -1,6 +1,6 @@
-# TCK Failure Classification — post-Quantifier-fix (3018/3880 passing, 77.8%)
+# TCK Failure Classification — post v0.20.0 fixes (3029/3880 passing, 78.1%)
 
-**Date**: 2026-05-11
+**Date**: 2025-05-11 (updated)
 **Status**: living reference — update after each release
 **Purpose**: Exhaustive classification of every failing TCK scenario, grouped
 by root cause. See [plans/rs-polygraph-analysis.md](rs-polygraph-analysis.md)
@@ -8,24 +8,33 @@ by root cause. See [plans/rs-polygraph-analysis.md](rs-polygraph-analysis.md)
 
 ## Snapshot
 
-- **Pass**: 3018 / 3880 (77.8%)
-- **Fail**: 862
-- **Unique failing feature groups**: 28
+- **Pass**: 3029 / 3880 (78.1%)
+- **Fail**: 851
+- **Unique failing feature groups**: 22 (down from 28)
+- **Regression floor**: 3029 (enforced by `tests/tck/baseline.txt`)
 
 ## Bucket Summary
 
 | Count | Bucket | Action |
 |------:|--------|--------|
-| 826 | Temporal types (Date, Time, LocalTime, LocalDateTime, DateTime, Duration) | Implement temporal type system (large feature; deferred) |
-| 12 | Variable-length / shortest-path patterns (Match4/5/9) | Implement variable-length expand correctness improvements |
-| ~~12~~ 0 | ~~Quantifier1–4 type mismatch [15/16]~~ ✅ **FIXED in v0.21.0-dev** | Compile-time type check in planner |
+| 826 | Temporal types (Date, Time, LocalTime, LocalDateTime, DateTime, Duration) | Implement temporal type system → v0.22.0 |
+| ~~12~~ 5 | Variable-length / shortest-path (Match4[7,8], Match5[27], Match6[14], Match9[*]) | Remaining hard cases after v0.21.0-dev fixes |
+| ~~12~~ 0 | ~~Quantifier1–4 type mismatch [15/16]~~ ✅ **FIXED** | Compile-time type check in planner |
 | 5 | WithOrderBy2 date sort [11,12] | Subset of temporal bucket — ORDER BY on date expression |
-| 4 | Optional MATCH edge cases (Match7[22,28], Match8[2,3]) | Targeted fixes to exec_expand / optional-match planner |
+| ~~4~~ 2 | ~~Optional MATCH (Match7[22,28])~~ partially ✅ | Match7[22,28] **FIXED**; Match8[2,3] remain |
 | 2 | Create2 [11,12] — adjacency edge to existing node | Storage-level: edge from pre-existing node not visible to follow-up MATCH |
 | 2 | CountingSubgraphMatches1 [10,11] — self-relationship counting | Executor: count self-relationships in mixed directed/undirected pattern |
 | 2 | WithOrderBy4 [13,14] — fail on non-projected aggregation in ORDER BY | Planner: add InvalidAggregation check for ORDER BY agg refs not in RETURN |
 | 2 | With2[1] / With4[2] — Forward property across WITH for join | Planner: forwarded scalar binding not used as join key |
-| 1 each | Pattern1[11] (self-pattern type check), Merge5[10] (path bind), WithSkipLimit2[2], MatchWhere4[2], WithWhere4[2], Match6[14], Delete5[7], Temporal7[*] | Targeted fixes |
+| 1 | WithSkipLimit2[2] | Limit dependencies |
+| 1 | MatchWhere4[2] | Disjunctive multi-part predicates |
+| 1 | WithWhere4[2] | Same as MatchWhere4[2] but in WITH |
+| 1 | Delete5[7] | Delete paths from nested map/list |
+| 0 | ~~Pattern1[11]~~ ✅ **FIXED** | WHERE boolean check |
+| 0 | ~~Merge5[10]~~ ✅ **FIXED** | MERGE path bind on create branch |
+| 0 | ~~Match5[4,21,22]~~ ✅ **FIXED** | *N exact length parsing |
+| 0 | ~~Match4[4], Match6[14], Match9[5]~~ ✅ **FIXED** | Var-length dst predicates |
+| 0 | ~~Match4[5]~~ ✅ **FIXED** | Var-length rel property predicates |
 
 ## Detailed Buckets
 
@@ -55,48 +64,40 @@ by root cause. See [plans/rs-polygraph-analysis.md](rs-polygraph-analysis.md)
 
 Recommend a dedicated v0.22.0+ release.
 
-### 2. Variable-length and named paths — 12 failures
+### 2. Variable-length and named paths — 5 remaining failures
 
-| Test | Issue |
-|------|-------|
-| Match4[*] | Variable-length pattern with various predicates |
-| Match5[*] | shortestPath / allShortestPaths |
-| Match9[*] | Deprecated variable-length scenarios |
-| Match6[14] | Named path with undirected fixed variable length |
+| Test | Issue | Status |
+|------|-------|--------|
+| Match4[4] | Var-length with dst label predicate | ✅ Fixed |
+| Match4[5] | Var-length with rel property predicate | ✅ Fixed |
+| Match4[7] | Complex var-length with multiple predicates | Open |
+| Match4[8] | Complex var-length with backtracking | Open |
+| Match5[4,21,22] | *N exact length | ✅ Fixed |
+| Match5[27] | allShortestPaths with complex predicates | Open |
+| Match6[14] | Named path with undirected fixed var-length | ✅ Fixed |
+| Match9[5] | Deprecated var-length with dst predicate | ✅ Fixed |
+| Match9[*] | Remaining deprecated syntax | Open (~2) |
 
-**Action**: Each Match4/5/9 group needs targeted analysis. Most are likely
-correctness issues in `exec_var_length_expand` rather than missing features.
+**Action**: Remaining cases (Match4[7,8], Match5[27]) require deeper analysis
+of the BFS executor. Low priority — only 5 scenarios total.
 
-### 3. Quantifier type-mismatch detection — 12 failures (4 scenarios × ~3 examples)
+### 3. Quantifier type-mismatch detection — ✅ RESOLVED (0 remaining)
 
-**Spec ref**: openCypher 9 §6.5 (Predicate functions)
+All 12 scenarios fixed via `check_quantifier_type_mismatch()` in planner.
+Detects when the list element type and predicate operand type are statically
+incompatible and raises SyntaxError at compile time.
 
-| Test | Scenario |
-|------|----------|
-| Quantifier1[15] | none(x IN list WHERE pred) with type mismatch |
-| Quantifier2[16] | single(x IN list WHERE pred) with type mismatch |
-| Quantifier3[15] | any(x IN list WHERE pred) with type mismatch |
-| Quantifier4[15] | all(x IN list WHERE pred) with type mismatch |
+### 4. Optional MATCH edge cases — 2 remaining failures
 
-Expected behaviour: when the list element type and the predicate's operand
-type are statically incompatible (e.g., `all(x IN [1,2,3] WHERE x.prop)` where
-integers don't have properties), raise SyntaxError at compile time.
+| Test | Issue | Status |
+|------|-------|--------|
+| Match7[22] | OPTIONAL MATCH with non-existent dst label | ✅ Fixed |
+| Match7[28] | OPTIONAL MATCH with inline label predicate | ✅ Fixed |
+| Match8[2] | Counting rows after MATCH, MERGE, OPTIONAL MATCH | Open |
+| Match8[3] | Matching and disregarding output, then matching again | Open |
 
-**Action**: Add compile-time type check in planner for list predicates. Requires
-basic type inference over the list expression.
-
-### 4. Optional MATCH edge cases — 4 failures
-
-| Test | Issue |
-|------|-------|
-| Match7[22] | MATCH after OPTIONAL MATCH — subsequent MATCH should run on null rows? |
-| Match7[28] | OPTIONAL MATCH with inline label predicate |
-| Match8[2] | Counting rows after MATCH, MERGE, OPTIONAL MATCH |
-| Match8[3] | Matching and disregarding output, then matching again |
-
-**Action**: Each needs individual analysis — these are pre-existing failures
-that survived v0.20.0 improvements. Suspect: how MATCH-after-OPTIONAL-MATCH
-interacts with the row pipeline when the optional side is null.
+**Action**: Match8[2,3] need individual analysis — involve interaction between
+MATCH-after-MERGE and OPTIONAL MATCH row pipeline.
 
 ### 5. Storage / adjacency — 2 failures
 
@@ -146,41 +147,59 @@ predicate.
 **Action**: Both involve a WITH-clause value used downstream as a join key.
 Planner currently expects pattern-pattern joins, not scalar-to-pattern joins.
 
-### 9. Singletons (1 failure each, 9 tests)
+### 9. Singletons (1 failure each)
 
-| Test | Bucket |
-|------|--------|
-| Pattern1[11] | Compile-time type check: WHERE (n) must reject non-boolean pattern |
-| Merge5[10] | MERGE should bind a path variable |
-| WithSkipLimit2[2] | Dependencies across WITH with LIMIT |
-| MatchWhere4[2] | Non-equi join with disjunctive multi-part predicates |
-| WithWhere4[2] | Same as MatchWhere4[2] but in WITH |
-| Match6[14] | Named path with undirected fixed variable length |
-| Delete5[7] | Delete paths from nested map/list |
-| Literals6[5] | (already fixed in v0.20.0) |
-| Literals7[17] | (already fixed in v0.20.0) |
+| Test | Bucket | Status |
+|------|--------|--------|
+| ~~Pattern1[11]~~ | ~~WHERE boolean check~~ | ✅ Fixed |
+| ~~Merge5[10]~~ | ~~MERGE path bind~~ | ✅ Fixed |
+| WithSkipLimit2[2] | Dependencies across WITH with LIMIT | Open |
+| MatchWhere4[2] | Non-equi join with disjunctive multi-part predicates | Open |
+| WithWhere4[2] | Same as MatchWhere4[2] but in WITH | Open |
+| ~~Match6[14]~~ | ~~Named path with undirected var-length~~ | ✅ Fixed |
+| Delete5[7] | Delete paths from nested map/list | Open |
+| ~~Literals6[5]~~ | ~~Gherkin backslash unescaping~~ | ✅ Fixed (v0.20.0) |
+| ~~Literals7[17]~~ | ~~String-aware list depth~~ | ✅ Fixed (v0.20.0) |
 
-## Recommended v0.21.0 Targets
+## Resolved (v0.21.0-dev, post v0.20.0 tag)
+
+| Fix | Scenarios Won | Commit |
+|-----|:---:|--------|
+| Quantifier type-mismatch detection | +12 | planner `check_quantifier_type_mismatch()` |
+| WHERE boolean check (Pattern1[11]) | +1 | planner `check_where_is_boolean()` |
+| MERGE path bind (Merge5[10]) | +1 | executor MERGE create branch |
+| OPTIONAL MATCH label short-circuit (Match7[22,28]) | +2 | executor `exec_expand` |
+| *N exact length parsing (Match5[4,21,22]) | +3 | parser `min_explicit` tracking |
+| Var-length dst predicates (Match4[4], Match6[14], Match9[5]) | +3 | planner Filter step |
+| Var-length rel predicates (Match4[5]) | +1 | planner rel property Filter |
+| **Total** | **+23** | 3006 → 3029 |
+
+## Remaining v0.21.0 Targets
 
 In rough effort-vs-value order:
 
-1. **Quantifier type-mismatch** (12 wins): compile-time type check in planner —
-   well-scoped, clear spec semantics.
+1. **CountingSubgraphMatches1[10,11]** (2 wins): self-loop counting in
+   exec_expand.
 2. **WithOrderBy4[13,14]** (2 wins): re-enable aggregation-in-ORDER-BY check
    with a tighter predicate that avoids the v0.20.0 regression.
-3. **CountingSubgraphMatches1[10,11]** (2 wins): self-loop counting in
-   exec_expand.
-4. **Create2[11,12]** (2 wins): adjacency flush timing — TAP test reproducer first.
-5. **Pattern1[11]** (1 win): reject non-pattern non-boolean expressions in WHERE.
-6. **Match7[28]** (1 win): inline label predicate on optional match.
+3. **Create2[11,12]** (2 wins): adjacency flush timing — TAP test reproducer first.
+4. **With2[1] / With4[2]** (2 wins): scalar-to-pattern join via WITH.
+5. **Match8[2,3]** (2 wins): MATCH after MERGE + OPTIONAL MATCH row counting.
+6. **WithSkipLimit2[2]** (1 win): dependencies across WITH with LIMIT.
+7. **MatchWhere4[2] / WithWhere4[2]** (2 wins): disjunctive multi-part predicates.
+8. **Delete5[7]** (1 win): DELETE paths from nested map/list.
 
-Total realistic v0.21.0 target: **+20 to +30 scenarios** (3026–3036 / 3880).
+Total realistic v0.21.0 target: **+14 to +20 scenarios** (3043–3049 / 3880, ~78.6%).
+
+After v0.21.0, only **826 temporal** + ~5 hard variable-length cases remain.
+The temporal type system (v0.22.0) is the final major feature push.
 
 ## Out of Scope (Future Releases)
 
-- Temporal types (v0.22.0+) — 826 scenarios
+- Temporal types (v0.22.0) — 826 scenarios; dedicated release planned
 - Spatial types — currently unimplemented, no TCK failures attributed
-- Variable-length path completeness (Match4/5/9) — partial in v0.21.0+
+- Variable-length hard cases (Match4[7,8], Match5[27]) — deferred; 
+  require recursive pattern analysis beyond current BFS executor
 
 ## How To Update This File
 

@@ -1466,7 +1466,7 @@ layer micro-benchmark already proved raw adjacency-follow speed.
 - [x] CI performance gate: IS-3 ratio > 1.0 (pg_eddy slower) fails benchmark script
       (exits 1); current result WARN (within 2×)
 
-**v0.13.0 — Storage Stabilisation + Parser Hardening** *(replaces Schema DDL as next milestone)*:
+**v0.13.0 — Storage Stabilisation + Parser Hardening** ✅ COMPLETE (tagged v0.13.0):
 
 > **Why this milestone was inserted**: TCK analysis after v0.12.1 found that
 > 53% of all 1487 failures (790 scenarios) are caused by a `PageAddItemExtended
@@ -1530,7 +1530,7 @@ expression positions; hex/octal literals parse; TCK pass rate ≥ 65%.
 
 ---
 
-**v0.14.0 — Property Indexes + Temporal Types**:
+**v0.14.0 — Property Indexes + Temporal Types** ✅ COMPLETE (tagged v0.14.0):
 
 > Moves temporal functions earlier (from v0.16.0) because they account for
 > 14% of TCK failures (201 scenarios), and property indexes fix the IS-1
@@ -1558,7 +1558,7 @@ TCK groups; TCK pass rate ≥ 80%.
 
 ---
 
-**v0.15.0 — Storage Correctness + Error Validation** *(replaces Schema DDL)*:
+**v0.15.0 — Storage Correctness + Error Validation** ✅ COMPLETE (tagged v0.15.0):
 
 > **Why this milestone was reshuffled**: TCK failure analysis after v0.14.0
 > shows that **70% of all 1047 failures** (732 scenarios) are storage errors:
@@ -1602,7 +1602,7 @@ undefined ORDER BY variables raise SyntaxError ✓; TCK pass rate ≥ 75%
 
 ---
 
-### Phase 8 — TCK Gap Closure and Full Cypher Compliance (v0.16.0–v0.22.0)
+### Phase 8 — TCK Gap Closure and Full Cypher Compliance (v0.16.0–v0.25.0)
 
 > **Context after v0.15.0**: 1781/3880 (45.9%) pass, 960 failing, 1141
 > skipped. The skip list is the bigger priority: 939 of 1141 skips come from
@@ -1612,7 +1612,7 @@ undefined ORDER BY variables raise SyntaxError ✓; TCK pass rate ≥ 75%
 
 ---
 
-**v0.16.0 — Map Literal Expressions**:
+**v0.16.0 — Map Literal Expressions** ✅ COMPLETE (tagged v0.16.0):
 
 > **Why first**: Map literal syntax `{key: expr, ...}` in RETURN/WITH/SET
 > unblocks 939 currently-skipped TCK scenarios — 82% of all skips — in a
@@ -1657,7 +1657,7 @@ were masked by the skip guards. Map literal feature itself is complete.
 
 ---
 
-**v0.17.0 — Error Validation + Named Paths**:
+**v0.17.0 — Error Validation + Named Paths** ✅ COMPLETE (tagged v0.17.0):
 
 > **Two orthogonal groups bundled because both are mid-sized and purely
 > executor/planner work with no storage impact.**
@@ -1693,7 +1693,7 @@ Match6 named-path scenarios pass; `shortestPath` returns correct result.
 
 ---
 
-**v0.18.0 — Quantifiers, Pattern Predicates, List Operations, UNION**:
+**v0.18.0 — Quantifiers, Pattern Predicates, List Operations, UNION** ✅ COMPLETE (tagged v0.18.0):
 
 **Quantifiers** (~50 scenarios: Quantifier9/11/12):
 - [x] `ANY(x IN list WHERE predicate)` → true if any element satisfies predicate
@@ -1727,89 +1727,203 @@ UNION works for basic cases. ✅
 
 ---
 
-**v0.19.0 — Temporal Completion, CALL, and Sort Correctness**:
+**v0.19.0 — Cypher Correctness and Ordering Improvements** ✅ COMPLETE (tagged v0.19.0)
 
-**Temporal gaps** (~133 scenarios: Temporal10/4/2/8/5):
-- [ ] `Temporal4` — storing temporal values as node/relationship properties
-      and reading them back with correct type (currently stored as strings,
-      not typed temporal values)
-- [ ] `Temporal2` — remaining ISO 8601 parsing edge cases: week-date format
-      `YYYY-Www-D`, ordinal date `YYYY-DDD`, truncated forms
-- [ ] `Temporal10` — `duration.between()` for all temporal type pairs
-      (currently only some pairs implemented); signed duration semantics
-- [ ] `Temporal8` — duration arithmetic: `date + duration`, `datetime - duration`,
-      duration addition/subtraction
-- [ ] `Temporal5` — component access on computed temporal values (not just
-      parsed literals)
+> **Reorientation**: The original plan called for temporal completion, CALL
+> procedures, and sort correctness. In practice, a broad sweep of engine
+> correctness issues was more impactful: fixing WITH post-aggregation WHERE,
+> bound relationship forwarding, named path null propagation, type ordering,
+> edge/path equality, and strict planner type-checking. This yielded +583 TCK
+> scenarios — far exceeding the original +242 target.
 
-**CALL procedure** (~49 skipped):
-- [ ] `CALL db.labels()` YIELD `label` — return all label names from catalog
-- [ ] `CALL db.relationshipTypes()` YIELD `relationshipType`
-- [ ] `CALL db.propertyKeys()` YIELD `propertyKey`
-- [ ] `CALL dbms.components()` YIELD `name, versions, edition`
-- [ ] Procedure registry infrastructure for future user-defined procedures
+**Delivered** (see CHANGELOG v0.19.0 for full details):
+- [x] WITH post-aggregation WHERE (HAVING semantics)
+- [x] Bound relationship variable forwarding across WITH
+- [x] Named path null propagation in OPTIONAL MATCH
+- [x] Correct openCypher type ordering (Map < Node < Rel < List < Path < String < Bool < Number < NaN < Null)
+- [x] ListPredicate over aggregate expressions
+- [x] Edge and path equality comparison
+- [x] Strict type checking in planner (labels/type/length argument validation)
+- [x] DISTINCT + ORDER BY validation
+- [x] NaN comparison semantics: NaN sorts last, `NaN <> NaN` is true
+- [x] Cross-type sort order per openCypher spec
 
-**Sort correctness** (~60 skipped/failing):
-- [ ] Temporal value ordering in ORDER BY: dates, times, datetimes, durations
-      (50 skipped: `temporal type sorting not supported`)
-- [ ] Cross-type sort order per openCypher spec: Null < Bool < Int/Float <
-      Str < List < Map < Node < Relationship < Path (10 skipped)
-- [ ] NaN comparison semantics: `NaN <> NaN` is true; NaN sorts last (4 skipped)
+**Deferred to future releases**:
+- [ ] Temporal4 — storing temporal values as typed properties (→ v0.22.0)
+- [ ] Temporal2 — week-date/ordinal-date ISO 8601 parsing (→ v0.22.0)
+- [ ] Temporal10 — duration.between() for all type pairs (→ v0.22.0)
+- [ ] Temporal8 — duration arithmetic (→ v0.22.0)
+- [ ] Temporal5 — component access on computed temporal values (→ v0.22.0)
+- [ ] CALL db.labels() / db.relationshipTypes() / db.propertyKeys() (→ v0.23.0)
+- [ ] Procedure registry infrastructure (→ v0.23.0)
 
-**Target**: TCK ≥ 81% (+~242 scenarios).
+**Actual result**: 2974/3880 (76.6%), +583 scenarios vs v0.18.0. **Target exceeded.**
 
-**Exit criteria**: Temporal4 storage round-trip works; CALL db.labels()
-returns results; ORDER BY on temporal values produces correct order.
-
----
-
-**v0.20.0 — Match Engine Completeness + Write Persistence**:
-
-**Match engine gaps** (~82 scenarios):
-- [ ] `Match7` — OPTIONAL MATCH: null propagation when no match found for
-      right side of outer join; `OPTIONAL MATCH (a)-[r]->(b)` with predicate
-- [ ] `Match3` — fixed-length multi-hop: `(a)-[r1]->(b)-[r2]->(c)` with
-      relationship variable binding across hops
-- [ ] `MatchWhere6` — filtering OPTIONAL MATCH results with WHERE on
-      optionally-null variables
-- [ ] `Graph5` — label expressions in patterns: `(n:A|B)`, `(n:!A)`,
-      `(n:A&B)` (GQL-style label predicates)
-- [ ] `Match9` — deprecated syntax acceptance (some scenarios need graceful
-      handling of legacy patterns)
-
-**Write persistence** (~26 scenarios: Delete6/Set6/Remove3):
-- [ ] `Delete6` — side effects of DELETE persist across WITH boundaries:
-      `MATCH (n) DELETE n WITH count(*) AS c RETURN c` should see 0 nodes
-- [ ] `Set6` — SET side effects visible in subsequent clauses of same query
-- [ ] `Remove3` — REMOVE side effects (label removal, property removal)
-      visible in subsequent clauses
-
-**CREATE/MERGE completeness** (~13 scenarios: Create4/5, Merge5):
-- [ ] Multi-hop CREATE patterns: `CREATE (a)-[:R]->(b)-[:R]->(c)` in one clause
-- [ ] `CREATE` with path variable: `CREATE p = (a)-[:R]->(b)`
-- [ ] `Merge5` — MERGE on relationships where end node must also be matched
-      or created; MERGE with ON CREATE / ON MATCH across relationship patterns
-
-**Skip/limit and comparison edge cases** (~41 scenarios):
-- [ ] `ReturnSkipLimit1/2` — SKIP/LIMIT with expressions; `SKIP 0`; fractional
-      coercion to integer
-- [ ] `Comparison1/2/3` — full equality edge cases (NaN, null, mixed numeric);
-      half-bounded and full-bounded range with null operands
-- [ ] `Unwind1` — UNWIND of null (should produce no rows), UNWIND of nested
-      lists
-
-**Target**: TCK ≥ 85% (+~162 scenarios).
-
-**Exit criteria**: OPTIONAL MATCH produces correct null rows; multi-hop CREATE
-works; Delete6/Set6/Remove3 persistence tests pass.
+**Exit criteria**: ✅ Cross-type sort order correct; NaN semantics correct;
+OPTIONAL MATCH named paths work; HAVING semantics work.
 
 ---
 
-**v0.21.0 — Property Indexes + Schema DDL**:
+**v0.20.0 — Engine Correctness and TCK Harness Improvements** ✅ COMPLETE (tagged v0.20.0)
 
-> Moved from the original v0.16.0 position. No TCK scenarios are gated on
-> this (SchemaAcceptance group is tiny), but IS-1 node-lookup benchmark
-> requires a property index for competitive performance.
+> **Reorientation**: Instead of one monolithic release targeting match engine,
+> write persistence, and CREATE/MERGE completeness all at once, v0.20.0
+> focused on a broad sweep of engine correctness bugs and TCK harness
+> improvements. This produced a steady +32 TCK gain and prepared the
+> infrastructure for systematic future work.
+
+**Delivered** (see CHANGELOG v0.20.0 for full details):
+- [x] NaN round-trip through JSON
+- [x] Relationship isomorphism in named paths
+- [x] Optional MATCH null-row preservation
+- [x] Multi-hop OPTIONAL MATCH uses LeftJoin
+- [x] Correlated variable fallback in eval_expr
+- [x] Nested EXISTS scope
+- [x] SET clause rejects pattern predicates
+- [x] rand() forbidden inside aggregate
+- [x] Property type validation in SET
+- [x] Aggregate ORDER BY via projected column lookup
+- [x] Map literal key case preservation
+- [x] TCK harness: UNWIND list-of-maps, trailing empty cells, backslash
+      unescaping, string-aware list depth tracking
+
+**Deferred to future releases**:
+- [ ] Match engine completeness: Match7 remaining edge cases, Graph5 label
+      expressions, Match9 deprecated syntax (→ v0.21.0)
+- [ ] Write persistence: Delete6/Set6/Remove3 side effects across WITH (→ v0.21.0)
+- [ ] Multi-hop CREATE patterns, CREATE with path variable (→ v0.21.0)
+
+**Actual result**: 3006/3880 (77.5%), +32 scenarios vs v0.19.0.
+
+**Exit criteria**: ✅ OPTIONAL MATCH correctness improved; named path
+isomorphism enforced; harness correctly parses all TCK row formats.
+
+---
+
+**v0.21.0 — Variable-Length Correctness + Remaining Quick Wins** (in progress):
+
+> **Reorientation**: Property indexes and Schema DDL are deferred further
+> (→ v0.23.0). The highest-value work is closing correctness gaps in
+> variable-length paths and the remaining non-temporal TCK failures (29
+> non-temporal failures at current state). This maximises the non-temporal
+> pass rate before the temporal type system is tackled.
+
+**Delivered so far** (unreleased, post v0.20.0):
+- [x] Quantifier type-mismatch compile-time detection (12 TCK scenarios)
+- [x] WHERE expression must be boolean — Pattern1[11] (1 scenario)
+- [x] MERGE binds path variable on create branch — Merge5[10] (1 scenario)
+- [x] OPTIONAL MATCH with non-existent dst label short-circuits — Match7[22,28] (2 scenarios)
+- [x] Variable-length `*N` parses as exact length N — Match5[4,21,22] (3 scenarios)
+- [x] Variable-length expand applies dst node label/property predicates — Match4[4], Match6[14], Match9[5] (3 scenarios)
+- [x] Variable-length expand applies rel property predicates — Match4[5] (1 scenario)
+- [x] TCK regression floor: `tests/tck/baseline.txt` + `tests/tck/tck_floor.sh`
+- [x] TCK failure classification: `plans/tck-failure-analysis.md`
+
+**Remaining targets**:
+- [ ] CountingSubgraphMatches1[10,11] — self-loop counting (2 scenarios)
+- [ ] WithOrderBy4[13,14] — non-projected aggregation in ORDER BY (2 scenarios)
+- [ ] Create2[11,12] — adjacency flush on follow-up MATCH after CREATE (2 scenarios)
+- [ ] With2[1] / With4[2] — scalar-to-pattern join via WITH (2 scenarios)
+- [ ] WithSkipLimit2[2] — dependencies across WITH with LIMIT (1 scenario)
+- [ ] Match8[2,3] — MATCH after MERGE + OPTIONAL MATCH row counting (2 scenarios)
+- [ ] Delete5[7] — DELETE paths from nested map/list (1 scenario)
+- [ ] MatchWhere4[2] / WithWhere4[2] — disjunctive multi-part predicates (2 scenarios)
+
+**Current TCK**: 3029/3880 (78.1%), +23 since v0.20.0 tag. Baseline floor: 3029.
+
+**Target**: TCK ≥ 79.5% (≈3085/3880, +56 from v0.20.0). Clear all non-temporal
+non-variable-length failures except known hard cases (Match4[7,8], Match5[27]).
+
+**Exit criteria**: All Quantifier, Pattern1, Merge5 path-bind scenarios pass ✓;
+variable-length path with dst predicates works ✓; no regressions below floor.
+
+---
+
+**v0.22.0 — Temporal Type System**:
+
+> **Why now**: After v0.21.0, the remaining 826 TCK failures (95% of all
+> non-passing scenarios) are temporal types. Every other non-temporal
+> correctness gap will have been closed. This is the largest single
+> feature remaining and requires a dedicated, focused release.
+>
+> See `plans/tck-failure-analysis.md` §1 for the full breakdown by suite.
+
+**Scope** (826 TCK scenarios across 10 suites):
+
+| Suite | Count | Covers |
+|-------|------:|--------|
+| Temporal9 | 322 | DateTime arithmetic and comparison |
+| Temporal3 | 183 | Time + LocalTime |
+| Temporal1 | 162 | Date construction and properties |
+| Temporal10 | 66 | Duration arithmetic |
+| Temporal8 | 27 | Duration construction |
+| Temporal4 | 27 | LocalDateTime |
+| Temporal6 | 17 | Time zones |
+| Temporal2 | 14 | Date arithmetic |
+| Temporal5 | 7 | DateTime construction |
+| Temporal7 | 1 | Edge cases |
+
+**Type system additions**:
+- [ ] `Value::Date(NaiveDate)` — calendar date without timezone
+- [ ] `Value::LocalTime(NaiveTime)` — time without timezone
+- [ ] `Value::Time(NaiveTime, FixedOffset)` — time with timezone offset
+- [ ] `Value::LocalDateTime(NaiveDateTime)` — datetime without timezone
+- [ ] `Value::DateTime(DateTime<FixedOffset>)` — full datetime with timezone
+- [ ] `Value::Duration { months: i64, days: i64, seconds: i64, nanos: i32 }` — ISO 8601 duration
+
+**Constructor functions**:
+- [ ] `date()`, `date({year, month, day})`, `date('YYYY-MM-DD')` — parse ISO 8601
+- [ ] `localtime()`, `localtime({hour, minute, second, ...})`, `localtime('HH:MM:SS')`
+- [ ] `time()`, `time({hour, minute, second, timezone})`, `time('HH:MM:SS+HH:MM')`
+- [ ] `localdatetime()`, `localdatetime({...})`, `localdatetime('...')`
+- [ ] `datetime()`, `datetime({...})`, `datetime('...')` — ISO 8601 with timezone
+- [ ] `duration()`, `duration({...})`, `duration('P...')` — ISO 8601 duration
+- [ ] Week-date format (`YYYY-Www-D`), ordinal date (`YYYY-DDD`), truncated forms
+
+**Component access**:
+- [ ] `.year`, `.month`, `.day`, `.hour`, `.minute`, `.second`, `.millisecond`,
+      `.microsecond`, `.nanosecond` on temporal values
+- [ ] `.timezone`, `.offset`, `.offsetMinutes`, `.offsetSeconds` on zoned types
+- [ ] `.epochMillis`, `.epochSeconds` on datetime types
+- [ ] `.years`, `.months`, `.days`, `.hours`, `.minutes`, `.seconds`,
+      `.milliseconds`, `.microseconds`, `.nanoseconds` on Duration
+
+**Arithmetic**:
+- [ ] `temporal + duration`, `temporal - duration` for all 5 temporal types
+- [ ] `duration + duration`, `duration - duration`, `duration * number`,
+      `duration / number`
+- [ ] `temporal - temporal` → Duration (for same-type pairs)
+- [ ] `duration.between(t1, t2)` for all valid temporal type pairs
+
+**Comparison and ordering**:
+- [ ] Temporal values of the same type are comparable with `<`, `>`, `=`, etc.
+- [ ] Cross-type temporal comparison: `Date < LocalDateTime < DateTime` (per spec)
+- [ ] ORDER BY on temporal values: ascending/descending with correct ordering
+- [ ] Null propagation: any null operand in temporal arithmetic → null
+
+**Storage**:
+- [ ] Temporal values stored as typed binary in property store (not JSON strings)
+- [ ] Property binary encoding tags 0x06–0x09 (already reserved in §5.3)
+- [ ] Round-trip: create node with temporal property → read back same value
+
+**Dependencies**: Rust `chrono` crate for calendar arithmetic + timezone
+resolution. IANA tz database via `chrono-tz` for named timezone support.
+
+**Target**: TCK ≥ 95% (~3686/3880). All Temporal1–10 suites pass except
+any spec-deviation edge cases documented in release notes.
+
+**Exit criteria**: All 5 temporal types + Duration stored and retrieved as
+typed values; ISO 8601 parsing handles all standard forms; temporal arithmetic
+correct for all type pairs; ORDER BY on temporal values correct.
+
+---
+
+**v0.23.0 — Property Indexes + Schema DDL**:
+
+> Moved from the original v0.16.0 → v0.21.0 → v0.23.0 position. No TCK
+> scenarios are gated on this (SchemaAcceptance group is tiny), but IS-1
+> node-lookup benchmark requires a property index for competitive performance.
+> CALL procedures also land here.
 
 - [ ] `pg_eddy.create_node_index(label TEXT, property_key TEXT)` — per-property
       B-tree index stored in a PostgreSQL index relation; integrated with
@@ -1822,16 +1936,22 @@ works; Delete6/Set6/Remove3 persistence tests pass.
 - [ ] `SHOW CONSTRAINTS` / `SHOW INDEXES` — query catalog tables
 - [ ] Planner: rewrite `WHERE n.prop = $val` into an index scan when a
       matching index exists; cost-based fallback to full scan
+- [ ] `CALL db.labels()` YIELD `label` — return all label names from catalog
+- [ ] `CALL db.relationshipTypes()` YIELD `relationshipType`
+- [ ] `CALL db.propertyKeys()` YIELD `propertyKey`
+- [ ] `CALL dbms.components()` YIELD `name, versions, edition`
+- [ ] Procedure registry infrastructure for user-defined procedures
 
 **Target**: `SchemaAcceptance` TCK group passes; IS-1 node lookup within 2×
-of AGE (property index used); TCK ~86%.
+of AGE (property index used); TCK ~96%.
 
 **Exit criteria**: IS-1 benchmark shows ≤2× AGE latency; `CREATE INDEX`
-and `CREATE CONSTRAINT` round-trip through `SHOW INDEXES`/`SHOW CONSTRAINTS`.
+and `CREATE CONSTRAINT` round-trip through `SHOW INDEXES`/`SHOW CONSTRAINTS`;
+`CALL db.labels()` returns correct results.
 
 ---
 
-**v0.22.0 — Query Optimisation**:
+**v0.24.0 — Query Optimisation**:
 
 - [ ] Cost model for AM scan operators: adjacency-follow O(degree) vs B-tree
       O(log N + degree) using `pg_class.reltuples` for label selectivity
@@ -1842,16 +1962,16 @@ and `CREATE CONSTRAINT` round-trip through `SHOW INDEXES`/`SHOW CONSTRAINTS`.
       per-operator row counts and wall-clock timings
 - [ ] Non-ASCII identifiers: Unicode letter/digit characters in node labels,
       relationship types, and property keys (6 skipped scenarios)
-- [ ] Remaining wrong-result fixes surfaced by v0.16–v0.21 work
+- [ ] Remaining wrong-result fixes surfaced by v0.16–v0.22 work
 
-**Target**: TCK ≥ 90%; IS-3 1-hop expand remains ≥1.8× faster than AGE.
+**Target**: TCK ≥ 97%; IS-3 1-hop expand remains ≥1.8× faster than AGE.
 
 **Exit criteria**: `cypher_explain` returns plan; predicate pushdown measurably
 reduces scan rows on indexed queries; no regressions on LDBC IS-1/IS-3.
 
 ---
 
-**v0.23.0 — Production Readiness**:
+**v0.25.0 — Production Readiness**:
 
 - [ ] LDBC SNB IS-1 through IS-7 and IC-1 through IC-14 benchmarked in full
       (extending the v0.12.x IS-1/IS-3 baseline to the complete suite);
@@ -1873,7 +1993,7 @@ reduces scan rows on indexed queries; no regressions on LDBC IS-1/IS-3.
       setup scenarios (multi-graph fixtures not supported by single-database
       AM), any spec deviations noted with upstream CIP references
 
-**Exit criteria** (v1.0 readiness): ≥95% TCK pass (document any remaining
+**Exit criteria** (v1.0 readiness): ≥98% TCK pass (document any remaining
 spec deviations); LDBC SNB full suite published baselines; pg_dump round-trip
 verified; `pg_eddy.health_check()` returns OK; Docker + CNPG images published.
 
