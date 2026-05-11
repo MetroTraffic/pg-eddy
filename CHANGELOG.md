@@ -31,6 +31,32 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ---
 
+## [Unreleased]
+
+### Process & Quality
+
+- **TCK regression floor**: New `tests/tck/baseline.txt` records the minimum
+  passing scenario count, enforced by `tests/tck/tck_floor.sh`. Following the
+  approach from rs-polygraph (see `plans/rs-polygraph-analysis.md` §4.3), no
+  release may decrease this number. Current floor: **3018**.
+- **TCK failure classification**: New `plans/tck-failure-analysis.md` exhaustively
+  buckets every failing scenario by root cause. Drives roadmap planning per
+  rs-polygraph §4.2.
+
+### Cypher Correctness
+
+- **Quantifier type-mismatch detection** (Quantifier1–4 [15], 12 TCK scenarios):
+  When the list argument of `any/all/none/single` is a homogeneous literal list
+  of strings or booleans, and the predicate applies arithmetic to the iteration
+  variable, the planner now raises `SyntaxError: InvalidArgumentType` at compile
+  time, matching openCypher 9 §6.5 semantics.
+
+### TCK
+
+- Pass rate: 3006 → 3018 / 3880 (77.5% → 77.8%, +12).
+
+---
+
 ## [0.20.0] — Engine Correctness and TCK Harness Improvements
 
 v0.20.0 is a focused correctness and test-harness release. TCK pass rate rises

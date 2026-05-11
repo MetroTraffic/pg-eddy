@@ -406,9 +406,8 @@ fn plan_clauses(
                 }
                 // Check for nested aggregation in RETURN items.
                 for item in items.iter() {
-                    if let Err(e) = check_nested_aggregation(&item.expr, false) {
-                        return Err(e);
-                    }
+                    check_nested_aggregation(&item.expr, false)?;
+                    check_quantifier_type_mismatch(&item.expr)?;
                 }
                 // Check: aggregation in ORDER BY without aggregation in RETURN projection
                 // is a SyntaxError (InvalidAggregation). Mirrors the same check for WITH.
@@ -1746,8 +1745,115 @@ fn check_nested_aggregation(expr: &Expr, inside_agg: bool) -> Result<(), PlanErr
     }
 }
 
-/// Build a relationship isomorphism filter: for N relationship variables,
-/// emit id(r1) != id(r2) for every pair (i, j) with i < j.
+/// Static type-mismatch check for list quantifiers (any/all/none/single).
+///
+/// When the list expression is a literal whose elements are all of a single
+/// non-numeric primitive type (String or Bool), an arithmetic operation
+/// applied to the iteration variable in the predicate is an `InvalidArgumentType`
+/// compile-time error per openCypher 9 §6.5.
+fn check_quantifier_type_mismatch(expr: &Expr) -> Result<(), PlanError> {
+    match expr {
+        Expr::ListPredicate { variable, list_expr, predicate, .. } => {
+            check_quantifier_type_mismatch(list_expr)?;
+            if let Some(elem_ty) = infer_homogeneous_list_type(list_expr)
+                && !matches!(elem_ty, PrimTy::Int | PrimTy::Float)
+                && predicate_arith_on_var(predicate, variable)
+            {
+                return Err(PlanError {
+                    message: format!(
+                        "SyntaxError: InvalidArgumentType — \
+                         arithmetic operation on iteration variable '{variable}' \
+                         whose list elements are of type {elem_ty:?}"
+                    ),
+                });
+            }
+            check_quantifier_type_mismatch(predicate)
+        }
+        Expr::Arith(l, _, r) | Expr::Compare(l, _, r) | Expr::And(l, r)
+        | Expr::Or(l, r) | Expr::Xor(l, r) | Expr::StartsWith(l, r)
+        | Expr::EndsWith(l, r) | Expr::Contains(l, r) | Expr::InList(l, r) => {
+            check_quantifier_type_mismatch(l)?;
+            check_quantifier_type_mismatch(r)
+        }
+        Expr::Not(e) | Expr::Neg(e) | Expr::IsNull(e) | Expr::IsNotNull(e)
+        | Expr::HasLabel(e, _) | Expr::Property(e, _) => check_quantifier_type_mismatch(e),
+        Expr::FunctionCall(_, args) | Expr::List(args) => {
+            for a in args { check_quantifier_type_mismatch(a)?; }
+            Ok(())
+        }
+        Expr::MapLiteral(pairs) => {
+            for (_, v) in pairs { check_quantifier_type_mismatch(v)?; }
+            Ok(())
+        }
+        Expr::Subscript(b, i) => {
+            check_quantifier_type_mismatch(b)?;
+            check_quantifier_type_mismatch(i)
+        }
+        _ => Ok(()),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimTy { Int, Float, String, Bool }
+
+/// If `expr` is a literal list whose elements are all the same primitive type,
+/// return that type; otherwise None.
+fn infer_homogeneous_list_type(expr: &Expr) -> Option<PrimTy> {
+    let items = match expr {
+        Expr::List(items) => items,
+        _ => return None,
+    };
+    if items.is_empty() { return None; }
+    let mut ty: Option<PrimTy> = None;
+    for it in items {
+        let t = match it {
+            Expr::IntLit(_) => PrimTy::Int,
+            Expr::FloatLit(_) => PrimTy::Float,
+            Expr::StringLit(_) => PrimTy::String,
+            Expr::BoolLit(_) => PrimTy::Bool,
+            _ => return None,
+        };
+        match ty {
+            None => ty = Some(t),
+            Some(prev) if prev == t => {}
+            _ => return None,
+        }
+    }
+    ty
+}
+
+/// Returns true if `expr` contains an arithmetic operation whose operand
+/// directly references the variable `var`.
+fn predicate_arith_on_var(expr: &Expr, var: &str) -> bool {
+    match expr {
+        Expr::Arith(l, _, r) => {
+            is_var_ref(l, var) || is_var_ref(r, var)
+                || predicate_arith_on_var(l, var) || predicate_arith_on_var(r, var)
+        }
+        Expr::Compare(l, _, r) | Expr::And(l, r) | Expr::Or(l, r) | Expr::Xor(l, r)
+        | Expr::StartsWith(l, r) | Expr::EndsWith(l, r) | Expr::Contains(l, r)
+        | Expr::InList(l, r) => predicate_arith_on_var(l, var) || predicate_arith_on_var(r, var),
+        Expr::Not(e) | Expr::Neg(e) | Expr::IsNull(e) | Expr::IsNotNull(e)
+        | Expr::HasLabel(e, _) | Expr::Property(e, _) => predicate_arith_on_var(e, var),
+        Expr::FunctionCall(_, args) | Expr::List(args) => {
+            args.iter().any(|a| predicate_arith_on_var(a, var))
+        }
+        Expr::MapLiteral(pairs) => pairs.iter().any(|(_, v)| predicate_arith_on_var(v, var)),
+        Expr::Subscript(b, i) => predicate_arith_on_var(b, var) || predicate_arith_on_var(i, var),
+        Expr::ListPredicate { list_expr, predicate, variable, .. } => {
+            // Shadowing: an inner predicate with the same iteration variable
+            // doesn't reference the outer one's binding inside its predicate.
+            predicate_arith_on_var(list_expr, var)
+                || (variable != var && predicate_arith_on_var(predicate, var))
+        }
+        _ => false,
+    }
+}
+
+fn is_var_ref(expr: &Expr, var: &str) -> bool {
+    matches!(expr, Expr::Variable(v) if v == var)
+}
+
 /// Null-safe: `r1 IS NULL OR r2 IS NULL OR id(r1) != id(r2)`.
 /// This enforces openCypher relationship uniqueness within a MATCH clause.
 fn build_rel_isomorphism_filter(rel_vars: &[String]) -> Option<Expr> {
