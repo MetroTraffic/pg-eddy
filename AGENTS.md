@@ -46,7 +46,7 @@ justfile          — Developer task runner
 ```bash
 cargo build --features pg18        # build
 cargo pgrx test pg18               # run pgrx unit tests
-cargo clippy --features pg18       # lint
+just lint                          # lint (uses -D warnings; bare clippy misses warnings)
 cargo pgrx run pg18                # start psql session
 ```
 
@@ -121,8 +121,10 @@ Before releasing a new version:
 4. **Run unit tests** — ⚠️ **REQUIRED GATE** — Execute `cargo pgrx test pg18`
    and ensure all tests pass (all unit tests in `pg_eddy/src/` must pass).
    Do not proceed to tagging if any tests fail.
-5. **Run clippy** — ⚠️ **REQUIRED GATE** — Execute `cargo clippy --features pg18`
-   and ensure there are zero warnings. Do not proceed to tagging if clippy fails.
+5. **Run clippy** — ⚠️ **REQUIRED GATE** — Execute `just lint` (which runs
+   `cargo clippy --features pg18 -- -D warnings`) and ensure there are zero warnings.
+   Do not use bare `cargo clippy --features pg18` — it does not treat warnings as errors.
+   Do not proceed to tagging if clippy fails.
 6. **Run TAP tests** — Execute `prove tests/tap/*.pl` to verify crash recovery
    and edge cases work correctly.
 7. **Run TCK tests** — Execute `perl tests/tck/run_tck.pl` and update the badge

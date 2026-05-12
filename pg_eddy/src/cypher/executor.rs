@@ -1996,11 +1996,11 @@ fn temporal_cmp(a: &TemporalValue, b: &TemporalValue) -> std::cmp::Ordering {
             let a_utc_ns = time_to_ns(at) - (a_off as i64) * 1_000_000_000;
             let b_utc_ns = time_to_ns(bt) - (b_off as i64) * 1_000_000_000;
             if let (Some(ad), Some(bd)) = (a.date, b.date) {
-                // DateTime: compare date first, then time
-                let a_days = ad.num_days_from_ce() as i64;
-                let b_days = bd.num_days_from_ce() as i64;
-                let a_total = a_days * 86_400_000_000_000 + a_utc_ns;
-                let b_total = b_days * 86_400_000_000_000 + b_utc_ns;
+                // DateTime: compare date first, then time — use i128 to avoid overflow
+                let a_days = ad.num_days_from_ce() as i128;
+                let b_days = bd.num_days_from_ce() as i128;
+                let a_total = a_days * 86_400_000_000_000i128 + a_utc_ns as i128;
+                let b_total = b_days * 86_400_000_000_000i128 + b_utc_ns as i128;
                 return a_total.cmp(&b_total);
             }
             // Time only: compare UTC nanoseconds (mod day)
@@ -6709,21 +6709,37 @@ fn exec_create_pattern(
     patterns: &[Pattern],
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<Vec<Row>, ExecError> {
-    let input_rows = execute(input, params)?;
+    // Collect the full chain of consecutive CreatePattern nodes iteratively to avoid
+    // stack overflow from deeply-nested plans (e.g. 100+ chained CREATE clauses).
+    let mut chain: Vec<&[Pattern]> = vec![patterns];
+    let mut cur: &LogicalPlan = input;
+    while let LogicalPlan::CreatePattern { input: inner, patterns: pats } = cur {
+        chain.push(pats);
+        cur = inner;
+    }
+    chain.reverse(); // bottom-up: execute base first
+
+    let input_rows = execute(cur, params)?;
     let mut result = Vec::new();
     let mut buf = CatalogWriteBuffer::default();
+    let is_single_row = matches!(cur, LogicalPlan::SingleRow);
+
     for row in input_rows {
         let mut new_row = row.clone();
-        for pattern in patterns {
-            create_pattern_in_row(pattern, &mut new_row, params, &mut buf)?;
+        for pats in &chain {
+            for pattern in *pats {
+                create_pattern_in_row(pattern, &mut new_row, params, &mut buf)?;
+            }
         }
         result.push(new_row);
     }
     // If there were no input rows (empty pipeline), create once.
-    if result.is_empty() && matches!(input, LogicalPlan::SingleRow) {
+    if result.is_empty() && is_single_row {
         let mut new_row = Row::new();
-        for pattern in patterns {
-            create_pattern_in_row(pattern, &mut new_row, params, &mut buf)?;
+        for pats in &chain {
+            for pattern in *pats {
+                create_pattern_in_row(pattern, &mut new_row, params, &mut buf)?;
+            }
         }
         result.push(new_row);
     }

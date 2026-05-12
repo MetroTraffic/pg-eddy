@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.22.2](#0222----tck-bug-fixes) — TCK Bug Fixes
 - [0.22.1](#0221----100-tck-compliance) — 100% TCK Compliance
 - [0.22.0](#0220----temporal-type-system) — Temporal Type System
 - [0.21.0](#0210----variable-length-correctness-and-remaining-quick-wins) — Variable-Length Correctness and Remaining Quick Wins
@@ -35,6 +36,29 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 ---
 
 ## [Unreleased]
+
+---
+
+## [0.22.2] — 2026-05-12 — TCK Bug Fixes
+
+v0.22.2 fixes two bugs found by a clean full-TCK run after v0.22.1.
+TCK pass rate: **3880/3880** (0 failures; 171 intentionally skipped
+scenarios count as TAP passes).
+
+### Fixed
+
+**`temporal_cmp` integer overflow** — When comparing `datetime` values
+with timezone offsets, the conversion from day count to nanoseconds
+used `i64` arithmetic which overflows for dates in common years (e.g.
+1984 → ~724,000 days × 86,400,000,000,000 ns >> `i64::MAX`). Fixed
+by using `i128` for the intermediate product. Fixes Temporal6[5] and
+Temporal7[5].
+
+**`exec_create_pattern` stack overflow on large CREATE queries** — A
+query with many chained `CREATE` clauses (e.g. Create4[2] with ~180
+clauses) built a deeply nested `LogicalPlan::CreatePattern` tree that
+caused a stack overflow when `execute()` recursed through it. Fixed by
+unwinding the chain iteratively before executing. Fixes Create4[2].
 
 ---
 
