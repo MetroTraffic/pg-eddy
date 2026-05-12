@@ -42,11 +42,10 @@ pub enum QueryClause {
     },
     /// CALL proc.name(arg, …) YIELD col1, col2 — procedure call.
     CallProcedure {
-        #[allow(dead_code)]
         proc_name: String,
-        #[allow(dead_code)]
         args: Vec<Expr>,
         yield_items: Vec<(String, Option<String>)>, // (column, alias)
+        implicit: bool, // true when called without parens (implicit arg passing)
     },
     /// WITH clause: intermediate projection (may include WHERE after it).
     With {

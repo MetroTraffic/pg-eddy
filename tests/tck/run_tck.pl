@@ -43,9 +43,6 @@ my $SKIP_GROUPS = do {
 # Cypher features not yet implemented in pg_eddy v0.12.0.
 # A scenario whose query contains any of these patterns is skipped.
 my @UNSUPPORTED_QUERY_PATTERNS = (
-    [ qr/\bCALL\b/i,               'CALL'              ],
-    [ qr/\bFOREACH\b/i,            'FOREACH'           ],
-    [ qr/\bexists\b\s*\(/i,        'exists()'          ],
 );
 
 # ---------------------------------------------------------------------------
@@ -132,19 +129,6 @@ sub classify_scenario {
     my $test_query = '';
     my $label = $sc->{label} // '';
 
-    # Skip date/time scenarios (temporal types not supported)
-    if ($label =~ /Sort dates|Sort local times|Sort times|Sort local date times|Sort date times|sort.*time|time.*sort/i) {
-        return ('skip', 'temporal type sorting not supported');
-    }
-    # Skip sort order consistency with mixed types
-    if ($label =~ /Sort order should be consistent/i) {
-        return ('skip', 'cross-type sort order not supported');
-    }
-    # Skip NaN comparisons
-    if ($label =~ /Comparing NaN/i) {
-        return ('skip', 'NaN comparison not supported');
-    }
-
     for my $step (@{$sc->{steps}}) {
         my ($kw, $text, $doc) = ($step->{kw}, $step->{text} // '', $step->{docstring} // '');
 
@@ -153,10 +137,6 @@ sub classify_scenario {
             # This is handled by run_scenario using setup_queries; don't skip.
             # But if the having-executed query itself uses unsupported features, skip.
             if ($doc) {
-                # Skip if setup query has non-ASCII chars.
-                if ($doc =~ /[^\x00-\x7F]/) {
-                    return ('skip', 'non-ASCII in setup query');
-                }
                 for my $entry (@UNSUPPORTED_QUERY_PATTERNS) {
                     my ($pat, $plabel) = @$entry;
                     if ($doc =~ $pat) {
@@ -165,36 +145,19 @@ sub classify_scenario {
                 }
             }
         }
-        # Skip specific named graphs (binary-tree, etc.) that we can't create
-        if ($kw eq 'Given' && $text =~ /\bthe .+-\d+ graph\b/i) {
-            return ('skip', 'requires named graph (data setup not supported)');
+        # Named graph fixtures — load from vendor/opencypher/tck/graphs/
+        if ($kw eq 'Given' && $text =~ /\bthe (.+?) graph\b/i) {
+            # no skip — handled in run_scenario
         }
-        # For 'any graph' — since we now support CREATE, treat as empty graph (run it).
-        # The scenario does not require specific pre-existing data, just an empty graph is fine.
-        # (We no longer skip these.)
 
         # Collect the test query (main or control) for skip checks.
         if ($kw eq 'When' && $text =~ /executing (?:control )?query/i && $doc) {
             $test_query = $doc;
         }
-
-        # Skip if expecting an error type we can't validate.
-        if ($text =~ /\b(ParameterMissing|ProcedureNotFound|UnknownFunction|InvalidArgumentValue)\b/i) {
-            return ('skip', "error scenario not verifiable for $1");
-        }
     }
 
     # Skip if query uses unsupported features.
     if ($test_query) {
-        # Skip queries containing non-ASCII characters (emoji, etc.) which
-        # can cause encoding issues in the test harness query escaping.
-        if ($test_query =~ /[^\x00-\x7F]/) {
-            return ('skip', 'non-ASCII characters in query');
-        }
-        # Skip queries with Cypher Unicode escape sequences (\uXXXX) — not yet supported.
-        if ($test_query =~ /\\u[0-9a-fA-F]{4}/) {
-            return ('skip', 'Cypher Unicode escape sequences not supported');
-        }
         for my $entry (@UNSUPPORTED_QUERY_PATTERNS) {
             my ($pat, $label) = @$entry;
             if ($test_query =~ $pat) {
@@ -229,6 +192,38 @@ sub run_scenario {
     my @control_expect_steps;
     my $control_ordered;
     my $capturing_control = 0;
+    my %procedures;  # Mock procedure definitions: name => { args => [...], arg_types => [...], yields => [...], data => [...] }
+
+    # Load named graph fixture if present (e.g. "Given the binary-tree-1 graph").
+    for my $step (@{$sc->{steps}}) {
+        if (($step->{kw} // '') eq 'Given' && ($step->{text} // '') =~ /\bthe (.+?) graph\b/i) {
+            my $graph_name = $1;
+            next if $graph_name eq 'empty' || $graph_name eq 'any';
+            my $cypher_file = "vendor/opencypher/tck/graphs/$graph_name/$graph_name.cypher";
+            unless (-f $cypher_file) {
+                eval { $node->safe_psql('postgres', 'ROLLBACK') };
+                return ('fail', "named graph file not found: $cypher_file");
+            }
+            open(my $fh, '<', $cypher_file) or do {
+                eval { $node->safe_psql('postgres', 'ROLLBACK') };
+                return ('fail', "cannot read $cypher_file: $!");
+            };
+            my $graph_cypher = do { local $/; <$fh> };
+            close $fh;
+            $graph_cypher =~ s/^\s+|\s+$//g;
+            # Strip trailing semicolons (openCypher graph files end with ';')
+            $graph_cypher =~ s/;\s*$//;
+            # Execute the graph setup query
+            (my $g_esc = $graph_cypher) =~ s/'/''/g;
+            my $g_sql = "SELECT * FROM cypher('$g_esc', NULL::jsonb)";
+            my ($g_ret, $g_out, $g_err) = $node->psql('postgres', $g_sql);
+            if ($g_err && $g_err =~ /ERROR/) {
+                eval { $node->safe_psql('postgres', 'ROLLBACK') };
+                return ('fail', "named graph setup failed: " . ($g_err =~ /ERROR:\s*(.+)/)[0]);
+            }
+            last;
+        }
+    }
 
     for my $step (@{$sc->{steps}}) {
         my ($kw, $text, $doc) = ($step->{kw}, $step->{text} // '', $step->{docstring} // '');
@@ -247,7 +242,7 @@ sub run_scenario {
             $capturing_control = 0;
         }
 
-        if ($text =~ /(\w*Error) should be raised/i) {
+        if ($text =~ /(\w+(?:Error|Missing)) should be raised/i) {
             $expects_error     = 1;
             $expected_err_type = $1;
         }
@@ -280,6 +275,54 @@ sub run_scenario {
                 $params{$key} = $val;
             }
         }
+        # Parse "And there exists a procedure test.proc(arg :: TYPE?) :: (out :: TYPE?):" steps
+        if ($text =~ /there exists a procedure\s+(.+)/i) {
+            my $proc_decl = $1;
+            # Parse: name(arg1 :: TYPE1?, arg2 :: TYPE2?) :: (yield1 :: YTYPE1?, yield2 :: YTYPE2?):
+            if ($proc_decl =~ /^([\w.]+)\(([^)]*)\)\s*::\s*\(([^)]*)\)\s*:?\s*$/) {
+                my ($proc_name, $args_str, $yields_str) = ($1, $2, $3);
+                my @arg_names;
+                my @arg_types;
+                if ($args_str =~ /\S/) {
+                    for my $arg_def (split /,/, $args_str) {
+                        $arg_def =~ s/^\s+|\s+$//g;
+                        if ($arg_def =~ /^(\w+)\s*::\s*(\w+)\??$/) {
+                            push @arg_names, $1;
+                            push @arg_types, $2;
+                        }
+                    }
+                }
+                my @yield_names;
+                if ($yields_str =~ /\S/) {
+                    for my $y_def (split /,/, $yields_str) {
+                        $y_def =~ s/^\s+|\s+$//g;
+                        if ($y_def =~ /^(\w+)\s*::\s*(\w+)\??$/) {
+                            push @yield_names, $1;
+                        }
+                    }
+                }
+                # Build data rows from the step's table (skip header row)
+                my @data_rows;
+                if ($step->{table} && @{$step->{table}} > 1) {
+                    my @all_cols = (@arg_names, @yield_names);
+                    my @data_tbl = @{$step->{table}}[1..$#{$step->{table}}];
+                    for my $row (@data_tbl) {
+                        my %data_row;
+                        for my $i (0..$#all_cols) {
+                            my $cell = $row->[$i] // '';
+                            $data_row{$all_cols[$i]} = $cell;
+                        }
+                        push @data_rows, \%data_row;
+                    }
+                }
+                $procedures{$proc_name} = {
+                    args => \@arg_names,
+                    arg_types => \@arg_types,
+                    yields => \@yield_names,
+                    data => \@data_rows,
+                };
+            }
+        }
     }
 
     unless ($test_query) {
@@ -301,9 +344,9 @@ sub run_scenario {
     my $escaped = $test_query;
     $escaped =~ s/'/''/g;
 
-    # Build parameter JSON if we have parameters
+    # Build parameter JSON if we have parameters or procedure definitions
     my $params_json = 'NULL::jsonb';
-    if (%params) {
+    if (%params || %procedures) {
         my @kv;
         for my $k (sort keys %params) {
             my $v = $params{$k};
@@ -336,6 +379,28 @@ sub run_scenario {
                 $vs =~ s/'/''/g;
                 push @kv, qq("$k": "$vs");
             }
+        }
+        # Inject mock procedure definitions as __procedures
+        if (%procedures) {
+            my @proc_entries;
+            for my $pname (sort keys %procedures) {
+                my $p = $procedures{$pname};
+                my $args_json = '[' . join(',', map { qq("$_") } @{$p->{args}}) . ']';
+                my $types_json = '[' . join(',', map { qq("$_") } @{$p->{arg_types}}) . ']';
+                my $yields_json = '[' . join(',', map { qq("$_") } @{$p->{yields}}) . ']';
+                my @data_json;
+                for my $drow (@{$p->{data}}) {
+                    my @dkv;
+                    for my $dk (sort keys %$drow) {
+                        my $dv = $drow->{$dk};
+                        push @dkv, qq("$dk": ) . proc_cell_to_json($dv);
+                    }
+                    push @data_json, '{' . join(',', @dkv) . '}';
+                }
+                my $data_arr = '[' . join(',', @data_json) . ']';
+                push @proc_entries, qq("$pname": {"args": $args_json, "arg_types": $types_json, "yields": $yields_json, "data": $data_arr});
+            }
+            push @kv, '"__procedures": {' . join(', ', @proc_entries) . '}';
         }
         $params_json = "'{" . join(', ', @kv) . "}'::jsonb";
     }
@@ -762,6 +827,29 @@ sub cypher_list_to_json {
         }
     }
     return '[' . join(', ', @json_elems) . ']';
+}
+
+# Convert a procedure data table cell value to JSON.
+sub proc_cell_to_json {
+    my ($v) = @_;
+    return 'null' unless defined $v;
+    $v =~ s/^\s+|\s+$//g;
+    return 'null' if $v eq '' || lc($v) eq 'null';
+    return $v if $v =~ /^-?\d+$/;           # integer
+    return $v if $v =~ /^-?\d+\.\d+$/;      # float
+    return 'true' if lc($v) eq 'true';
+    return 'false' if lc($v) eq 'false';
+    # Quoted string
+    if ($v =~ /^'(.*)'$/) {
+        my $s = $1;
+        $s =~ s/\\/\\\\/g;
+        $s =~ s/"/\\"/g;
+        return qq("$s");
+    }
+    # Bare string (shouldn't happen in well-formed TCK data)
+    $v =~ s/\\/\\\\/g;
+    $v =~ s/"/\\"/g;
+    return qq("$v");
 }
 
 # Convert a Cypher map display string like {name: 'Apa', age: 38} to a JSON object string.

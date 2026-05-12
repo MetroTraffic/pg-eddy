@@ -187,7 +187,7 @@ impl Parser {
                             proc_name.push_str(&next);
                         }
                         // Parse optional argument list
-                        let args = if *self.peek() == Token::LParen {
+                        let (args, implicit) = if *self.peek() == Token::LParen {
                             self.advance(); // (
                             let mut args = Vec::new();
                             if *self.peek() != Token::RParen {
@@ -198,33 +198,38 @@ impl Parser {
                                 }
                             }
                             self.expect(&Token::RParen)?;
-                            args
+                            (args, false)
                         } else {
-                            Vec::new()
+                            (Vec::new(), true)
                         };
                         // Parse optional YIELD clause
                         let yield_items = if *self.peek() == Token::Yield {
                             self.advance();
-                            let mut items = Vec::new();
-                            loop {
-                                let col = self.eat_ident_flexible()?;
-                                let alias = if *self.peek() == Token::As {
-                                    self.advance();
-                                    Some(self.eat_ident_flexible()?)
-                                } else {
-                                    None
-                                };
-                                items.push((col, alias));
-                                if *self.peek() != Token::Comma {
-                                    break;
-                                }
+                            if *self.peek() == Token::Star {
                                 self.advance();
+                                vec![("*".to_string(), None)]
+                            } else {
+                                let mut items = Vec::new();
+                                loop {
+                                    let col = self.eat_ident_flexible()?;
+                                    let alias = if *self.peek() == Token::As {
+                                        self.advance();
+                                        Some(self.eat_ident_flexible()?)
+                                    } else {
+                                        None
+                                    };
+                                    items.push((col, alias));
+                                    if *self.peek() != Token::Comma {
+                                        break;
+                                    }
+                                    self.advance();
+                                }
+                                items
                             }
-                            items
                         } else {
                             Vec::new()
                         };
-                        clauses.push(QueryClause::CallProcedure { proc_name, args, yield_items });
+                        clauses.push(QueryClause::CallProcedure { proc_name, args, yield_items, implicit });
                     }
                 }
                 Token::With => {
@@ -862,12 +867,14 @@ impl Parser {
             return Ok(name);
         }
         // For keyword tokens (null, true, false, etc.), recover original case from source.
+        // Extract only the alphanumeric/underscore characters starting at the token offset.
         let start = self.tokens[self.pos].offset;
-        let end = self.tokens.get(self.pos + 1).map_or(self.source.len(), |t| t.offset);
-        let original = self.source[start..end].trim_end().to_string();
+        let original: String = self.source[start..].chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
         // Verify it's a valid identifier character sequence.
-        if original.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
-            && original.chars().all(|c| c.is_alphanumeric() || c == '_')
+        if !original.is_empty()
+            && original.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
         {
             self.advance();
             Ok(original)

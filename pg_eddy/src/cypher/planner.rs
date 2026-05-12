@@ -119,8 +119,17 @@ pub enum LogicalPlan {
         inner: Box<LogicalPlan>,
         null_vars: Vec<String>,
     },
-    /// Empty plan: produces zero rows (used for unimplemented CALL procedures).
+    /// Empty plan: produces zero rows.
+    #[allow(dead_code)]
     Empty,
+    /// CALL procedure: execute a named procedure and bind yielded columns.
+    CallProcedure {
+        input: Box<LogicalPlan>,
+        proc_name: String,
+        args: Vec<Expr>,
+        yield_items: Vec<(String, Option<String>)>, // (column, alias)
+        implicit: bool, // true when called without parens (implicit arg passing)
+    },
     // -----------------------------------------------------------------------
     // v0.12.0: Write plan nodes
     // -----------------------------------------------------------------------
@@ -276,17 +285,48 @@ fn plan_clauses(
                     inner: Box::new(inner_plan),
                 };
             }
-            QueryClause::CallProcedure { yield_items, .. } => {
-                // Procedure registry not yet implemented: produce empty rows.
+            QueryClause::CallProcedure { proc_name, args, yield_items, implicit } => {
+                // Check for aggregation in CALL arguments (SyntaxError: InvalidAggregation)
+                for arg in args.iter() {
+                    if expr_contains_aggregation(arg) {
+                        return Err(PlanError {
+                            message: "SyntaxError: InvalidAggregation — aggregation functions \
+                                      are not allowed in procedure call arguments".into(),
+                        });
+                    }
+                }
+                // Check for VariableAlreadyBound — YIELD must not shadow existing variables
+                // Also check that YIELD aliases don't create duplicate bindings
+                let mut yield_bindings: std::collections::HashSet<&String> = std::collections::HashSet::new();
+                for (col, alias) in yield_items.iter() {
+                    if col == "*" { continue; }
+                    let exposed = alias.as_ref().unwrap_or(col);
+                    if bound_vars.contains(exposed) {
+                        return Err(PlanError {
+                            message: format!("SyntaxError: VariableAlreadyBound — variable `{exposed}` \
+                                              is already bound; cannot be yielded from procedure call"),
+                        });
+                    }
+                    if !yield_bindings.insert(exposed) {
+                        return Err(PlanError {
+                            message: format!("SyntaxError: VariableAlreadyBound — variable `{exposed}` \
+                                              is yielded multiple times from procedure call"),
+                        });
+                    }
+                }
                 // Bind the YIELD variables so downstream clauses don't error.
-                for (col, alias) in yield_items {
+                for (col, alias) in yield_items.iter() {
+                    if col == "*" { continue; }
                     let exposed = alias.as_ref().unwrap_or(col);
                     bound_vars.insert(exposed.clone());
                     var_kinds.insert(exposed.clone(), VarKind::Scalar);
                 }
-                current = LogicalPlan::Apply {
-                    outer: Box::new(current),
-                    inner: Box::new(LogicalPlan::Empty),
+                current = LogicalPlan::CallProcedure {
+                    input: Box::new(current),
+                    proc_name: proc_name.clone(),
+                    args: args.clone(),
+                    yield_items: yield_items.clone(),
+                    implicit: *implicit,
                 };
             }
             QueryClause::With { distinct, items, order_by, skip, limit, where_clause } => {
@@ -2394,6 +2434,10 @@ pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
             format!("{prefix}LeftJoin(null_vars=[{}])\n{o}\n{i}", null_vars.join(", "))
         }
         LogicalPlan::Empty => format!("{prefix}Empty"),
+        LogicalPlan::CallProcedure { input, proc_name, .. } => {
+            let child = explain(input, indent + 1);
+            format!("{prefix}CallProcedure({proc_name})\n{child}")
+        }
         LogicalPlan::CreatePattern { input, .. } => {
             let child = explain(input, indent + 1);
             format!("{prefix}CreatePattern\n{child}")
@@ -2583,7 +2627,6 @@ mod tests {
         let q = parse("CALL test.doNothing() YIELD x RETURN x").unwrap();
         let p = plan(&q).unwrap();
         let s = explain(&p, 0);
-        assert!(s.contains("Apply"), "expected Apply in plan: {s}");
-        assert!(s.contains("Empty"), "expected Empty in plan: {s}");
+        assert!(s.contains("CallProcedure(test.doNothing)"), "expected CallProcedure in plan: {s}");
     }
 }

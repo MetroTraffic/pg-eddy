@@ -1954,6 +1954,126 @@ correct for all type pairs; ORDER BY on temporal values correct.
 
 ---
 
+**v0.22.2 — TCK Bug Fixes**:
+
+> Fixes two bugs discovered on a clean full-TCK run: temporal comparison
+> overflow and CREATE-chain stack depth.
+
+- [x] `temporal_cmp`: use `i128` for day × nanosecond product to prevent
+      `i64` overflow on normal dates (Temporal6[5], Temporal7[5])
+- [x] `exec_create_pattern`: unwind consecutive `CreatePattern` chain
+      iteratively to prevent stack overflow on queries with many chained
+      CREATE clauses (Create4[2])
+
+**Target**: TCK = 3880/3880 (0 failures); 171 skipped scenarios remain.
+
+---
+
+**v0.22.3 — Remove Stale Skip Guards (Low-Hanging Fruit)**:
+
+> Many skip guards in `run_tck.pl` protect features that have since been
+> implemented. Removing these guards and fixing the underlying issues unlocks
+> ~65 scenarios with minimal code changes.
+
+- [x] Remove "temporal type sorting not supported" skip — temporal `ORDER BY`
+      works since v0.22.0; only the skip guard prevents testing (50 scenarios)
+- [x] Remove "cross-type sort order not supported" skip — implemented in v0.19.0
+      (10 scenarios)
+- [x] Remove "NaN comparison not supported" skip — NaN ordering implemented in
+      v0.20.0 (4 scenarios)
+- [x] Remove `exists()` from `@UNSUPPORTED_QUERY_PATTERNS` — `EXISTS { }` and
+      `exists()` deprecated function both work since v0.11.0; pattern is too
+      broad and catches `exists(n.prop)` which should raise a proper error
+- [x] Fix harness non-ASCII escaping — 5 of 6 non-ASCII scenarios are simple
+      string/list/map returns with UTF-8 characters; fix the Perl `psql`
+      escaping to pass them through correctly (5 scenarios)
+- [x] Handle Unicode hyphen error scenario — Mathematical3[1] expects an error
+      when a non-ASCII hyphen is used; return a parse error (1 scenario)
+
+**Target**: TCK 3880/3880, 0 skips (all guards removed).
+
+---
+
+**v0.22.4 — Error Validation (InvalidArgumentValue + UnknownFunction)**:
+
+> Implement proper error validation for function calls with invalid argument
+> types, unknown functions, and missing parameters.
+
+- [x] `labels()` on non-node arguments → raise `InvalidArgumentValue`
+      (Graph3[9]: 1 scenario)
+- [x] `type()` on non-relationship arguments → raise `InvalidArgumentValue`
+      (Graph4[6]: multiple examples, 5 scenarios)
+- [x] `toBoolean()` on invalid types (list, map, path) → raise
+      `InvalidArgumentValue` (TypeConversion1[5]: 4 scenarios)
+- [x] `toInteger()` on invalid types → raise `InvalidArgumentValue`
+      (TypeConversion2[8]: 6 scenarios)
+- [x] `toFloat()` on invalid types → raise `InvalidArgumentValue`
+      (TypeConversion3[6]: 4 scenarios)
+- [x] `toString()` on invalid types → raise `InvalidArgumentValue`
+      (TypeConversion4[10]: 8 scenarios)
+- [x] Unknown function name → raise `UnknownFunction` error
+      (Return2[18]: 1 scenario)
+- [x] Missing parameter → raise `ParameterMissing` error
+      (Call1[11]: 1 scenario)
+- [x] Remove corresponding skip guards from `classify_scenario`
+
+**Target**: TCK 3880/3880, 0 skips (all error validations pass).
+
+---
+
+**v0.22.5 — Named Graph Support in TCK Harness**:
+
+> The TriadicSelection1 feature uses `Given the binary-tree-1 graph` and
+> `Given the binary-tree-2 graph` named graph fixtures. The harness needs
+> to detect these, load the corresponding `.cypher` file from
+> `vendor/opencypher/tck/graphs/`, and execute it as setup.
+
+- [x] Parse `Given the <name> graph` in `classify_scenario` / `run_scenario`
+- [x] Map graph names to `.cypher` files in `vendor/opencypher/tck/graphs/`
+- [x] Execute the `.cypher` file as setup data before running the scenario
+- [x] Remove "requires named graph" skip guard
+
+**Target**: TCK 3880/3880, 0 skips (named graph scenarios pass).
+
+---
+
+**v0.22.6 — CALL Procedures and Unicode Escapes**:
+
+> Implement the procedure CALL mechanism with a minimal built-in procedure
+> registry (`test.doNothing`, `test.labels`, `test.my.proc`) that the TCK
+> Call1/Call2 scenarios require. Also implement `\uXXXX` Unicode escape
+> sequences in the Cypher lexer.
+
+- [x] Procedure registry: `HashMap<String, ProcedureDef>` mapping qualified
+      names to (argument types, yield columns, implementation fn)
+- [x] Built-in test procedures:
+      - `test.doNothing()` → yields nothing
+      - `test.labels()` → yields `label` column with all label names
+      - `test.my.proc(...)` → yields `out` column echoing arguments
+- [x] `CALL proc(args) YIELD col` executor: look up procedure, validate
+      argument count/types, execute, bind yielded columns
+- [x] Standalone `CALL proc()` (no YIELD) — execute for side effects only
+- [x] Error cases: `ProcedureNotFound`, `ParameterMissing` (too few args),
+      `InvalidNumberOfArguments` (too many args)
+- [x] Remove `CALL` from `@UNSUPPORTED_QUERY_PATTERNS`
+- [x] Lexer: implement `\uXXXX` and `\UXXXXXXXX` escape sequences in string
+      literals (Literals6[10]: 1 scenario)
+- [x] Remove "Cypher Unicode escape sequences not supported" skip guard
+- [x] Mock procedure support: TCK harness parses `And there exists a procedure`
+      declarations, passes them via `__procedures` params key to executor
+- [x] `YIELD *` support (yield all procedure output columns)
+- [x] `YIELD col AS alias` renaming with VariableAlreadyBound validation
+- [x] Implicit argument resolution (CALL without parens)
+- [x] InvalidAggregation check for aggregation functions in CALL arguments
+- [x] Assignable type coercion: NUMBER accepts INTEGER/FLOAT, FLOAT accepts INTEGER
+
+**Target**: TCK 3880/3880, **0 skips** — true 100% compliance.
+
+**Exit criteria**: `prove tests/tck/run_tck.pl` reports 3880/3880 passed,
+0 failed, 0 skipped.
+
+---
+
 **v0.23.0 — Property Indexes + Schema DDL**:
 
 > Moved from the original v0.16.0 → v0.21.0 → v0.23.0 position. No TCK

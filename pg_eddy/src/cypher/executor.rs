@@ -230,19 +230,24 @@ impl CypherDuration {
         let mut f_hours = 0.0f64;
         let mut f_minutes = 0.0f64;
         let mut f_seconds = 0.0f64;
+        let mut found_any = false;
 
         let mut cur = date_part;
-        if let Some((v, r)) = parse_f64_component(cur, 'Y') { f_years = v; cur = r; }
-        if let Some((v, r)) = parse_f64_component(cur, 'M') { f_months = v; cur = r; }
-        if let Some((v, r)) = parse_f64_component(cur, 'W') { f_weeks = v; cur = r; }
-        if let Some((v, r)) = parse_f64_component(cur, 'D') { f_days = v; cur = r; }
-        let _ = cur;
+        if let Some((v, r)) = parse_f64_component(cur, 'Y') { f_years = v; cur = r; found_any = true; }
+        if let Some((v, r)) = parse_f64_component(cur, 'M') { f_months = v; cur = r; found_any = true; }
+        if let Some((v, r)) = parse_f64_component(cur, 'W') { f_weeks = v; cur = r; found_any = true; }
+        if let Some((v, r)) = parse_f64_component(cur, 'D') { f_days = v; cur = r; found_any = true; }
+        if !cur.is_empty() { return None; } // leftover text in date part → not valid
 
         let mut cur = time_part;
-        if let Some((v, r)) = parse_f64_component(cur, 'H') { f_hours = v; cur = r; }
-        if let Some((v, r)) = parse_f64_component(cur, 'M') { f_minutes = v; cur = r; }
-        if let Some((v, r)) = parse_f64_component(cur, 'S') { f_seconds = v; cur = r; }
-        let _ = cur;
+        if let Some((v, r)) = parse_f64_component(cur, 'H') { f_hours = v; cur = r; found_any = true; }
+        if let Some((v, r)) = parse_f64_component(cur, 'M') { f_minutes = v; cur = r; found_any = true; }
+        if let Some((v, r)) = parse_f64_component(cur, 'S') { f_seconds = v; cur = r; found_any = true; }
+        if !cur.is_empty() { return None; } // leftover text in time part → not valid
+
+        // "P" with no date part and no time part is valid (zero duration),
+        // but strings like "Pontus" that start with P but have no valid components are not.
+        if !found_any && !date_part.is_empty() { return None; }
 
         // Cascade fractional parts (same logic as map constructor)
         let years = f_years.trunc() as i64;
@@ -2458,6 +2463,10 @@ fn json_to_value(v: &serde_json::Value) -> Value {
             // lists and UNWIND, and sorts at the correct position in value_ordering.
             if s == "NaN" {
                 Value::Float(f64::NAN)
+            } else if let Some(tv) = try_parse_temporal_iso(s) {
+                Value::Temporal(tv)
+            } else if let Some(dur) = try_parse_duration_iso(s) {
+                Value::Duration(dur)
             } else {
                 Value::Str(s.clone())
             }
@@ -2596,6 +2605,9 @@ pub fn execute(
         }
         LogicalPlan::Empty => {
             Ok(Vec::new())
+        }
+        LogicalPlan::CallProcedure { input, proc_name, args, yield_items, implicit } => {
+            exec_call_procedure(input, proc_name, args, yield_items, *implicit, params)
         }
         // v0.12.0 write plan nodes
         LogicalPlan::CreatePattern { input, patterns } => {
@@ -3712,6 +3724,15 @@ fn exec_project(
     limit: &Option<Expr>,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<Vec<Row>, ExecError> {
+    // Validate function names in all expressions before executing (catches
+    // UnknownFunction even when the input produces zero rows).
+    for item in items {
+        validate_function_names(&item.expr)?;
+    }
+    for ob in order_by {
+        validate_function_names(&ob.expr)?;
+    }
+
     let rows = execute(input, params)?;
 
     // If any return item contains an aggregate function, use grouping.
@@ -5142,11 +5163,23 @@ fn compare_values(left: &Value, op: &CmpOp, right: &Value) -> Option<bool> {
     if matches!(left, Value::Null) || matches!(right, Value::Null) {
         return None;
     }
-    // NaN comparisons: NaN = anything → false, NaN <> anything → true (openCypher spec).
+    // NaN comparisons: NaN = anything → false; NaN <> anything → true.
+    // For ordering operators (< > <= >=) with non-numeric types → null.
     let left_is_nan = matches!(left, Value::Float(f) if f.is_nan());
     let right_is_nan = matches!(right, Value::Float(f) if f.is_nan());
     if left_is_nan || right_is_nan {
-        return Some(matches!(op, CmpOp::Neq));
+        // Equality/inequality: always defined for NaN
+        if matches!(op, CmpOp::Eq | CmpOp::Neq) {
+            return Some(matches!(op, CmpOp::Neq));
+        }
+        // Ordering: both sides must be numeric
+        let left_numeric = matches!(left, Value::Int(_) | Value::Float(_));
+        let right_numeric = matches!(right, Value::Int(_) | Value::Float(_));
+        if left_numeric && right_numeric {
+            return Some(false); // NaN is not < > <= >= anything
+        }
+        // NaN vs non-numeric with ordering: null (incomparable)
+        return None;
     }
     match (left, right) {
         (Value::Int(a), Value::Int(b)) => Some(int_cmp(*a, op, *b)),
@@ -5471,6 +5504,98 @@ fn float_arith(a: f64, op: &ArithOp, b: f64) -> Result<Value, ExecError> {
     }
 }
 
+/// Known function names for validation.
+const KNOWN_FUNCTIONS: &[&str] = &[
+    "labels", "type", "properties", "keys", "id", "elementid",
+    "tostring", "tointeger", "tofloat", "toboolean",
+    "size", "length", "nodes", "relationships", "rels",
+    "head", "last", "tail", "range", "reverse", "coalesce",
+    "abs", "sign", "ceil", "floor", "round", "sqrt",
+    "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+    "degrees", "radians", "pi", "e", "log", "log10", "exp",
+    "rand", "tostring", "replace", "substring", "trim",
+    "ltrim", "rtrim", "toupper", "tolower", "split",
+    "left", "right", "starts with", "ends with", "contains",
+    "exists", "collect", "count", "sum", "avg", "min", "max",
+    "stdev", "stdevp", "percentilecont", "percentiledisc",
+    "date", "localtime", "time", "localdatetime", "datetime",
+    "duration", "duration.between", "duration.inmonths",
+    "duration.indays", "duration.inseconds",
+    "date.truncate", "localtime.truncate", "time.truncate",
+    "localdatetime.truncate", "datetime.truncate",
+    "date.realtime", "date.statement", "date.transaction",
+    "localtime.realtime", "localtime.statement", "localtime.transaction",
+    "time.realtime", "time.statement", "time.transaction",
+    "localdatetime.realtime", "localdatetime.statement", "localdatetime.transaction",
+    "datetime.realtime", "datetime.statement", "datetime.transaction",
+    "timestamp", "point", "distance",
+    "tointegerornull", "tofloatornull", "tobooleanornull",
+    "tostringornull", "valuetype",
+    // Bare names for namespaced functions (parser produces FunctionCall("between", ...) etc.)
+    "between", "inmonths", "indays", "inseconds",
+    "transaction", "statement", "realtime", "truncate", "fromepoch",
+    "fromepochmillis",
+    // DISTINCT aggregation variants (parser rewrites count(DISTINCT x) → count_distinct(x))
+    "count_distinct", "collect_distinct", "sum_distinct", "avg_distinct",
+    // Graph functions
+    "startnode", "endnode",
+];
+
+/// Validate that all function calls in an expression use known function names.
+fn validate_function_names(expr: &Expr) -> Result<(), ExecError> {
+    match expr {
+        Expr::FunctionCall(name, args) => {
+            if !KNOWN_FUNCTIONS.contains(&name.to_ascii_lowercase().as_str()) {
+                return Err(ExecError {
+                    message: format!("UnknownFunction: {name}()"),
+                });
+            }
+            for a in args {
+                validate_function_names(a)?;
+            }
+        }
+        Expr::Arith(l, _, r) | Expr::And(l, r) | Expr::Or(l, r) | Expr::Xor(l, r)
+        | Expr::Compare(l, _, r) | Expr::InList(l, r) | Expr::StartsWith(l, r)
+        | Expr::EndsWith(l, r) | Expr::Contains(l, r) | Expr::Regex(l, r) => {
+            validate_function_names(l)?;
+            validate_function_names(r)?;
+        }
+        Expr::Not(e) | Expr::IsNull(e) | Expr::IsNotNull(e) | Expr::Neg(e) => {
+            validate_function_names(e)?;
+        }
+        Expr::CaseSearched { branches, else_ } => {
+            for (w, t) in branches {
+                validate_function_names(w)?;
+                validate_function_names(t)?;
+            }
+            if let Some(el) = else_ { validate_function_names(el)?; }
+        }
+        Expr::CaseSimple { test, branches, else_ } => {
+            validate_function_names(test)?;
+            for (w, t) in branches {
+                validate_function_names(w)?;
+                validate_function_names(t)?;
+            }
+            if let Some(el) = else_ { validate_function_names(el)?; }
+        }
+        Expr::List(items) => {
+            for i in items { validate_function_names(i)?; }
+        }
+        Expr::Property(e, _) => validate_function_names(e)?,
+        Expr::Subscript(e, i) => {
+            validate_function_names(e)?;
+            validate_function_names(i)?;
+        }
+        Expr::ListSlice { list_expr, from, to } => {
+            validate_function_names(list_expr)?;
+            if let Some(s) = from { validate_function_names(s)?; }
+            if let Some(end) = to { validate_function_names(end)?; }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn eval_function(
     name: &str,
     args: &[Expr],
@@ -5500,7 +5625,10 @@ fn eval_function(
                     let arr: Vec<serde_json::Value> = labels.into_iter().map(|l| l.into()).collect();
                     Ok(Value::Json(serde_json::Value::Array(arr)))
                 }
-                _ => Ok(Value::Null),
+                Value::Null => Ok(Value::Null),
+                _ => Err(ExecError {
+                    message: "InvalidArgumentValue: labels() requires a node argument".into(),
+                }),
             }
         }
         "type" => {
@@ -5510,7 +5638,10 @@ fn eval_function(
             let val = eval_expr(&args[0], row, params)?;
             match val {
                 Value::Edge { rel_type, .. } => Ok(Value::Str(rel_type)),
-                _ => Ok(Value::Null),
+                Value::Null => Ok(Value::Null),
+                _ => Err(ExecError {
+                    message: "InvalidArgumentValue: type() requires a relationship argument".into(),
+                }),
             }
         }
         "properties" => {
@@ -5565,7 +5696,9 @@ fn eval_function(
                 Value::Temporal(tv) => Ok(Value::Str(tv.iso)),
                 Value::Duration(d) => Ok(Value::Str(d.iso)),
                 Value::Null => Ok(Value::Null),
-                _ => Ok(Value::Null),
+                _ => Err(ExecError {
+                    message: "InvalidArgumentValue: toString() cannot convert this type".into(),
+                }),
             }
         }
         "tointeger" => {
@@ -5576,6 +5709,7 @@ fn eval_function(
             match val {
                 Value::Int(i) => Ok(Value::Int(i)),
                 Value::Float(f) => Ok(Value::Int(f as i64)),
+                Value::Bool(b) => Ok(Value::Int(if b { 1 } else { 0 })),
                 Value::Str(s) => {
                     // Try integer parse first, then float-truncation.
                     if let Ok(i) = s.trim().parse::<i64>() {
@@ -5587,7 +5721,9 @@ fn eval_function(
                     }
                 }
                 Value::Null => Ok(Value::Null),
-                _ => Ok(Value::Null),
+                _ => Err(ExecError {
+                    message: "InvalidArgumentValue: toInteger() cannot convert this type".into(),
+                }),
             }
         }
         "tofloat" => {
@@ -5603,7 +5739,9 @@ fn eval_function(
                     Err(_) => Ok(Value::Null),
                 },
                 Value::Null => Ok(Value::Null),
-                _ => Ok(Value::Null),
+                _ => Err(ExecError {
+                    message: "InvalidArgumentValue: toFloat() cannot convert this type".into(),
+                }),
             }
         }
         "coalesce" => {
@@ -5623,13 +5761,16 @@ fn eval_function(
             let val = eval_expr(&args[0], row, params)?;
             match val {
                 Value::Bool(b) => Ok(Value::Bool(b)),
+                Value::Int(i) => Ok(Value::Bool(i != 0)),
                 Value::Str(s) => match s.to_ascii_lowercase().as_str() {
                     "true" => Ok(Value::Bool(true)),
                     "false" => Ok(Value::Bool(false)),
                     _ => Ok(Value::Null),
                 },
                 Value::Null => Ok(Value::Null),
-                _ => Ok(Value::Null),
+                _ => Err(ExecError {
+                    message: "InvalidArgumentValue: toBoolean() cannot convert this type".into(),
+                }),
             }
         }
         // --- Size / length ---
@@ -6287,7 +6428,7 @@ fn eval_function(
             }
         }
         _ => Err(ExecError {
-            message: format!("unknown function: {name}()"),
+            message: format!("UnknownFunction: {name}()"),
         }),
     }
 }
@@ -6597,6 +6738,276 @@ fn exec_apply(
         }
     }
     Ok(result)
+}
+
+/// Execute a CALL procedure: look up the procedure by name, evaluate arguments,
+/// and produce result rows with yielded columns bound.
+fn exec_call_procedure(
+    input: &LogicalPlan,
+    proc_name: &str,
+    args: &[Expr],
+    yield_items: &[(String, Option<String>)],
+    implicit: bool,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<Row>, ExecError> {
+    let input_rows = execute(input, params)?;
+    let mut result = Vec::new();
+
+    // Check if this is YIELD * (all columns)
+    let is_yield_star = yield_items.len() == 1 && yield_items[0].0 == "*";
+
+    for row in &input_rows {
+        // Evaluate arguments (or resolve implicit args from params)
+        let arg_vals: Vec<Value> = if implicit {
+            // Try to resolve implicit args from params using procedure definition
+            resolve_implicit_args(proc_name, params)?
+        } else {
+            args.iter()
+                .map(|a| eval_expr(a, row, params))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        // Dispatch on procedure name (check mock procedures in params first)
+        let proc_rows = call_procedure(proc_name, &arg_vals, params)?;
+
+        if proc_rows.is_empty() {
+            // Standalone CALL with no YIELD: pass through input row
+            if yield_items.is_empty() {
+                result.push(row.clone());
+            }
+            // else: no rows produced by procedure, nothing to emit
+        } else if yield_items.is_empty() || is_yield_star {
+            // Standalone CALL with no explicit YIELD or YIELD *: return all procedure columns
+            for proc_row in proc_rows {
+                let mut merged = row.clone();
+                for (k, v) in &proc_row {
+                    merged.insert(k.clone(), v.clone());
+                }
+                result.push(merged);
+            }
+        } else {
+            for proc_row in proc_rows {
+                let mut merged = row.clone();
+                // Bind yielded columns
+                for (col, alias) in yield_items {
+                    let exposed = alias.as_ref().unwrap_or(col);
+                    let val = proc_row.get(col.as_str()).cloned().unwrap_or(Value::Null);
+                    merged.insert(exposed.clone(), val);
+                }
+                result.push(merged);
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Resolve implicit arguments from params based on procedure definition.
+fn resolve_implicit_args(proc_name: &str, params: &HashMap<String, serde_json::Value>) -> Result<Vec<Value>, ExecError> {
+    // Look up procedure definition in __procedures
+    let arg_names = params.get("__procedures")
+        .and_then(|v| v.as_object())
+        .and_then(|procs| procs.get(proc_name))
+        .and_then(|def| def.get("args"))
+        .and_then(|v| v.as_array());
+
+    if let Some(arg_names) = arg_names {
+        let mut vals = Vec::new();
+        for arg_name_val in arg_names {
+            if let Some(arg_name) = arg_name_val.as_str() {
+                if let Some(param_val) = params.get(arg_name) {
+                    vals.push(json_to_value(param_val));
+                } else {
+                    return Err(ExecError {
+                        message: format!("ParameterMissing: MissingParameter — procedure {proc_name} \
+                                          requires parameter `{arg_name}` for implicit call"),
+                    });
+                }
+            }
+        }
+        return Ok(vals);
+    }
+    // No procedure def found, return empty (built-in procs with no args)
+    Ok(Vec::new())
+}
+/// { "test.my.proc": { "args": ["name", "id"], "arg_types": ["STRING", "INTEGER"],
+///                      "yields": ["city", "country_code"],
+///                      "data": [{"name":"Stefan","id":1,"city":"Berlin","country_code":49}, ...] } }
+/// ```
+fn call_procedure(name: &str, args: &[Value], params: &HashMap<String, serde_json::Value>) -> Result<Vec<Row>, ExecError> {
+    // Check for mock procedure definitions in params
+    let mock_def = params.get("__procedures")
+        .and_then(|v| v.as_object())
+        .and_then(|procs| procs.get(name));
+    if let Some(proc_def) = mock_def {
+        return exec_mock_procedure(name, args, proc_def);
+    }
+
+    // Built-in procedures
+    match name {
+        "test.doNothing" => {
+            Ok(Vec::new())
+        }
+        "test.labels" => {
+            let labels = crate::catalog::labels::all_labels();
+            let rows: Vec<Row> = labels.into_iter().map(|l| {
+                let mut r = Row::new();
+                r.insert("label".to_string(), Value::Str(l));
+                r
+            }).collect();
+            Ok(rows)
+        }
+        "test.my.proc" => {
+            if args.is_empty() {
+                return Err(ExecError {
+                    message: "ParameterMissing: test.my.proc requires at least 1 argument".into(),
+                });
+            }
+            let mut r = Row::new();
+            r.insert("out".to_string(), args[0].clone());
+            Ok(vec![r])
+        }
+        "db.labels" => {
+            let labels = crate::catalog::labels::all_labels();
+            let rows: Vec<Row> = labels.into_iter().map(|l| {
+                let mut r = Row::new();
+                r.insert("label".to_string(), Value::Str(l));
+                r
+            }).collect();
+            Ok(rows)
+        }
+        "db.relationshipTypes" => {
+            let types = crate::catalog::labels::all_rel_types();
+            let rows: Vec<Row> = types.into_iter().map(|t| {
+                let mut r = Row::new();
+                r.insert("relationshipType".to_string(), Value::Str(t));
+                r
+            }).collect();
+            Ok(rows)
+        }
+        "db.propertyKeys" => {
+            let keys = crate::catalog::labels::all_prop_keys();
+            let rows: Vec<Row> = keys.into_iter().map(|k| {
+                let mut r = Row::new();
+                r.insert("propertyKey".to_string(), Value::Str(k));
+                r
+            }).collect();
+            Ok(rows)
+        }
+        _ => {
+            Err(ExecError {
+                message: format!("ProcedureNotFound: {name}"),
+            })
+        }
+    }
+}
+
+/// Execute a mock procedure defined via params["__procedures"].
+fn exec_mock_procedure(name: &str, args: &[Value], proc_def: &serde_json::Value) -> Result<Vec<Row>, ExecError> {
+    let obj = proc_def.as_object().ok_or_else(|| ExecError {
+        message: format!("ProcedureNotFound: {name}"),
+    })?;
+
+    let arg_names: Vec<&str> = obj.get("args")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let arg_types: Vec<&str> = obj.get("arg_types")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let yield_cols: Vec<&str> = obj.get("yields")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let data = obj.get("data")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Validate argument count
+    if args.len() != arg_names.len() {
+        return Err(ExecError {
+            message: format!("InvalidNumberOfArguments: {name} expects {} argument(s), got {}",
+                           arg_names.len(), args.len()),
+        });
+    }
+
+    // Validate argument types
+    for (i, (val, expected_type)) in args.iter().zip(arg_types.iter()).enumerate() {
+        if matches!(val, Value::Null) {
+            continue; // null is always acceptable
+        }
+        let type_ok = match *expected_type {
+            "STRING" => matches!(val, Value::Str(_)),
+            "INTEGER" => matches!(val, Value::Int(_)),
+            "FLOAT" => matches!(val, Value::Float(_) | Value::Int(_)),
+            "NUMBER" => matches!(val, Value::Int(_) | Value::Float(_)),
+            "BOOLEAN" => matches!(val, Value::Bool(_)),
+            "NODE" => matches!(val, Value::Node { .. }),
+            "RELATIONSHIP" => matches!(val, Value::Edge { .. }),
+            "ANY" => true,
+            _ => true,
+        };
+        if !type_ok {
+            return Err(ExecError {
+                message: format!("InvalidArgumentType: {name} argument {} ('{}'): expected {}, got {}",
+                               i, arg_names.get(i).unwrap_or(&"?"), expected_type,
+                               value_type_name(val).to_uppercase()),
+            });
+        }
+    }
+
+    // Filter data rows by argument values
+    let mut result_rows: Vec<Row> = Vec::new();
+    for data_row in &data {
+        let data_obj = match data_row.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+
+        // Check if this row matches the provided arguments
+        let mut matches = true;
+        for (i, arg_name) in arg_names.iter().enumerate() {
+            if let Some(data_val) = data_obj.get(*arg_name) {
+                let arg_val = &args[i];
+                if !mock_value_matches(arg_val, data_val) {
+                    matches = false;
+                    break;
+                }
+            }
+        }
+
+        if matches {
+            let mut row = Row::new();
+            for col in &yield_cols {
+                let val = data_obj.get(*col)
+                    .map(json_to_value)
+                    .unwrap_or(Value::Null);
+                row.insert(col.to_string(), val);
+            }
+            result_rows.push(row);
+        }
+    }
+
+    Ok(result_rows)
+}
+
+/// Check if a runtime Value matches a JSON value from mock procedure data.
+/// Handles numeric coercion: Int can match Float data and vice versa.
+fn mock_value_matches(runtime: &Value, expected: &serde_json::Value) -> bool {
+    match (runtime, expected) {
+        (Value::Null, serde_json::Value::Null) => true,
+        (Value::Int(a), serde_json::Value::Number(n)) => {
+            n.as_i64() == Some(*a) || n.as_f64().is_some_and(|f| (f - *a as f64).abs() < 1e-9)
+        }
+        (Value::Float(a), serde_json::Value::Number(n)) => {
+            n.as_f64().is_some_and(|f| (f - a).abs() < 1e-9)
+        }
+        (Value::Str(a), serde_json::Value::String(b)) => a == b,
+        (Value::Bool(a), serde_json::Value::Bool(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Convert result rows to JSONB output format.

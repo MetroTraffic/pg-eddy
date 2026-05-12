@@ -206,8 +206,10 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
                     }
                     pos += 1;
                 } else {
-                    s.push(bytes[pos] as char);
-                    pos += 1;
+                    // Decode full UTF-8 character (may be multi-byte)
+                    let ch = input[pos..].chars().next().unwrap();
+                    s.push(ch);
+                    pos += ch.len_utf8();
                 }
             }
             tokens.push(SpannedToken { token: Token::StringLit(s), offset: start });
@@ -256,10 +258,13 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
                             s.push(bytes[pos] as char);
                         }
                     }
+                    pos += 1;
                 } else {
-                    s.push(bytes[pos] as char);
+                    // Decode full UTF-8 character (may be multi-byte)
+                    let ch = input[pos..].chars().next().unwrap();
+                    s.push(ch);
+                    pos += ch.len_utf8();
                 }
-                pos += 1;
             }
             if pos < len {
                 pos += 1; // closing "
@@ -273,8 +278,10 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
             pos += 1;
             let mut s = String::new();
             while pos < len && bytes[pos] != b'`' {
-                s.push(bytes[pos] as char);
-                pos += 1;
+                // Decode full UTF-8 character (may be multi-byte)
+                let ch = input[pos..].chars().next().unwrap();
+                s.push(ch);
+                pos += ch.len_utf8();
             }
             if pos < len {
                 pos += 1; // closing `

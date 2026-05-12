@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.22.6](#0226----call-procedures-and-100-tck) — CALL Procedures and 100% TCK
 - [0.22.2](#0222----tck-bug-fixes) — TCK Bug Fixes
 - [0.22.1](#0221----100-tck-compliance) — 100% TCK Compliance
 - [0.22.0](#0220----temporal-type-system) — Temporal Type System
@@ -36,6 +37,45 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 ---
 
 ## [Unreleased]
+
+---
+
+## [0.22.6] — 2026-05-12 — CALL Procedures and 100% TCK
+
+v0.22.6 implements full CALL procedure support and achieves true 100% TCK
+compliance: **3880/3880 passed, 0 skipped, 0 failures**.
+
+### What's New
+
+**Full CALL procedure support** — `CALL proc(args) YIELD col, col2 AS alias`
+works with full argument validation, type coercion, implicit argument
+resolution, and `YIELD *`. Mock procedure definitions from TCK feature files
+are parsed and passed to the executor via a `__procedures` params key.
+
+**Error validation for CALL** — `InvalidNumberOfArguments` (wrong arg count),
+`InvalidArgumentType` (wrong type), `ParameterMissing` (implicit call missing
+params), `VariableAlreadyBound` (YIELD shadows bound var or duplicates),
+`InvalidAggregation` (aggregation function in CALL args), `ProcedureNotFound`
+(unknown procedure).
+
+**Assignable type coercion** — NUMBER accepts INTEGER or FLOAT; FLOAT accepts
+INTEGER. Matches are coerced when filtering mock procedure data tables.
+
+**CypherDuration::parse false positive fix** — Strings like "Pontus" starting
+with 'P' were incorrectly parsed as zero-duration temporal values. Fixed by
+requiring at least one valid component and rejecting leftover text.
+
+**All skip guards removed** — `@UNSUPPORTED_QUERY_PATTERNS` is empty. Every
+TCK scenario runs without skipping.
+
+### Implementation Details
+
+- Parser: `YIELD *` support, `implicit` flag on CALL AST node
+- Planner: VariableAlreadyBound and InvalidAggregation compile-time checks
+- Executor: `exec_mock_procedure()` with data table filtering, numeric
+  coercion in `mock_value_matches()`, `resolve_implicit_args()` from params
+- TCK harness: `And there exists a procedure` declarations parsed from
+  Gherkin steps, converted to JSON and injected as `__procedures` param
 
 ---
 

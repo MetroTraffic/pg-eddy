@@ -1799,11 +1799,11 @@ mod tests {
         let s = explain(&p, 0);
         assert!(s.contains("Apply"), "expected Apply in CALL subquery plan: {s}");
 
-        // CALL proc() YIELD — should produce Apply + Empty.
+        // CALL proc() YIELD — should produce CallProcedure plan node.
         let q2 = parse("CALL test.doNothing() YIELD x RETURN x").expect("parse failed");
         let p2 = plan(&q2).expect("plan failed");
         let s2 = explain(&p2, 0);
-        assert!(s2.contains("Empty"), "expected Empty in procedure plan: {s2}");
+        assert!(s2.contains("CallProcedure(test.doNothing)"), "expected CallProcedure in procedure plan: {s2}");
 
         // exists { } should parse without error.
         let q3 = parse("MATCH (n) WHERE exists { (n)-->() } RETURN n").expect("parse failed");
