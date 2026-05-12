@@ -58,6 +58,19 @@ pub enum LogicalPlan {
         optional: bool,
         /// If Some(var), the BFS stores the full path (nodes+rels) under this variable name.
         path_carry_var: Option<String>,
+        /// Relationship variables from fixed-length hops in the same pattern whose
+        /// edge IDs must be excluded from the BFS (cross-hop uniqueness).
+        excluded_rel_vars: Vec<String>,
+    },
+    /// Pre-bound relationship list expand (deprecated Cypher feature):
+    /// `MATCH (a)-[rs*]->(b)` where `rs` is already bound as a list of edges.
+    /// Walks the pre-supplied edge list to verify it forms a connected path.
+    BoundRelListExpand {
+        input: Box<LogicalPlan>,
+        src_var: String,
+        list_var: String,
+        dst_var: String,
+        direction: RelDirection,
     },
     /// Named path: wraps a plan and packages the matched nodes+rels into a path value.
     NamedPath {
@@ -389,6 +402,16 @@ fn plan_clauses(
                 let old_var_kinds = std::mem::take(var_kinds);
                 bound_vars.clear();
                 for item in items {
+                    if matches!(item.expr, Expr::Star) {
+                        // WITH * re-introduces all previous non-anonymous variables.
+                        for (v, kind) in &old_var_kinds {
+                            if !v.starts_with('_') {
+                                bound_vars.insert(v.clone());
+                                var_kinds.insert(v.clone(), kind.clone());
+                            }
+                        }
+                        continue;
+                    }
                     let exposed = item.alias.clone().or_else(|| {
                         if let Expr::Variable(v) = &item.expr { Some(v.clone()) } else { None }
                     });
@@ -1062,7 +1085,30 @@ fn plan_match_clause(
         let hop_count: usize = patterns.iter()
             .map(|pat| pat.elements.iter().filter(|e| matches!(e, crate::cypher::ast::PatternElement::Relationship(_))).count())
             .sum();
-        let needs_left_join = where_clause.is_some() || hop_count > 1 || patterns.iter().any(|pat| {
+        // Also use LeftJoin when a var-length relationship's destination node has
+        // label or property constraints.  VarLengthExpand emits separate Filter nodes
+        // for these (unlike fixed-length Expand which handles them inline), so a null
+        // destination from optional expand would be discarded by the filter.  With
+        // LeftJoin the filters live inside the inner plan; if the inner produces 0 rows,
+        // the outer row is preserved with null-filled variables.
+        let varlength_dst_constrained = patterns.iter().any(|pat| {
+            let elems = &pat.elements;
+            let mut i = 1;
+            while i < elems.len() {
+                if let PatternElement::Relationship(r) = &elems[i] {
+                    if r.length.is_some() {
+                        if let Some(PatternElement::Node(n)) = elems.get(i + 1) {
+                            if !n.labels.is_empty() || !n.properties.is_empty() {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                i += 2;
+            }
+            false
+        });
+        let needs_left_join = where_clause.is_some() || hop_count > 1 || varlength_dst_constrained || patterns.iter().any(|pat| {
             if let Some(crate::cypher::ast::PatternElement::Node(n)) = pat.elements.first() {
                 // First node is unbound if it has no variable OR its variable is not in bound_vars.
                 match &n.variable {
@@ -1143,7 +1189,22 @@ fn plan_match_clause(
 
     // Relationship isomorphism: different relationship variables in the same MATCH clause
     // must not be bound to the same relationship (openCypher relationship uniqueness).
-    let rel_iso_filter = build_rel_isomorphism_filter(&new_rel_vars);
+    // Only fixed-length rels participate — var-length rels hold edge lists (not single
+    // edges) and handle uniqueness internally via BFS + excluded_rel_vars.
+    let fixed_rel_vars: Vec<String> = new_rel_vars.iter().filter(|rv| {
+        // Check if this rel var corresponds to a fixed-length relationship.
+        patterns.iter().any(|pat| {
+            pat.elements.iter().any(|e| {
+                if let PatternElement::Relationship(r) = e {
+                    r.length.is_none() && (r.variable.as_deref() == Some(rv.as_str())
+                        || rv.starts_with("_anon_rel_"))
+                } else {
+                    false
+                }
+            })
+        })
+    }).cloned().collect();
+    let rel_iso_filter = build_rel_isomorphism_filter(&fixed_rel_vars);
 
     // In openCypher, different node variables CAN bind to the same node (no node isomorphism).
     let combined = match (rel_iso_filter, where_clause.clone()) {
@@ -1178,6 +1239,12 @@ fn plan_pattern_onto(
     let fixed_hop_count = pattern.elements.iter()
         .filter(|e| matches!(e, PatternElement::Relationship(r) if r.length.is_none()))
         .count();
+
+    // Check if the pattern has any var-length relationships.
+    // When both fixed-length and var-length rels exist in the same pattern,
+    // fixed-length anonymous rels need tracking for cross-hop uniqueness.
+    let has_varlen = pattern.elements.iter()
+        .any(|e| matches!(e, PatternElement::Relationship(r) if r.length.is_some()));
 
     // First element must be a node.
     let first_node = match pattern.elements.first() {
@@ -1261,6 +1328,35 @@ fn plan_pattern_onto(
     // When first_is_bound=true, plan starts as SingleRow but find_last_node_var would
     // return "_none". We need to track explicitly.
     let mut last_node_var = first_var.clone();
+    // Track fixed-length relationship variables seen so far in this pattern, so
+    // var-length expands can exclude them (cross-hop uniqueness).
+    // Pre-collect ALL named/bound fixed-length rel vars in this pattern so even
+    // var-length hops that appear BEFORE the fixed hops get the exclusion list.
+    let mut all_fixed_rel_vars: Vec<String> = Vec::new();
+    {
+        let mut ac: usize = 0;
+        let mut j = 1;
+        while j < pattern.elements.len() {
+            if let PatternElement::Relationship(r) = &pattern.elements[j] {
+                if r.length.is_none() {
+                    // Fixed-length hop: figure out what its variable name will be.
+                    if let Some(ref rv) = r.variable {
+                        all_fixed_rel_vars.push(rv.clone());
+                    } else if is_named {
+                        // Will get _pr_N name — we'll track that separately.
+                    } else if fixed_hop_count > 1 || has_varlen {
+                        // Will get _anon_rel_N name.
+                        let name = format!("_anon_rel_{}", ac);
+                        ac += 1;
+                        all_fixed_rel_vars.push(name);
+                    }
+                }
+                j += 2;
+            } else {
+                j += 1;
+            }
+        }
+    }
 
     // Process relationship+node pairs.
     let mut i = 1;
@@ -1276,7 +1372,13 @@ fn plan_pattern_onto(
             // Determine rel variable name (user-provided or internal for named paths).
             let rel_var_name: Option<String> = if let Some(ref rv) = rel.variable {
                 // Type-conflict check.
-                if matches!(var_kinds.get(rv), Some(k) if *k != VarKind::Rel) {
+                // Allow a pre-bound list variable used in a var-length position
+                // (deprecated Cypher feature: `WITH [r1,r2] AS rs ... MATCH ()-[rs*]->()`).
+                // Only allow Scalar or NotNode (list types), not Path or Node.
+                let is_prebound_list = rel.length.is_some()
+                    && matches!(var_kinds.get(rv), Some(VarKind::Scalar | VarKind::NotNode))
+                    && bound_vars.contains(rv);
+                if !is_prebound_list && matches!(var_kinds.get(rv), Some(k) if *k != VarKind::Rel) {
                     return Err(PlanError {
                         message: format!(
                             "SyntaxError: VariableTypeConflict — '{rv}' is already bound as a \
@@ -1299,10 +1401,11 @@ fn plan_pattern_onto(
                 let internal = format!("_pr_{}", anon_rel_counter);
                 anon_rel_counter += 1;
                 Some(internal)
-            } else if fixed_hop_count > 1 && rel.length.is_none() {
-                // Multi-hop pattern with anonymous fixed-length rel: generate internal
-                // name so relationship uniqueness can be enforced via isomorphism filter.
-                // (Variable-length rels handle uniqueness internally via BFS.)
+            } else if (fixed_hop_count > 1 || has_varlen) && rel.length.is_none() {
+                // Fixed-length anonymous rel in a multi-hop or mixed (fixed+varlen) pattern:
+                // generate internal name so relationship uniqueness can be enforced
+                // (via isomorphism filter for multi-fixed, or excluded_rel_vars for
+                // cross-hop uniqueness with var-length).
                 let internal = format!("_anon_rel_{}", anon_rel_counter);
                 anon_rel_counter += 1;
                 Some(internal)
@@ -1311,9 +1414,22 @@ fn plan_pattern_onto(
             };
 
             // For named paths: add rel var to element_vars.
+            // For var-length rels, compute the path_carry name now so we can push
+            // it to element_vars in the correct position (before the dst node).
             if let Some(ref rv) = rel_var_name {
                 if is_named {
-                    element_vars.push(rv.clone());
+                    if rel.length.is_some() {
+                        // Var-length in named path: push the path_carry name.
+                        let pcv = if rel.variable.is_some() {
+                            format!("_path_carry_{rv}")
+                        } else {
+                            rv.clone()
+                        };
+                        element_vars.push(pcv);
+                    } else {
+                        // Fixed-length: use the rel var name directly.
+                        element_vars.push(rv.clone());
+                    }
                 }
                 // Track as Rel kind if not already known.
                 if !var_kinds.contains_key(rv) {
@@ -1350,10 +1466,37 @@ fn plan_pattern_onto(
             }
 
             if let Some(vl) = &rel.length {
+                // Check for pre-bound relationship list (deprecated Cypher feature).
+                let prebound_list_var = rel.variable.as_ref().and_then(|rv| {
+                    if bound_vars.contains(rv) && matches!(var_kinds.get(rv), Some(VarKind::Scalar | VarKind::NotNode)) {
+                        Some(rv.clone())
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(list_var) = prebound_list_var {
+                    // BoundRelListExpand: walk the pre-provided edge list.
+                    plan = LogicalPlan::BoundRelListExpand {
+                        input: Box::new(plan),
+                        src_var,
+                        list_var,
+                        dst_var: dst_var.clone(),
+                        direction: rel.direction,
+                    };
+                } else {
                 // Variable-length expand.
                 // For a named path, use path_carry_var to store the full traversal.
+                // If the rel has a user-provided variable, also populate the edge
+                // list so RETURN r shows the list of edges (not the path).
                 let path_carry = if is_named {
-                    rel_var_name.clone()
+                    if rel.variable.is_some() {
+                        // Use an internal name for path carry so the user variable
+                        // can hold the edge list.
+                        Some(format!("_path_carry_{}", rel_var_name.as_deref().unwrap_or("_")))
+                    } else {
+                        rel_var_name.clone()
+                    }
                 } else {
                     None
                 };
@@ -1366,7 +1509,9 @@ fn plan_pattern_onto(
                 } else {
                     None
                 };
-                let effective_rel_var = if is_named {
+                let effective_rel_var = if is_named && rel.variable.is_some() {
+                    rel.variable.clone() // user named the rel → store edge list under that name
+                } else if is_named {
                     None
                 } else {
                     rel.variable.clone().or_else(|| synth_rel_var.clone())
@@ -1381,7 +1526,8 @@ fn plan_pattern_onto(
                     min_hops: vl.min,
                     max_hops: vl.max,
                     optional,
-                    path_carry_var: path_carry,
+                    path_carry_var: path_carry.clone(),
+                    excluded_rel_vars: all_fixed_rel_vars.clone(),
                 };
                 // Apply relationship property predicates: each edge in the path
                 // must satisfy the inline property map. Emit as
@@ -1415,6 +1561,7 @@ fn plan_pattern_onto(
                         plan = LogicalPlan::Filter { input: Box::new(plan), predicate: all_expr };
                     }
                 }
+                } // end else (VarLengthExpand, not prebound list)
                 // Var-length expand does not apply dst node label/property predicates.
                 // Emit explicit filter expressions on the bound destination so they
                 // are enforced post-traversal.
@@ -2217,6 +2364,17 @@ pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
             };
             let child = explain(input, indent + 1);
             format!("{prefix}VarLengthExpand({src_var})-[{rv}:{types_str} {range}]{dir_str}({dst_var})\n{child}")
+        }
+        LogicalPlan::BoundRelListExpand {
+            input, src_var, list_var, dst_var, direction,
+        } => {
+            let dir_str = match direction {
+                RelDirection::Out => "->",
+                RelDirection::In => "<-",
+                RelDirection::Both => "--",
+            };
+            let child = explain(input, indent + 1);
+            format!("{prefix}BoundRelListExpand({src_var})-[{list_var}*]{dir_str}({dst_var})\n{child}")
         }
         LogicalPlan::NamedPath { input, path_var, element_vars } => {
             let evars = element_vars.join(", ");

@@ -1800,7 +1800,7 @@ isomorphism enforced; harness correctly parses all TCK row formats.
 
 ---
 
-**v0.21.0 — Variable-Length Correctness + Remaining Quick Wins** (in progress):
+**v0.21.0 — Variable-Length Correctness + Remaining Quick Wins**:
 
 > **Reorientation**: Property indexes and Schema DDL are deferred further
 > (→ v0.23.0). The highest-value work is closing correctness gaps in
@@ -1820,22 +1820,34 @@ isomorphism enforced; harness correctly parses all TCK row formats.
 - [x] TCK failure classification: `plans/tck-failure-analysis.md`
 
 **Remaining targets**:
-- [ ] CountingSubgraphMatches1[10,11] — self-loop counting (2 scenarios)
-- [ ] WithOrderBy4[13,14] — non-projected aggregation in ORDER BY (2 scenarios)
-- [ ] Create2[11,12] — adjacency flush on follow-up MATCH after CREATE (2 scenarios)
-- [ ] With2[1] / With4[2] — scalar-to-pattern join via WITH (2 scenarios)
-- [ ] WithSkipLimit2[2] — dependencies across WITH with LIMIT (1 scenario)
-- [ ] Match8[2,3] — MATCH after MERGE + OPTIONAL MATCH row counting (2 scenarios)
-- [ ] Delete5[7] — DELETE paths from nested map/list (1 scenario)
-- [ ] MatchWhere4[2] / WithWhere4[2] — disjunctive multi-part predicates (2 scenarios)
+- [x] CountingSubgraphMatches1[10,11] — self-loop counting (2 scenarios)
+- [x] WithOrderBy4[13,14] — non-projected aggregation in ORDER BY (2 scenarios)
+- [x] Create2[11,12] — adjacency flush on follow-up MATCH after CREATE (2 scenarios)
+- [x] With2[1] / With4[2] — scalar-to-pattern join via WITH (2 scenarios)
+- [x] WithSkipLimit2[2] — dependencies across WITH with LIMIT (1 scenario)
+- [x] Match8[2,3] — MATCH after MERGE + OPTIONAL MATCH row counting (2 scenarios)
+- [x] Delete5[7] — DELETE paths from nested map/list (1 scenario)
+- [x] MatchWhere4[2] / WithWhere4[2] — disjunctive multi-part predicates (2 scenarios)
 
-**Current TCK**: 3029/3880 (78.1%), +23 since v0.20.0 tag. Baseline floor: 3029.
+**Additional fixes delivered** (unreleased):
+- [x] OPTIONAL MATCH with chained var-length + dst label (LeftJoin fix) — Match7[15] (1 scenario)
+- [x] Pre-bound edge list in var-length position (BoundRelListExpand) — Match4[8], Match9[6,7] (3 scenarios)
+- [x] Cross-hop uniqueness between fixed and var-length rels — Match5[27] (1 scenario)
+- [x] Optional var-length with pre-bound dst null-fill — Match9[9] (1 scenario)
+- [x] WITH * preserves bound_vars for downstream OPTIONAL MATCH — Match8[2] (1 scenario)
+
+**Deferred**:
+- Match4[7] — cross-var-length uniqueness between multiple anonymous var-length
+  segments. Requires inter-BFS edge exclusion; very complex for minimal gain.
+
+**Current TCK**: 2877/3880 (74.1% overall; 77.6% in-scope); 171 skipped.
 
 **Target**: TCK ≥ 79.5% (≈3085/3880, +56 from v0.20.0). Clear all non-temporal
-non-variable-length failures except known hard cases (Match4[7,8], Match5[27]).
+non-variable-length failures except known hard cases (Match4[7]).
 
 **Exit criteria**: All Quantifier, Pattern1, Merge5 path-bind scenarios pass ✓;
 variable-length path with dst predicates works ✓; no regressions below floor.
+All remaining targets completed ✓.
 
 ---
 

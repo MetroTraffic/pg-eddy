@@ -1107,12 +1107,18 @@ pub fn execute(
         LogicalPlan::VarLengthExpand {
             input, src_var, rel_var, dst_var,
             rel_types, direction, min_hops, max_hops, optional, path_carry_var,
+            excluded_rel_vars,
         } => {
             exec_var_length_expand(
                 input, src_var, rel_var.as_deref(), dst_var,
                 rel_types, *direction, *min_hops, *max_hops,
-                *optional, path_carry_var.as_deref(), params,
+                *optional, path_carry_var.as_deref(), excluded_rel_vars, params,
             )
+        }
+        LogicalPlan::BoundRelListExpand {
+            input, src_var, list_var, dst_var, direction,
+        } => {
+            exec_bound_rel_list_expand(input, src_var, list_var, dst_var, *direction, params)
         }
         LogicalPlan::NamedPath { input, path_var, element_vars } => {
             exec_named_path(input, path_var, element_vars, params)
@@ -1750,6 +1756,7 @@ fn exec_var_length_expand(
     max_hops: Option<u32>,
     optional: bool,
     path_carry_var: Option<&str>,
+    excluded_rel_vars: &[String],
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<Vec<Row>, ExecError> {
     use crate::catalog::labels::{label_name, prop_key_name};
@@ -1804,6 +1811,15 @@ fn exec_var_length_expand(
         // BFS: (node_id, depth, visited_edge_ids, path_node_ids, path_edge_ids)
         // path_node_ids/path_edge_ids are only populated when path_carry_var is set.
         let max_depth = max_hops.unwrap_or(u32::MAX).min(256); // safety cap
+
+        // Collect edge IDs from excluded_rel_vars (cross-hop uniqueness).
+        let excluded_edge_ids: Vec<i64> = excluded_rel_vars.iter().filter_map(|rv| {
+            let v = input_row.get(rv).cloned().or_else(|| params.get(rv).map(json_to_value));
+            match v {
+                Some(Value::Edge { edge_id, .. }) => Some(edge_id),
+                _ => None,
+            }
+        }).collect();
 
         // If dst_var is already bound in the input row or in params (correlated pattern),
         // filter BFS results to only paths ending at that node.
@@ -1942,6 +1958,10 @@ fn exec_var_length_expand(
                     if entry.visited_edge_ids.contains(&edge.edge_id) {
                         continue;
                     }
+                    // Skip edges excluded by cross-hop uniqueness.
+                    if excluded_edge_ids.contains(&edge.edge_id) {
+                        continue;
+                    }
                     let next_node_id = match direction {
                         RelDirection::Out => edge.target_node_id,
                         RelDirection::In => edge.source_node_id,
@@ -1969,11 +1989,141 @@ fn exec_var_length_expand(
 
         if !found_any && optional {
             let mut r = input_row.clone();
-            r.insert(dst_var.to_string(), Value::Null);
+            // Only null-fill the destination if it was NOT already bound in the
+            // input row.  A pre-bound destination that simply didn't match should
+            // keep its original value; only the relationship and path variables
+            // are new and should be set to null.
+            if expected_dst_id.is_none() {
+                r.insert(dst_var.to_string(), Value::Null);
+            }
             if let Some(rv) = rel_var { r.insert(rv.to_string(), Value::Null); }
             if let Some(pcv) = path_carry_var { r.insert(pcv.to_string(), Value::Null); }
             result.push(r);
         }
+    }
+
+    Ok(result)
+}
+
+/// Pre-bound relationship list expand (deprecated Cypher feature).
+/// `rs` is already bound as a list of Edge values. Walk them in order,
+/// verifying they form a connected path from `src_var` to the resulting
+/// `dst_var` endpoint. If `src_var` is pre-bound as a specific node, only
+/// emit if the chain starts there. Direction is considered when checking
+/// connectivity.
+fn exec_bound_rel_list_expand(
+    input: &LogicalPlan,
+    src_var: &str,
+    list_var: &str,
+    dst_var: &str,
+    direction: RelDirection,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<Row>, ExecError> {
+    use crate::catalog::labels::{label_name, prop_key_name};
+    use crate::storage::prop_store;
+
+    let input_rows = execute(input, params)?;
+    let mut result: Vec<Row> = Vec::new();
+
+    for input_row in &input_rows {
+        // Get the source node.
+        let src_val = input_row.get(src_var)
+            .cloned()
+            .or_else(|| params.get(src_var).map(json_to_value));
+        let src_id = match &src_val {
+            Some(Value::Node { node_id, .. }) => *node_id,
+            _ => continue,
+        };
+
+        // Get the pre-bound relationship list from the row or params.
+        let list_val = input_row.get(list_var)
+            .cloned()
+            .or_else(|| params.get(list_var).map(json_to_value));
+        // The list is Value::Json(Array([edge_json, ...])) — convert items to Value.
+        let edges: Vec<Value> = match &list_val {
+            Some(Value::Json(serde_json::Value::Array(arr))) => {
+                arr.iter().map(json_to_value).collect()
+            }
+            _ => continue,
+        };
+
+        // Walk the edge list and verify connectivity.
+        let mut current_node = src_id;
+        let mut connected = true;
+        for edge in &edges {
+            if let Value::Edge { source, target, .. } = edge {
+                match direction {
+                    RelDirection::Out => {
+                        if *source != current_node {
+                            connected = false;
+                            break;
+                        }
+                        current_node = *target;
+                    }
+                    RelDirection::In => {
+                        if *target != current_node {
+                            connected = false;
+                            break;
+                        }
+                        current_node = *source;
+                    }
+                    RelDirection::Both => {
+                        if *source == current_node {
+                            current_node = *target;
+                        } else if *target == current_node {
+                            current_node = *source;
+                        } else {
+                            connected = false;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                connected = false;
+                break;
+            }
+        }
+
+        if !connected {
+            continue;
+        }
+
+        // Check if dst_var is pre-bound; if so, verify the endpoint matches.
+        let expected_dst_id: Option<i64> = {
+            let bound_dst = input_row.get(dst_var)
+                .cloned()
+                .or_else(|| if !dst_var.starts_with("_anon_") { params.get(dst_var).map(json_to_value) } else { None });
+            if let Some(Value::Node { node_id, .. }) = bound_dst { Some(node_id) } else { None }
+        };
+        if let Some(eid) = expected_dst_id {
+            if current_node != eid {
+                continue;
+            }
+        }
+
+        // Build the destination node value.
+        let dst_val = unsafe {
+            let nrel = crate::open_nodes_relation();
+            let snapshot = pgrx::pg_sys::GetActiveSnapshot();
+            let record = crate::storage::node_store::find_node_by_id(nrel, current_node, snapshot);
+            pgrx::pg_sys::table_close(nrel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+            if let Some(mut r) = record {
+                if r.overflow_blkno != 0 && r.prop_bytes.is_empty() {
+                    let nrel2 = crate::open_nodes_relation();
+                    r.prop_bytes = crate::storage::node_store::read_overflow_block(nrel2, r.overflow_blkno);
+                    pgrx::pg_sys::table_close(nrel2, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                }
+                let labels: Vec<String> = r.label_ids.iter().map(|id| label_name(*id)).collect();
+                let properties = prop_store::decode(&r.prop_bytes, prop_key_name);
+                Value::Node { node_id: current_node, labels, properties }
+            } else {
+                continue;
+            }
+        };
+
+        let mut row = input_row.clone();
+        row.insert(dst_var.to_string(), dst_val);
+        result.push(row);
     }
 
     Ok(result)

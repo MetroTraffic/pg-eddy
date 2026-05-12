@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.21.0](#0210----variable-length-correctness-and-remaining-quick-wins) — Variable-Length Correctness and Remaining Quick Wins
 - [0.20.0](#0200----engine-correctness-and-tcl-harness-improvements) — Engine Correctness and TCK Harness Improvements
 - [0.19.0](#0190----cypher-correctness-and-ordering-improvements) — Cypher Correctness and Ordering Improvements
 - [0.18.0](#0180----quantifiers-pattern-comprehension-and-union) — Quantifiers, Pattern Comprehension, and UNION
@@ -33,36 +34,81 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## [Unreleased]
 
+---
+
+## [0.21.0] — Variable-Length Correctness and Remaining Quick Wins
+
+v0.21.0 closes virtually all non-temporal TCK failures. TCK pass rate rises
+from **2870/3880 (77.4%)** to **2877/3880 (77.6%)** — +7 scenarios beyond the
+v0.20.0 baseline. Only one non-temporal failure remains (Match4[7], deferred).
+
+### What's New
+
+**Variable-length expand with destination predicates** — var-length
+`MATCH (a)-[*]->(b:Label {prop: val})` now correctly applies label and
+property filters on the destination node. Previously these predicates were
+silently ignored during BFS traversal. Fixes Match4[4], Match5[4,21,22],
+Match6[14], Match9[5] (6 scenarios).
+
+**Variable-length expand with relationship predicates** — var-length
+`MATCH ()-[r:T* {key: val}]-()` now post-filters the edge list with an
+`all(r IN rels WHERE …)` predicate. Fixes Match4[5] (1 scenario).
+
+**Exact-length var-length patterns** — `*N` (e.g. `*3`) now parses as
+exactly N hops instead of unbounded. Fixes Match5[4,21,22] (3 scenarios).
+
+**Pre-bound edge list in var-length position** — deprecated Cypher syntax
+`WITH [r1,r2] AS rs … MATCH ()-[rs*]->()` now works via a new
+`BoundRelListExpand` plan node that walks the pre-provided edge list,
+verifying connectivity. Fixes Match4[8], Match9[6,7] (3 scenarios).
+
+**Cross-hop uniqueness (fixed × var-length)** — when a pattern contains
+both fixed-length and variable-length relationships, the BFS now excludes
+edges already bound by fixed-length hops, enforcing relationship uniqueness
+across the entire pattern. Fixes Match5[27] (1 scenario).
+
+**OPTIONAL MATCH + var-length + destination label** — chained
+`OPTIONAL MATCH (a)-[*]->(b:L)` where the var-length expand's destination
+has label constraints now correctly uses LeftJoin semantics, preventing
+null rows from being discarded by the post-expand label filter.
+Fixes Match7[15] (1 scenario).
+
+**OPTIONAL MATCH with non-existent destination label** — `OPTIONAL MATCH
+(n)-[]->(m:NonExistent)` now short-circuits to a null row instead of scanning
+edges. Fixes Match7[22,28] (2 scenarios).
+
+**Optional var-length with pre-bound destination** — when the destination
+variable is already bound and no path is found, the null-fill now preserves
+the pre-bound value instead of overwriting it. Fixes Match9[9] (1 scenario).
+
+**`WITH *` preserves variable bindings** — `WITH *` now correctly carries
+all non-anonymous variables into downstream clauses. Previously, `WITH *`
+cleared the planner's bound variable set, causing subsequent OPTIONAL MATCH
+to misplan with fresh scans instead of reusing pre-bound variables.
+Fixes Match8[2] (1 scenario).
+
+**Quantifier type-mismatch detection** — `any/all/none/single` over a
+literal list of strings or booleans with arithmetic predicates now raises
+`SyntaxError: InvalidArgumentType` at compile time. Fixes Quantifier1–4
+(12 scenarios).
+
+**WHERE expression must be boolean** — `WHERE (n)` (bare node variable)
+now raises `SyntaxError: InvalidArgumentType`. Fixes Pattern1[11]
+(1 scenario).
+
+**MERGE path variable on create** — `MERGE p = (a)-[:R]->(b) RETURN p`
+now populates `p` on the create branch. Fixes Merge5[10] (1 scenario).
+
 ### Process & Quality
 
-- **TCK regression floor**: New `tests/tck/baseline.txt` records the minimum
-  passing scenario count, enforced by `tests/tck/tck_floor.sh`. Following the
-  approach from rs-polygraph (see `plans/rs-polygraph-analysis.md` §4.3), no
-  release may decrease this number. Current floor: **3018**.
-- **TCK failure classification**: New `plans/tck-failure-analysis.md` exhaustively
-  buckets every failing scenario by root cause. Drives roadmap planning per
-  rs-polygraph §4.2.
-
-### Cypher Correctness
-
-- **MERGE binds path variable on create** (Merge5 [10], 1 TCK scenario):
-  `MERGE p = (a)-[:R]->(b) RETURN p` now correctly populates `p` with the
-  freshly-created path when the pattern did not previously exist. The
-  match-path branch already populated `p`; only the create-path branch was
-  missing path materialization.
-- **WHERE expression must be boolean** (Pattern1 [11], 1 TCK scenario):
-  `MATCH (n) WHERE (n) RETURN n` now raises `SyntaxError: InvalidArgumentType`
-  at compile time, matching openCypher 9 semantics — a bare graph-entity
-  variable is not a boolean predicate.
-- **Quantifier type-mismatch detection** (Quantifier1–4 [15], 12 TCK scenarios):
-  When the list argument of `any/all/none/single` is a homogeneous literal list
-  of strings or booleans, and the predicate applies arithmetic to the iteration
-  variable, the planner now raises `SyntaxError: InvalidArgumentType` at compile
-  time, matching openCypher 9 §6.5 semantics.
+- **TCK regression floor**: `tests/tck/baseline.txt` + `tests/tck/tck_floor.sh`
+  enforce a minimum passing count. Current floor: 2877.
+- **TCK failure classification**: `plans/tck-failure-analysis.md` exhaustively
+  buckets every failing scenario by root cause.
 
 ### TCK
 
-- Pass rate: 3006 → 3029 / 3880 (77.5% → 78.1%, +23).
+- Pass rate: 2870 → 2877 / 3880 (77.4% → 77.6%, +7 net).
 
 ---
 
