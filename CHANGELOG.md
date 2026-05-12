@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.22.0](#0220----temporal-type-system) — Temporal Type System
 - [0.21.0](#0210----variable-length-correctness-and-remaining-quick-wins) — Variable-Length Correctness and Remaining Quick Wins
 - [0.20.0](#0200----engine-correctness-and-tcl-harness-improvements) — Engine Correctness and TCK Harness Improvements
 - [0.19.0](#0190----cypher-correctness-and-ordering-improvements) — Cypher Correctness and Ordering Improvements
@@ -33,6 +34,64 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 ---
 
 ## [Unreleased]
+
+---
+
+## [0.22.0] — Temporal Type System
+
+v0.22.0 delivers full temporal type support. TCK pass rate jumps from
+**2877/3880 (74.2%)** to **3876/3880 (99.9%)** — +999 scenarios. Every
+temporal suite (Temporal1–10) now passes except 2 extreme-range tests
+requiring ±999,999,999 year dates beyond chrono's representable range.
+
+### What's New
+
+**Six temporal types** — `date`, `localtime`, `time`, `localdatetime`,
+`datetime`, and `duration` are now first-class Cypher values. Construct
+from ISO 8601 strings (`date('2024-01-15')`), maps (`time({hour: 12,
+minute: 30, timezone: 'Europe/London'})`), or project from other temporals
+(`datetime({date: d, time: t, timezone: 'UTC'})`).
+
+**Full component access** — `.year`, `.month`, `.day`, `.hour`, `.minute`,
+`.second`, `.millisecond`, `.microsecond`, `.nanosecond`, `.timezone`,
+`.offset`, `.offsetMinutes`, `.offsetSeconds`, `.epochMillis`,
+`.epochSeconds` on temporal values. Duration accessors (`.years`, `.months`,
+`.days`, `.hours`, `.minutes`, `.seconds`, etc.) follow Neo4j total-based
+semantics.
+
+**Temporal arithmetic** — `temporal + duration`, `temporal - duration`,
+`duration ± duration`, `duration * number`, `duration / number`,
+`duration * float`, `duration / float` all work correctly. Duration
+division uses the Neo4j 30.436875 days/month conversion factor with
+fractional cascading.
+
+**Duration functions** — `duration.between(t1, t2)`, `duration.inMonths()`,
+`duration.inDays()`, `duration.inSeconds()` compute differences between
+any valid temporal type pair. Mixed zoned/local comparisons interpret the
+local side in the named timezone for correct DST-aware results.
+
+**Temporal comparison and ordering** — Temporal values of the same type
+are comparable with `<`, `>`, `=`, etc. `ORDER BY` on temporal values
+works correctly. Zoned types compare in UTC.
+
+**Timezone support** — IANA named timezones (`'Europe/Stockholm'`,
+`'Pacific/Honolulu'`) and fixed offsets (`'+05:00'`, `'Z'`). DST
+transitions handled correctly for timezone projection and duration
+computation.
+
+**Date arithmetic edge cases** — date + duration includes whole-day
+overflow from time components. Fractional duration fields (e.g.,
+`years: 12.5`) cascade correctly through the field hierarchy.
+
+### Remaining TCK Failures (4 of 3880)
+
+- **Match4[7]** — variable-length pattern with bound relationship
+  (pre-existing, non-temporal)
+- **List12[6]** — list comprehension in WHERE (pre-existing, non-temporal)
+- **Temporal10[9]** — `date('-999999999-01-01')` exceeds chrono's
+  representable year range
+- **Temporal10[10]** — `localdatetime('-999999999-01-01')` exceeds chrono's
+  representable year range
 
 ---
 

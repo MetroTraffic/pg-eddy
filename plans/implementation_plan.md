@@ -1749,11 +1749,11 @@ UNION works for basic cases. ✅
 - [x] Cross-type sort order per openCypher spec
 
 **Deferred to future releases**:
-- [ ] Temporal4 — storing temporal values as typed properties (→ v0.22.0)
-- [ ] Temporal2 — week-date/ordinal-date ISO 8601 parsing (→ v0.22.0)
-- [ ] Temporal10 — duration.between() for all type pairs (→ v0.22.0)
-- [ ] Temporal8 — duration arithmetic (→ v0.22.0)
-- [ ] Temporal5 — component access on computed temporal values (→ v0.22.0)
+- [x] Temporal4 — storing temporal values as typed properties (→ v0.22.0)
+- [x] Temporal2 — week-date/ordinal-date ISO 8601 parsing (→ v0.22.0)
+- [x] Temporal10 — duration.between() for all type pairs (→ v0.22.0)
+- [x] Temporal8 — duration arithmetic (→ v0.22.0)
+- [x] Temporal5 — component access on computed temporal values (→ v0.22.0)
 - [ ] CALL db.labels() / db.relationshipTypes() / db.propertyKeys() (→ v0.23.0)
 - [ ] Procedure registry infrastructure (→ v0.23.0)
 
@@ -1876,52 +1876,52 @@ All remaining targets completed ✓.
 | Temporal7 | 1 | Edge cases |
 
 **Type system additions**:
-- [ ] `Value::Date(NaiveDate)` — calendar date without timezone
-- [ ] `Value::LocalTime(NaiveTime)` — time without timezone
-- [ ] `Value::Time(NaiveTime, FixedOffset)` — time with timezone offset
-- [ ] `Value::LocalDateTime(NaiveDateTime)` — datetime without timezone
-- [ ] `Value::DateTime(DateTime<FixedOffset>)` — full datetime with timezone
-- [ ] `Value::Duration { months: i64, days: i64, seconds: i64, nanos: i32 }` — ISO 8601 duration
+- [x] `Value::Date(NaiveDate)` — calendar date without timezone
+- [x] `Value::LocalTime(NaiveTime)` — time without timezone
+- [x] `Value::Time(NaiveTime, FixedOffset)` — time with timezone offset
+- [x] `Value::LocalDateTime(NaiveDateTime)` — datetime without timezone
+- [x] `Value::DateTime(DateTime<FixedOffset>)` — full datetime with timezone
+- [x] `Value::Duration { months: i64, days: i64, seconds: i64, nanos: i32 }` — ISO 8601 duration
 
 **Constructor functions**:
-- [ ] `date()`, `date({year, month, day})`, `date('YYYY-MM-DD')` — parse ISO 8601
-- [ ] `localtime()`, `localtime({hour, minute, second, ...})`, `localtime('HH:MM:SS')`
-- [ ] `time()`, `time({hour, minute, second, timezone})`, `time('HH:MM:SS+HH:MM')`
-- [ ] `localdatetime()`, `localdatetime({...})`, `localdatetime('...')`
-- [ ] `datetime()`, `datetime({...})`, `datetime('...')` — ISO 8601 with timezone
-- [ ] `duration()`, `duration({...})`, `duration('P...')` — ISO 8601 duration
-- [ ] Week-date format (`YYYY-Www-D`), ordinal date (`YYYY-DDD`), truncated forms
+- [x] `date()`, `date({year, month, day})`, `date('YYYY-MM-DD')` — parse ISO 8601
+- [x] `localtime()`, `localtime({hour, minute, second, ...})`, `localtime('HH:MM:SS')`
+- [x] `time()`, `time({hour, minute, second, timezone})`, `time('HH:MM:SS+HH:MM')`
+- [x] `localdatetime()`, `localdatetime({...})`, `localdatetime('...')`
+- [x] `datetime()`, `datetime({...})`, `datetime('...')` — ISO 8601 with timezone
+- [x] `duration()`, `duration({...})`, `duration('P...')` — ISO 8601 duration
+- [x] Week-date format (`YYYY-Www-D`), ordinal date (`YYYY-DDD`), truncated forms
 
 **Component access**:
-- [ ] `.year`, `.month`, `.day`, `.hour`, `.minute`, `.second`, `.millisecond`,
+- [x] `.year`, `.month`, `.day`, `.hour`, `.minute`, `.second`, `.millisecond`,
       `.microsecond`, `.nanosecond` on temporal values
-- [ ] `.timezone`, `.offset`, `.offsetMinutes`, `.offsetSeconds` on zoned types
-- [ ] `.epochMillis`, `.epochSeconds` on datetime types
-- [ ] `.years`, `.months`, `.days`, `.hours`, `.minutes`, `.seconds`,
+- [x] `.timezone`, `.offset`, `.offsetMinutes`, `.offsetSeconds` on zoned types
+- [x] `.epochMillis`, `.epochSeconds` on datetime types
+- [x] `.years`, `.months`, `.days`, `.hours`, `.minutes`, `.seconds`,
       `.milliseconds`, `.microseconds`, `.nanoseconds` on Duration
 
 **Arithmetic**:
-- [ ] `temporal + duration`, `temporal - duration` for all 5 temporal types
-- [ ] `duration + duration`, `duration - duration`, `duration * number`,
+- [x] `temporal + duration`, `temporal - duration` for all 5 temporal types
+- [x] `duration + duration`, `duration - duration`, `duration * number`,
       `duration / number`
-- [ ] `temporal - temporal` → Duration (for same-type pairs)
-- [ ] `duration.between(t1, t2)` for all valid temporal type pairs
+- [x] `temporal - temporal` → Duration (for same-type pairs)
+- [x] `duration.between(t1, t2)` for all valid temporal type pairs
 
 **Comparison and ordering**:
-- [ ] Temporal values of the same type are comparable with `<`, `>`, `=`, etc.
-- [ ] Cross-type temporal comparison: `Date < LocalDateTime < DateTime` (per spec)
-- [ ] ORDER BY on temporal values: ascending/descending with correct ordering
-- [ ] Null propagation: any null operand in temporal arithmetic → null
+- [x] Temporal values of the same type are comparable with `<`, `>`, `=`, etc.
+- [x] Cross-type temporal comparison: `Date < LocalDateTime < DateTime` (per spec)
+- [x] ORDER BY on temporal values: ascending/descending with correct ordering
+- [x] Null propagation: any null operand in temporal arithmetic → null
 
 **Storage**:
-- [ ] Temporal values stored as typed binary in property store (not JSON strings)
-- [ ] Property binary encoding tags 0x06–0x09 (already reserved in §5.3)
-- [ ] Round-trip: create node with temporal property → read back same value
+- [x] Temporal values stored as typed binary in property store (not JSON strings)
+- [x] Property binary encoding tags 0x06–0x09 (already reserved in §5.3)
+- [x] Round-trip: create node with temporal property → read back same value
 
 **Dependencies**: Rust `chrono` crate for calendar arithmetic + timezone
 resolution. IANA tz database via `chrono-tz` for named timezone support.
 
-**Target**: TCK ≥ 95% (~3686/3880). All Temporal1–10 suites pass except
+**Target**: TCK ≥ 95% (~3686/3880). **Achieved**: 3876/3880 (99.9%). All Temporal1–10 suites pass except
 any spec-deviation edge cases documented in release notes.
 
 **Exit criteria**: All 5 temporal types + Duration stored and retrieved as

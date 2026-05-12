@@ -378,8 +378,8 @@ fn plan_clauses(
                 //   post-aggregation filter (HAVING) and must be applied AFTER projection.
                 // - Otherwise, apply the WHERE BEFORE projection so pre-projected variables
                 //   are in scope, and substitute projection aliases (e.g. `WITH a+b AS c WHERE c > 0`).
-                if let Some(wh) = where_clause {
-                    if !proj_has_agg {
+                if let Some(wh) = where_clause
+                    && !proj_has_agg {
                         // Non-aggregating WITH: substitute aliases and filter before projection.
                         let alias_map: HashMap<String, Expr> = items.iter()
                             .filter_map(|item| {
@@ -390,7 +390,6 @@ fn plan_clauses(
                         current = LogicalPlan::Filter { input: Box::new(current), predicate: rewritten_wh };
                     }
                     // For aggregating WITH: WHERE will be added AFTER projection below.
-                }
                 current = LogicalPlan::Project {
                     input: Box::new(current),
                     items: items.clone(),
@@ -424,11 +423,10 @@ fn plan_clauses(
                 }
                 // For aggregating WITH with WHERE: apply the WHERE as a post-aggregation
                 // filter (HAVING) now that projected columns are in scope.
-                if proj_has_agg {
-                    if let Some(wh) = where_clause {
+                if proj_has_agg
+                    && let Some(wh) = where_clause {
                         current = LogicalPlan::Filter { input: Box::new(current), predicate: wh.clone() };
                     }
-                }
             }
             QueryClause::Return { distinct, items, order_by, skip, limit } => {
                 // Check for RETURN * with no non-anonymous variables in scope.
@@ -444,8 +442,8 @@ fn plan_clauses(
                 }
                 // Check for undefined variable references in RETURN items.
                 for item in items.iter() {
-                    if let Expr::Variable(v) = &item.expr {
-                        if !bound_vars.contains(v) {
+                    if let Expr::Variable(v) = &item.expr
+                        && !bound_vars.contains(v) {
                             return Err(PlanError {
                                 message: format!(
                                     "SyntaxError: UndefinedVariable — \
@@ -453,7 +451,6 @@ fn plan_clauses(
                                 ),
                             });
                         }
-                    }
                 }
                 // Check for nested aggregation in RETURN items.
                 for item in items.iter() {
@@ -504,8 +501,8 @@ fn plan_clauses(
                     // length(node|edge) is InvalidArgumentType.
                     if let Expr::FunctionCall(ref fname, ref args) = item.expr {
                         let lname = fname.to_ascii_lowercase();
-                        if args.len() == 1 {
-                            if let Expr::Variable(ref v) = args[0] {
+                        if args.len() == 1
+                            && let Expr::Variable(ref v) = args[0] {
                                 let vk = var_kinds.get(v);
                                 match lname.as_str() {
                                     "size" if matches!(vk, Some(VarKind::Path)) => {
@@ -531,7 +528,6 @@ fn plan_clauses(
                                     _ => {}
                                 }
                             }
-                        }
                     }
                 }
                 // Check for duplicate column names (ColumnNameConflict).
@@ -691,8 +687,8 @@ fn plan_clauses(
                 // Validate DELETE expressions: must be variable references.
                 for expr in exprs.iter() {
                     match expr {
-                        Expr::Variable(v) => {
-                            if !bound_vars.contains(v) {
+                        Expr::Variable(v)
+                            if !bound_vars.contains(v) => {
                                 return Err(PlanError {
                                     message: format!(
                                         "SyntaxError: UndefinedVariable — \
@@ -700,7 +696,6 @@ fn plan_clauses(
                                     ),
                                 });
                             }
-                        }
                         // Literal numeric/string/boolean/null cannot be nodes — reject at plan time.
                         Expr::IntLit(_) | Expr::FloatLit(_) | Expr::StringLit(_)
                         | Expr::BoolLit(_) | Expr::NullLit | Expr::List(_) | Expr::MapLiteral(_) => {
@@ -763,8 +758,8 @@ fn plan_clauses(
                             });
                         }
                         // Check rel var not already bound.
-                        if let Some(ref v) = r.variable {
-                            if bound_vars.contains(v) {
+                        if let Some(ref v) = r.variable
+                            && bound_vars.contains(v) {
                                 return Err(PlanError {
                                     message: format!(
                                         "SyntaxError: VariableAlreadyBound — \
@@ -772,11 +767,10 @@ fn plan_clauses(
                                     ),
                                 });
                             }
-                        }
                     }
                     // Check node vars: if re-bound standalone or with new labels, it's VariableAlreadyBound.
-                    if let PatternElement::Node(n) = elem {
-                        if let Some(ref v) = n.variable {
+                    if let PatternElement::Node(n) = elem
+                        && let Some(ref v) = n.variable {
                             let is_standalone = pattern.elements.len() == 1;
                             if bound_vars.contains(v) && (is_standalone || !n.labels.is_empty()) {
                                 return Err(PlanError {
@@ -787,7 +781,6 @@ fn plan_clauses(
                                 });
                             }
                         }
-                    }
                 }
                 // Variables from the merge pattern come into scope.
                 for elem in &pattern.elements {
@@ -943,8 +936,8 @@ fn expr_has_inline_pattern(expr: &Expr) -> bool {
         Expr::Subscript(base, idx) => expr_has_inline_pattern(base) || expr_has_inline_pattern(idx),
         Expr::ListSlice { list_expr, from, to } => {
             expr_has_inline_pattern(list_expr)
-                || from.as_deref().map_or(false, expr_has_inline_pattern)
-                || to.as_deref().map_or(false, expr_has_inline_pattern)
+                || from.as_deref().is_some_and(expr_has_inline_pattern)
+                || to.as_deref().is_some_and(expr_has_inline_pattern)
         }
         // Comparison chains
         Expr::Compare(base, _, rhs) => {
@@ -968,14 +961,12 @@ fn collect_pattern_named_vars(pattern: &Pattern) -> Vec<String> {
     for elem in &pattern.elements {
         match elem {
             PatternElement::Node(n) => {
-                if let Some(ref v) = n.variable {
-                    if !v.starts_with('_') { vars.push(v.clone()); }
-                }
+                if let Some(ref v) = n.variable
+                    && !v.starts_with('_') { vars.push(v.clone()); }
             }
             PatternElement::Relationship(r) => {
-                if let Some(ref v) = r.variable {
-                    if !v.starts_with('_') { vars.push(v.clone()); }
-                }
+                if let Some(ref v) = r.variable
+                    && !v.starts_with('_') { vars.push(v.clone()); }
             }
         }
     }
@@ -1095,15 +1086,12 @@ fn plan_match_clause(
             let elems = &pat.elements;
             let mut i = 1;
             while i < elems.len() {
-                if let PatternElement::Relationship(r) = &elems[i] {
-                    if r.length.is_some() {
-                        if let Some(PatternElement::Node(n)) = elems.get(i + 1) {
-                            if !n.labels.is_empty() || !n.properties.is_empty() {
+                if let PatternElement::Relationship(r) = &elems[i]
+                    && r.length.is_some()
+                        && let Some(PatternElement::Node(n)) = elems.get(i + 1)
+                            && (!n.labels.is_empty() || !n.properties.is_empty()) {
                                 return true;
                             }
-                        }
-                    }
-                }
                 i += 2;
             }
             false
@@ -1991,8 +1979,8 @@ fn is_aggregate_fn(name: &str) -> bool {
 fn check_path_property_access(expr: &Expr, var_kinds: &HashMap<String, VarKind>) -> Result<(), PlanError> {
     match expr {
         Expr::Property(base, _) => {
-            if let Expr::Variable(v) = base.as_ref() {
-                if matches!(var_kinds.get(v), Some(VarKind::Path)) {
+            if let Expr::Variable(v) = base.as_ref()
+                && matches!(var_kinds.get(v), Some(VarKind::Path)) {
                     return Err(PlanError {
                         message: format!(
                             "SyntaxError: InvalidArgumentType — \
@@ -2000,7 +1988,6 @@ fn check_path_property_access(expr: &Expr, var_kinds: &HashMap<String, VarKind>)
                         ),
                     });
                 }
-            }
             check_path_property_access(base, var_kinds)
         }
         Expr::Arith(l, _, r) | Expr::Compare(l, _, r) | Expr::And(l, r)
@@ -2044,7 +2031,7 @@ fn check_nested_aggregation(expr: &Expr, inside_agg: bool) -> Result<(), PlanErr
                 });
             }
             // Non-deterministic functions (rand()) inside aggregates are forbidden.
-            if inside_agg && name.to_ascii_lowercase() == "rand" {
+            if inside_agg && name.eq_ignore_ascii_case("rand") {
                 return Err(PlanError {
                     message: "SyntaxError: NonConstantExpression — \
                               non-deterministic function rand() cannot be used inside \
@@ -2544,11 +2531,12 @@ mod tests {
 
     #[test]
     fn test_plan_isomorphism() {
-        let q = parse("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b").unwrap();
+        // openCypher enforces relationship isomorphism, not node isomorphism.
+        // Two relationship variables in the same MATCH should produce a Filter.
+        let q = parse("MATCH (a)-[r1:KNOWS]->(b)-[r2:LIKES]->(c) RETURN a, b, c").unwrap();
         let p = plan(&q).unwrap();
         let s = explain(&p, 0);
-        // Should have a Filter with id(a) <> id(b)
-        assert!(s.contains("Filter"));
+        assert!(s.contains("Filter"), "expected Filter in plan: {s}");
     }
 
     #[test]
