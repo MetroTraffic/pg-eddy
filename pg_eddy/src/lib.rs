@@ -1947,6 +1947,72 @@ mod tests {
             let _s = explain(&p, 0);
         }
     }
+
+    /// TCK Match4[7]: variable-length pattern with bound relationship.
+    #[pg_test]
+    fn test_match4_7_bound_rel_varlen() {
+        // Setup: 4 nodes, 3 edges in a chain
+        crate::cypher(
+            "CREATE (n0:Node), (n1:Node), (n2:Node), (n3:Node), \
+             (n0)-[:EDGE]->(n1), (n1)-[:EDGE]->(n2), (n2)-[:EDGE]->(n3)",
+            None,
+        ).for_each(drop);
+
+        let results: Vec<pgrx::JsonB> = crate::cypher(
+            "MATCH ()-[r:EDGE]-() MATCH p = (n)-[*0..1]-()-[r]-()-[*0..1]-(m) RETURN count(p) AS c",
+            None,
+        ).collect();
+        assert_eq!(results.len(), 1, "expected 1 row");
+        let row = results[0].0.as_object().expect("expected object");
+        let c = row.get("c").and_then(|v| v.as_i64()).expect("expected c");
+        assert_eq!(c, 32, "Match4[7] expects count(p) = 32, got {}", c);
+    }
+
+    /// TCK List12[6]: list comprehension in WHERE.
+    #[pg_test]
+    fn test_list12_6_listcomp_in_where() {
+        crate::cypher(
+            "CREATE (a:A {name: 'c'}) CREATE (a)-[:T]->(:B), (a)-[:T]->(:C)",
+            None,
+        ).for_each(drop);
+
+        let results: Vec<pgrx::JsonB> = crate::cypher(
+            "MATCH (n)-->(b) WHERE n.name IN [x IN labels(b) | toLower(x)] RETURN b",
+            None,
+        ).collect();
+        assert_eq!(results.len(), 1, "expected 1 row matching WHERE");
+        let row = results[0].0.as_object().expect("expected object");
+        let b = row.get("b").expect("expected b");
+        // b should be the (:C) node since toLower('C') = 'c' = n.name
+        let labels = b.get("labels").and_then(|v| v.as_array()).expect("expected labels");
+        assert!(labels.iter().any(|l| l == "C"), "expected :C node, got {:?}", labels);
+    }
+
+    /// TCK Temporal10[9]: duration.between with extreme-range dates.
+    #[pg_test]
+    fn test_temporal10_9_large_duration() {
+        let results: Vec<pgrx::JsonB> = crate::cypher(
+            "RETURN duration.between(date('-999999999-01-01'), date('+999999999-12-31')) AS duration",
+            None,
+        ).collect();
+        assert_eq!(results.len(), 1);
+        let row = results[0].0.as_object().expect("expected object");
+        let dur = row.get("duration").and_then(|v| v.as_str()).expect("expected duration string");
+        assert_eq!(dur, "P1999999998Y11M30D", "Temporal10[9] expects P1999999998Y11M30D, got {}", dur);
+    }
+
+    /// TCK Temporal10[10]: duration.inSeconds with extreme-range localdatetimes.
+    #[pg_test]
+    fn test_temporal10_10_large_duration_seconds() {
+        let results: Vec<pgrx::JsonB> = crate::cypher(
+            "RETURN duration.inSeconds(localdatetime('-999999999-01-01'), localdatetime('+999999999-12-31T23:59:59')) AS duration",
+            None,
+        ).collect();
+        assert_eq!(results.len(), 1);
+        let row = results[0].0.as_object().expect("expected object");
+        let dur = row.get("duration").and_then(|v| v.as_str()).expect("expected duration string");
+        assert_eq!(dur, "PT17531639991215H59M59S", "Temporal10[10] expects PT17531639991215H59M59S, got {}", dur);
+    }
 }
 
 

@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.22.1](#0221----100-tck-compliance) — 100% TCK Compliance
 - [0.22.0](#0220----temporal-type-system) — Temporal Type System
 - [0.21.0](#0210----variable-length-correctness-and-remaining-quick-wins) — Variable-Length Correctness and Remaining Quick Wins
 - [0.20.0](#0200----engine-correctness-and-tcl-harness-improvements) — Engine Correctness and TCK Harness Improvements
@@ -34,6 +35,34 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 ---
 
 ## [Unreleased]
+
+---
+
+## [0.22.1] — 2026-05-12 — 100% TCK Compliance
+
+v0.22.1 closes the last 4 TCK failures. TCK pass rate reaches
+**3880/3880 (100%)** — full openCypher conformance.
+
+### What's New
+
+**`toLower()` / `toUpper()` string functions** — Cypher string case
+conversion functions are now implemented. Fixes List12[6] (list
+comprehension in WHERE using `toLower()`).
+
+**Extended-range date parsing** — dates with years outside chrono's
+representable range (±262143) now parse correctly via an extended-year
+ISO 8601 format handler. `date('-999999999-01-01')` and
+`localdatetime('+999999999-12-31T23:59:59')` work correctly.
+
+**Extended-range duration computation** — `duration.between()` and
+`duration.inSeconds()` now compute correct results for dates spanning
+the full ±999,999,999 year range using proleptic Gregorian calendar
+arithmetic that bypasses chrono when dates exceed its range. Fixes
+Temporal10[9] and Temporal10[10].
+
+**Match4[7] already passing** — variable-length pattern with bound
+relationship was already handled correctly by the existing planner and
+executor; confirmed with a dedicated regression test.
 
 ---
 
@@ -83,15 +112,12 @@ computation.
 overflow from time components. Fractional duration fields (e.g.,
 `years: 12.5`) cascade correctly through the field hierarchy.
 
-### Remaining TCK Failures (4 of 3880)
+### Remaining TCK Failures (4 of 3880) — all fixed in v0.22.1
 
-- **Match4[7]** — variable-length pattern with bound relationship
-  (pre-existing, non-temporal)
-- **List12[6]** — list comprehension in WHERE (pre-existing, non-temporal)
-- **Temporal10[9]** — `date('-999999999-01-01')` exceeds chrono's
-  representable year range
-- **Temporal10[10]** — `localdatetime('-999999999-01-01')` exceeds chrono's
-  representable year range
+- **Match4[7]** — ~~variable-length pattern with bound relationship~~ ✅ already passing
+- **List12[6]** — ~~list comprehension in WHERE~~ ✅ fixed (toLower/toUpper added)
+- **Temporal10[9]** — ~~`date('-999999999-01-01')` exceeds chrono range~~ ✅ fixed (extended-year parsing)
+- **Temporal10[10]** — ~~`localdatetime('-999999999-01-01')` exceeds chrono range~~ ✅ fixed (extended-year parsing)
 
 ---
 

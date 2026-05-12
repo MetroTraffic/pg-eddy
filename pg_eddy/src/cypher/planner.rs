@@ -1240,7 +1240,15 @@ fn plan_pattern_onto(
         _ => return Err(PlanError { message: "pattern must start with a node".into() }),
     };
 
-    let first_var = first_node.variable.clone().unwrap_or_else(|| "_anon_n0".to_string());
+    let first_var = if let Some(ref v) = first_node.variable {
+        v.clone()
+    } else {
+        let mut name = "_anon_n0".to_string();
+        while bound_vars.contains(&name) {
+            name.push('_');
+        }
+        name
+    };
     let first_is_bound = first_node.variable.is_some() && bound_vars.contains(&first_var);
 
     // Type-conflict check for first node.
@@ -1428,8 +1436,15 @@ fn plan_pattern_onto(
                 }
             }
 
-            let dst_var = next_node.variable.clone()
-                .unwrap_or_else(|| format!("_anon_n{}", i + 1));
+            let dst_var = if let Some(ref v) = next_node.variable {
+                v.clone()
+            } else {
+                let mut name = format!("_anon_n{}", i + 1);
+                while bound_vars.contains(&name) || new_node_vars.contains(&name) {
+                    name.push('_');
+                }
+                name
+            };
 
             // Type-conflict check for dest node.
             // Allow Scalar (could be a node from expression). Reject explicit Rel/Path/NotNode.

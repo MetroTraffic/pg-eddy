@@ -1930,6 +1930,30 @@ correct for all type pairs; ORDER BY on temporal values correct.
 
 ---
 
+**v0.22.1 — 100% TCK Compliance**:
+
+> Close the last 4 TCK failures (3876 → 3880/3880) to reach full openCypher
+> conformance. All issues are independent, non-temporal except for two
+> extreme-range date tests. Inserted between v0.22.0 and the next planned
+> v0.23.0 release.
+
+- [x] `toLower()` / `toUpper()` string functions — missing from `eval_function`
+      dispatch; List12[6] fails because `toLower(x)` is unrecognised
+      (1 scenario)
+- [x] Match4[7] — variable-length pattern with bound relationship: confirmed
+      already passing; regression test added (1 scenario)
+- [x] Temporal10[9,10] — `date('-999999999-01-01')` and
+      `localdatetime('-999999999-01-01')` exceed `chrono::NaiveDate`'s
+      representable year range (±262143). Fixed via `parse_extended_date_ymd`,
+      `add_months_ext`, `extended_date_diff_days`, `extended_total_day_diff`;
+      both `duration_between` and `duration_in_seconds` updated (2 scenarios)
+
+**Target**: TCK = 3880/3880 (100%).
+
+**Exit criteria**: All 3880 TCK scenarios pass; no regressions.
+
+---
+
 **v0.23.0 — Property Indexes + Schema DDL**:
 
 > Moved from the original v0.16.0 → v0.21.0 → v0.23.0 position. No TCK

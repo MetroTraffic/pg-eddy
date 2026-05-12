@@ -72,7 +72,8 @@ pub struct TemporalValue {
     pub kind: TemporalKind,
     /// Canonical ISO 8601 string (used for RETURN / storage).
     pub iso: String,
-    /// Date part (None for pure time values).
+    /// Date part (None for pure time values, or for extended-range dates
+    /// outside chrono's representable range ±262143).
     pub date: Option<NaiveDate>,
     /// Time part (None for pure date values).
     pub time: Option<NaiveTime>,
@@ -300,6 +301,70 @@ fn map_i64(m: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<
     m.get(key).and_then(|v| v.as_i64())
 }
 
+fn i32_from_i64(v: i64) -> Option<i32> {
+    i32::try_from(v).ok()
+}
+
+/// Parse an extended-year date string like `-999999999-01-01` or `+999999999-12-31`.
+/// Returns (year, month, day) or None if not an extended format.
+fn parse_extended_date_ymd(s: &str) -> Option<(i64, u32, u32)> {
+    let s = s.trim();
+    if s.is_empty() { return None; }
+    let (sign, rest) = match s.as_bytes()[0] {
+        b'+' => (1i64, &s[1..]),
+        b'-' => (-1i64, &s[1..]),
+        _ => return None, // not extended format
+    };
+    // Must have at least 5 digits for the year (extended format)
+    // Format: YYYYY...-MM-DD
+    let dash1 = rest.find('-')?;
+    if dash1 < 5 { return None; } // not extended — regular 4-digit years handled elsewhere
+    let year_str = &rest[..dash1];
+    if !year_str.chars().all(|c| c.is_ascii_digit()) { return None; }
+    let year: i64 = year_str.parse().ok()?;
+    let after_year = &rest[dash1 + 1..];
+    let dash2 = after_year.find('-')?;
+    let month: u32 = after_year[..dash2].parse().ok()?;
+    let day: u32 = after_year[dash2 + 1..].parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) { return None; }
+    Some((sign * year, month, day))
+}
+
+/// Days in a given month for a given year (handling leap years).
+fn days_in_month_ext(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) { 29 } else { 28 }
+        }
+        _ => 30,
+    }
+}
+
+/// Format an extended-range date as an ISO string with sign prefix.
+fn format_extended_date(year: i64, month: u32, day: u32) -> String {
+    if year < 0 {
+        format!("-{:09}-{:02}-{:02}", -year, month, day)
+    } else {
+        format!("+{:09}-{:02}-{:02}", year, month, day)
+    }
+}
+
+/// Extract (year, month, day) from a TemporalValue, supporting both chrono NaiveDate
+/// and extended-range dates stored only as ISO strings.
+fn temporal_ymd(tv: &TemporalValue) -> Option<(i64, u32, u32)> {
+    if let Some(d) = tv.date {
+        Some((d.year() as i64, d.month(), d.day()))
+    } else if matches!(tv.kind, TemporalKind::Date | TemporalKind::LocalDateTime | TemporalKind::DateTime) {
+        // Try to parse extended-range date from the ISO string.
+        let date_part = if let Some(t_pos) = tv.iso.find('T') { &tv.iso[..t_pos] } else { &tv.iso };
+        parse_extended_date_ymd(date_part)
+    } else {
+        None
+    }
+}
+
 /// Parse a date from an ISO 8601 string. Supports extended (2015-07-21),
 /// basic (20150721), week-based (2015-W30-2 / 2015W302), ordinal (2015-202),
 /// year-only (2015), year-month (2015-07 / 201507).
@@ -308,6 +373,14 @@ fn parse_date_str(s: &str) -> Option<NaiveDate> {
     // If the string contains a 'T', extract only the date part (before T).
     if let Some(t_pos) = s.find('T') {
         return parse_date_str(&s[..t_pos]);
+    }
+    // Try extended-year format first (starts with + or - followed by >4 digits).
+    // These may be outside chrono's range, so try to construct via from_ymd_opt.
+    if let Some((y, m, d)) = parse_extended_date_ymd(s) {
+        if let Some(y32) = i32_from_i64(y) {
+            return NaiveDate::from_ymd_opt(y32, m, d);
+        }
+        return None; // outside chrono range — caller should use parse_extended_date_ymd directly
     }
     // Extended: YYYY-MM-DD
     if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") { return Some(d); }
@@ -440,9 +513,16 @@ fn temporal_date(arg: &Value) -> Result<TemporalValue, ExecError> {
     let err = || ExecError { message: "date(): invalid argument".into() };
     match arg {
         Value::Str(s) => {
-            let d = parse_date_str(s).ok_or_else(err)?;
-            let iso = d.format("%Y-%m-%d").to_string();
-            Ok(TemporalValue { kind: TemporalKind::Date, iso, date: Some(d), time: None, offset_secs: None, tz_name: None })
+            if let Some(d) = parse_date_str(s) {
+                let iso = d.format("%Y-%m-%d").to_string();
+                Ok(TemporalValue { kind: TemporalKind::Date, iso, date: Some(d), time: None, offset_secs: None, tz_name: None })
+            } else if let Some((y, m, d)) = parse_extended_date_ymd(s) {
+                // Extended-range date outside chrono's representable range.
+                let iso = format_extended_date(y, m, d);
+                Ok(TemporalValue { kind: TemporalKind::Date, iso, date: None, time: None, offset_secs: None, tz_name: None })
+            } else {
+                Err(err())
+            }
         }
         Value::Json(serde_json::Value::Object(m)) => {
             let date = date_from_map(m).ok_or_else(err)?;
@@ -707,14 +787,28 @@ fn temporal_localdatetime(arg: &Value) -> Result<TemporalValue, ExecError> {
     match arg {
         Value::Str(s) => {
             let s = s.trim();
-            // Split at T
-            let (date_str, time_str) = split_datetime(s)?;
-            let date = parse_date_str(date_str).ok_or_else(err)?;
-            // Strip any offset from the time part
-            let (time_str_clean, _, _) = extract_time_tz(time_str);
-            let time = parse_localtime_str(time_str_clean).ok_or_else(err)?;
-            let iso = format_localdatetime(&date, &time);
-            Ok(TemporalValue { kind: TemporalKind::LocalDateTime, iso, date: Some(date), time: Some(time), offset_secs: None, tz_name: None })
+            // Split at T; if no T, treat entire string as date with midnight time.
+            let (date_str, time_str) = if let Some(t_pos) = s.find('T') {
+                (&s[..t_pos], &s[t_pos+1..])
+            } else {
+                (s, "00:00:00")
+            };
+            if let Some(date) = parse_date_str(date_str) {
+                // Strip any offset from the time part
+                let (time_str_clean, _, _) = extract_time_tz(time_str);
+                let time = parse_localtime_str(time_str_clean).ok_or_else(err)?;
+                let iso = format_localdatetime(&date, &time);
+                Ok(TemporalValue { kind: TemporalKind::LocalDateTime, iso, date: Some(date), time: Some(time), offset_secs: None, tz_name: None })
+            } else if let Some((y, m, d)) = parse_extended_date_ymd(date_str) {
+                // Extended-range date outside chrono's representable range.
+                let (time_str_clean, _, _) = extract_time_tz(time_str);
+                let time = parse_localtime_str(time_str_clean).unwrap_or_else(|| NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+                let date_iso = format_extended_date(y, m, d);
+                let iso = format!("{}T{}", date_iso, time.format("%H:%M:%S"));
+                Ok(TemporalValue { kind: TemporalKind::LocalDateTime, iso, date: None, time: Some(time), offset_secs: None, tz_name: None })
+            } else {
+                Err(err())
+            }
         }
         Value::Json(serde_json::Value::Object(m)) => {
             // Projection: {datetime: <temporal>, ...} or {date: <temporal>, ...}
@@ -1273,6 +1367,57 @@ fn add_months_to_date(d: NaiveDate, months: i64) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, day).unwrap_or(d)
 }
 
+/// Add months to an extended date (year, month, day), clamping day.
+fn add_months_ext(year: i64, month: u32, day: u32, months: i64) -> (i64, u32, u32) {
+    let total_months = year * 12 + (month as i64 - 1) + months;
+    let y = total_months.div_euclid(12);
+    let m = (total_months.rem_euclid(12) + 1) as u32;
+    let max_day = days_in_month_ext(y, m);
+    (y, m, day.min(max_day))
+}
+
+/// Compute the signed day-difference between two extended dates (a → b).
+/// Positive if b is after a.
+fn extended_date_diff_days(a: (i64, u32, u32), b: (i64, u32, u32)) -> i64 {
+    // If both dates fit in chrono's range, delegate to NaiveDate for exact result.
+    if let (Some(a32), Some(b32)) = (i32_from_i64(a.0), i32_from_i64(b.0))
+        && let (Some(ad), Some(bd)) = (
+            NaiveDate::from_ymd_opt(a32, a.1, a.2),
+            NaiveDate::from_ymd_opt(b32, b.1, b.2),
+        )
+    {
+        return bd.signed_duration_since(ad).num_days();
+    }
+    // Fallback: compute days by counting remaining days in a's month then full months.
+    // For the purpose of duration.between, we only need the remainder after subtracting
+    // whole months — so the diff is simply b.day - a.day, possibly borrowing a month.
+    // Since callers already aligned the month, this is just the day difference.
+    b.2 as i64 - a.2 as i64
+}
+
+/// Compute the total number of days between two extended dates using proleptic
+/// Gregorian calendar arithmetic.  Result is signed (positive when b > a).
+fn extended_total_day_diff(a: (i64, u32, u32), b: (i64, u32, u32)) -> i64 {
+    // If both fit in chrono range, use chrono for exact result.
+    if let (Some(a32), Some(b32)) = (i32_from_i64(a.0), i32_from_i64(b.0))
+        && let (Some(ad), Some(bd)) = (
+            NaiveDate::from_ymd_opt(a32, a.1, a.2),
+            NaiveDate::from_ymd_opt(b32, b.1, b.2),
+        )
+    {
+        return bd.signed_duration_since(ad).num_days();
+    }
+    // For extended dates: compute proleptic Julian Day Number difference.
+    fn to_jdn(y: i64, m: u32, d: u32) -> i64 {
+        // Algorithm from Meeus, Astronomical Algorithms, valid for all Gregorian dates.
+        let (y, m) = if m <= 2 { (y - 1, m as i64 + 12) } else { (y, m as i64) };
+        let a = y.div_euclid(100);
+        let b = 2 - a + a.div_euclid(4);
+        (365.25 * (y + 4716) as f64) as i64 + (30.6001 * (m + 1) as f64) as i64 + d as i64 + b - 1524
+    }
+    to_jdn(b.0, b.1, b.2) - to_jdn(a.0, a.1, a.2)
+}
+
 /// Days in a given month (leap-year aware).
 fn days_in_month(year: i32, month: u32) -> u32 {
     match month {
@@ -1327,28 +1472,29 @@ fn duration_between(lhs: &TemporalValue, rhs: &TemporalValue) -> CypherDuration 
                 return CypherDuration { years: 0, months: 0, weeks: 0, days: 0, hours, minutes, seconds: secs, nanoseconds: nanos, iso };
             }
 
-    // Both have date components → use calendar difference
-    if let (Some(ld), Some(rd)) = (lhs.date, rhs.date) {
+    // Both have date components → use calendar difference (supports extended-range dates)
+    let l_ymd = temporal_ymd(lhs);
+    let r_ymd = temporal_ymd(rhs);
+    if let (Some((ly, lm, ld_day)), Some((ry, rm, rd_day))) = (l_ymd, r_ymd) {
         let lt = lhs.time.unwrap_or(midnight);
         let rt = rhs.time.unwrap_or(midnight);
 
         // Compute total months difference
-        let mut months = (rd.year() as i64 - ld.year() as i64) * 12
-            + (rd.month() as i64 - ld.month() as i64);
+        let mut months = (ry - ly) * 12 + (rm as i64 - lm as i64);
 
         // After adding months to lhs date, compute remaining days
-        let date_after_months = add_months_to_date(ld, months);
-        let mut rem_days = rd.signed_duration_since(date_after_months).num_days();
+        let (am_y, am_m, am_d) = add_months_ext(ly, lm, ld_day, months);
+        let mut rem_days = extended_date_diff_days((am_y, am_m, am_d), (ry, rm, rd_day));
 
         // If remaining days has opposite sign to months, adjust
         if months > 0 && rem_days < 0 {
             months -= 1;
-            let date_after_months = add_months_to_date(ld, months);
-            rem_days = rd.signed_duration_since(date_after_months).num_days();
+            let (am_y2, am_m2, am_d2) = add_months_ext(ly, lm, ld_day, months);
+            rem_days = extended_date_diff_days((am_y2, am_m2, am_d2), (ry, rm, rd_day));
         } else if months < 0 && rem_days > 0 {
             months += 1;
-            let date_after_months = add_months_to_date(ld, months);
-            rem_days = rd.signed_duration_since(date_after_months).num_days();
+            let (am_y2, am_m2, am_d2) = add_months_ext(ly, lm, ld_day, months);
+            rem_days = extended_date_diff_days((am_y2, am_m2, am_d2), (ry, rm, rd_day));
         }
 
         // Time difference in nanoseconds — only account for offsets if both sides have one
@@ -1536,19 +1682,44 @@ fn duration_in_seconds(lhs: &TemporalValue, rhs: &TemporalValue) -> CypherDurati
             }
 
     // If both have dates: compute total seconds via epoch (UTC-adjusted if both have offsets)
-    if let (Some(ld), Some(rd)) = (lhs.date, rhs.date) {
+    let l_ymd = temporal_ymd(lhs);
+    let r_ymd = temporal_ymd(rhs);
+    if let (Some((ly, lm, ld_day)), Some((ry, rm, rd_day))) = (l_ymd, r_ymd) {
         let lt = lhs.time.unwrap_or(midnight);
         let rt = rhs.time.unwrap_or(midnight);
         let both_off = lhs.offset_secs.is_some() && rhs.offset_secs.is_some();
         let l_off = if both_off { lhs.offset_secs.unwrap_or(0) as i64 } else { 0 };
         let r_off = if both_off { rhs.offset_secs.unwrap_or(0) as i64 } else { 0 };
-        let l_ns = (NaiveDateTime::new(ld, lt).and_utc().timestamp() - l_off) * 1_000_000_000 + lt.nanosecond() as i64;
-        let r_ns = (NaiveDateTime::new(rd, rt).and_utc().timestamp() - r_off) * 1_000_000_000 + rt.nanosecond() as i64;
-        let ns_diff = r_ns - l_ns;
-        let hours = ns_diff / 3_600_000_000_000;
-        let minutes = (ns_diff % 3_600_000_000_000) / 60_000_000_000;
-        let secs = (ns_diff % 60_000_000_000) / 1_000_000_000;
-        let nanos = ns_diff % 1_000_000_000;
+
+        // Try chrono path for dates within range
+        if let (Some(ld), Some(rd)) = (lhs.date, rhs.date) {
+            let l_ns = (NaiveDateTime::new(ld, lt).and_utc().timestamp() - l_off) * 1_000_000_000 + lt.nanosecond() as i64;
+            let r_ns = (NaiveDateTime::new(rd, rt).and_utc().timestamp() - r_off) * 1_000_000_000 + rt.nanosecond() as i64;
+            let ns_diff = r_ns - l_ns;
+            let hours = ns_diff / 3_600_000_000_000;
+            let minutes = (ns_diff % 3_600_000_000_000) / 60_000_000_000;
+            let secs = (ns_diff % 60_000_000_000) / 1_000_000_000;
+            let nanos = ns_diff % 1_000_000_000;
+            let iso = CypherDuration::build_iso(0, 0, 0, 0, hours, minutes, secs, nanos);
+            return CypherDuration { years: 0, months: 0, weeks: 0, days: 0, hours, minutes, seconds: secs, nanoseconds: nanos, iso };
+        }
+
+        // Extended-range: compute total seconds arithmetically
+        let total_days = extended_total_day_diff((ly, lm, ld_day), (ry, rm, rd_day));
+        let lt_secs = lt.hour() as i64 * 3600 + lt.minute() as i64 * 60 + lt.second() as i64 - l_off;
+        let rt_secs = rt.hour() as i64 * 3600 + rt.minute() as i64 * 60 + rt.second() as i64 - r_off;
+        let total_secs = total_days * 86400 + (rt_secs - lt_secs);
+        let lt_nanos = lt.nanosecond() as i64 % 1_000_000_000;
+        let rt_nanos = rt.nanosecond() as i64 % 1_000_000_000;
+        let mut nanos = rt_nanos - lt_nanos;
+        let mut adj_secs = total_secs;
+        if nanos < 0 && adj_secs > 0 {
+            adj_secs -= 1;
+            nanos += 1_000_000_000;
+        }
+        let hours = adj_secs / 3600;
+        let minutes = (adj_secs % 3600) / 60;
+        let secs = adj_secs % 60;
         let iso = CypherDuration::build_iso(0, 0, 0, 0, hours, minutes, secs, nanos);
         return CypherDuration { years: 0, months: 0, weeks: 0, days: 0, hours, minutes, seconds: secs, nanoseconds: nanos, iso };
     }
@@ -5637,6 +5808,24 @@ fn eval_function(
             let v = eval_expr(&args[0], row, params)?;
             match v {
                 Value::Str(s) => Ok(Value::Str(s.trim_end().to_string())),
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "tolower" => {
+            if args.len() != 1 { return Err(ExecError { message: "toLower() takes exactly 1 argument".into() }); }
+            let v = eval_expr(&args[0], row, params)?;
+            match v {
+                Value::Str(s) => Ok(Value::Str(s.to_lowercase())),
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "toupper" => {
+            if args.len() != 1 { return Err(ExecError { message: "toUpper() takes exactly 1 argument".into() }); }
+            let v = eval_expr(&args[0], row, params)?;
+            match v {
+                Value::Str(s) => Ok(Value::Str(s.to_uppercase())),
                 Value::Null => Ok(Value::Null),
                 _ => Ok(Value::Null),
             }

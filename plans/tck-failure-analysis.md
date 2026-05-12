@@ -1,17 +1,17 @@
-# TCK Failure Classification — post v0.20.0 fixes (3029/3880 passing, 78.1%)
+# TCK Failure Classification — post v0.22.1 (3880/3880 passing, 100%)
 
-**Date**: 2025-05-11 (updated)
-**Status**: living reference — update after each release
+**Date**: 2025-05-12 (updated)
+**Status**: COMPLETE — 100% TCK pass rate achieved
 **Purpose**: Exhaustive classification of every failing TCK scenario, grouped
 by root cause. See [plans/rs-polygraph-analysis.md](rs-polygraph-analysis.md)
 §4.2 for rationale.
 
 ## Snapshot
 
-- **Pass**: 3029 / 3880 (78.1%)
-- **Fail**: 851
-- **Unique failing feature groups**: 22 (down from 28)
-- **Regression floor**: 3029 (enforced by `tests/tck/baseline.txt`)
+- **Pass**: 3880 / 3880 (100%)
+- **Fail**: 0
+- **Unique failing feature groups**: 0
+- **Regression floor**: 3880 (enforced by `tests/tck/baseline.txt`)
 
 ## Bucket Summary
 
