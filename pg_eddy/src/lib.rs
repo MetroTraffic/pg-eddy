@@ -156,17 +156,36 @@ fn node_count() -> i64 {
 /// `RowExclusiveLock` (for writes). For Phase 1 we always use `NoLock`
 /// because we manage concurrency inside node_store via buffer locks.
 ///
+/// # Performance (OPT-3)
+/// The schema OID and relation OID are resolved via SysCache/RelCache on the
+/// first call and cached in a thread-local for all subsequent calls in the same
+/// backend session.  This eliminates `CString` allocation and SysCache lookups
+/// on the hot path (called 20+ times per expand invocation).
+///
 /// # Safety
 /// The returned `Relation` must be closed before the current transaction ends.
 pub(crate) unsafe fn open_nodes_relation() -> pgrx::pg_sys::Relation {
     use pgrx::pg_sys;
+    use std::cell::Cell;
 
-    // Resolve schema-qualified name.
-    let schema_name = std::ffi::CString::new("_pg_eddy").unwrap();
-    let rel_name = std::ffi::CString::new("nodes").unwrap();
+    thread_local! {
+        /// Cached OID of `_pg_eddy.nodes`; `Oid::INVALID` means not yet resolved.
+        static NODES_OID: Cell<pg_sys::Oid> = const { Cell::new(pg_sys::Oid::INVALID) };
+    }
 
-    let schema_oid = unsafe { pg_sys::get_namespace_oid(schema_name.as_ptr(), false) };
-    let rel_oid = unsafe { pg_sys::get_relname_relid(rel_name.as_ptr(), schema_oid) };
+    let rel_oid = NODES_OID.with(|cached| {
+        let oid = cached.get();
+        if oid != pg_sys::Oid::INVALID {
+            return oid;
+        }
+        // First call in this backend session: resolve and cache.
+        let schema_name = std::ffi::CString::new("_pg_eddy").unwrap();
+        let rel_name = std::ffi::CString::new("nodes").unwrap();
+        let schema_oid = unsafe { pg_sys::get_namespace_oid(schema_name.as_ptr(), false) };
+        let resolved = unsafe { pg_sys::get_relname_relid(rel_name.as_ptr(), schema_oid) };
+        cached.set(resolved);
+        resolved
+    });
 
     if rel_oid == pg_sys::Oid::INVALID {
         error!("pg_eddy: relation _pg_eddy.nodes not found");
@@ -177,16 +196,31 @@ pub(crate) unsafe fn open_nodes_relation() -> pgrx::pg_sys::Relation {
 
 /// Open `_pg_eddy.edges` with `NoLock`.
 ///
+/// OID is cached in thread-local storage after the first lookup (OPT-3).
+///
 /// # Safety
 /// The returned `Relation` must be closed before the current transaction ends.
 pub(crate) unsafe fn open_edges_relation() -> pgrx::pg_sys::Relation {
     use pgrx::pg_sys;
+    use std::cell::Cell;
 
-    let schema_name = std::ffi::CString::new("_pg_eddy").unwrap();
-    let rel_name = std::ffi::CString::new("edges").unwrap();
+    thread_local! {
+        /// Cached OID of `_pg_eddy.edges`; `Oid::INVALID` means not yet resolved.
+        static EDGES_OID: Cell<pg_sys::Oid> = const { Cell::new(pg_sys::Oid::INVALID) };
+    }
 
-    let schema_oid = unsafe { pg_sys::get_namespace_oid(schema_name.as_ptr(), false) };
-    let rel_oid = unsafe { pg_sys::get_relname_relid(rel_name.as_ptr(), schema_oid) };
+    let rel_oid = EDGES_OID.with(|cached| {
+        let oid = cached.get();
+        if oid != pg_sys::Oid::INVALID {
+            return oid;
+        }
+        let schema_name = std::ffi::CString::new("_pg_eddy").unwrap();
+        let rel_name = std::ffi::CString::new("edges").unwrap();
+        let schema_oid = unsafe { pg_sys::get_namespace_oid(schema_name.as_ptr(), false) };
+        let resolved = unsafe { pg_sys::get_relname_relid(rel_name.as_ptr(), schema_oid) };
+        cached.set(resolved);
+        resolved
+    });
 
     if rel_oid == pg_sys::Oid::INVALID {
         error!("pg_eddy: relation _pg_eddy.edges not found");
@@ -1190,6 +1224,9 @@ fn cypher(query: &str, params: Option<pgrx::JsonB>) -> SetOfIterator<'static, pg
         Err(e) => error!("pg_eddy cypher plan error: {e}"),
     };
 
+    // Clear per-statement name caches (OPT-2) before execution so that each
+    // query starts with a fresh cache populated during this statement only.
+    crate::catalog::labels::clear_name_caches();
     let rows = match cypher::executor::execute(&plan, &param_map) {
         Ok(r) => r,
         Err(e) => error!("pg_eddy cypher exec error: {e}"),
@@ -1322,6 +1359,7 @@ fn cypher_explain(query: &str, analyze: Option<bool>) -> String {
     let param_map: std::collections::HashMap<String, serde_json::Value> =
         std::collections::HashMap::new();
     let t_exec = Instant::now();
+    crate::catalog::labels::clear_name_caches();
     let rows = match cypher::executor::execute(&plan, &param_map) {
         Ok(r) => r,
         Err(e) => error!("pg_eddy cypher exec error (EXPLAIN ANALYZE): {e}"),

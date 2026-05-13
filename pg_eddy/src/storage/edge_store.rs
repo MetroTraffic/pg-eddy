@@ -607,6 +607,15 @@ pub unsafe fn adjacency_follow(
 
 /// Walk one adjacency chain and collect visible edge records.
 ///
+/// # Same-page coalescing (OPT-6)
+///
+/// We hold the buffer lock while the next pointer stays on the same page,
+/// only releasing when the chain crosses to a different page or ends.  This
+/// reduces `ReadBufferExtended` + `LockBuffer` + `UnlockReleaseBuffer` triplets
+/// from one-per-edge to one-per-page-transition — a significant win when edges
+/// from a high-degree node cluster on a small number of pages (the common case
+/// after sequential inserts).
+///
 /// We always read each slot (even invisible ones or LP_DEAD) to extract the
 /// next pointer; only visible LP_NORMAL edges are appended to `out`.
 unsafe fn follow_chain(
@@ -620,71 +629,87 @@ unsafe fn follow_chain(
     let hdr_size = size_of::<pg_sys::HeapTupleHeaderData>();
 
     while head_sl != 0 {
-        // head_sl != 0 means there is an edge here.
+        // Pin and lock the current page.
+        let current_pg = head_pg;
         let buf = pg_sys::ReadBufferExtended(
             edge_rel,
             pg_sys::ForkNumber::MAIN_FORKNUM,
-            head_pg,
+            current_pg,
             pg_sys::ReadBufferMode::RBM_NORMAL,
             std::ptr::null_mut(),
         );
         pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
         let page = pg_sys::BufferGetPage(buf);
 
-        // Safety: head_sl is 1-based (valid item offset).
-        let off = head_sl;
-        let iid = pg_sys::PageGetItemId(page, off);
-        let flags = (*iid).lp_flags();
-        let item_len = (*iid).lp_len() as usize;
+        // Inner loop: process all consecutive chain slots on this page without
+        // releasing the buffer lock.  Break out (to release) when the chain
+        // either ends or jumps to a different page.
+        loop {
+            if head_sl == 0 {
+                break; // chain ended; release below
+            }
 
-        // LP_DEAD: VACUUM has marked this slot dead but kept data for chain following.
-        // We skip it (don't yield) but still follow the next pointer.
-        let is_lp_dead = flags == pg_sys::LP_DEAD;
-        let is_lp_normal = flags == pg_sys::LP_NORMAL;
+            let off = head_sl;
+            let iid = pg_sys::PageGetItemId(page, off);
+            let flags = (*iid).lp_flags();
+            let item_len = (*iid).lp_len() as usize;
 
-        if !is_lp_normal && !is_lp_dead {
-            // LP_UNUSED or other invalid — stop traversal (broken chain).
-            pg_sys::UnlockReleaseBuffer(buf);
-            break;
-        }
-        if item_len < hdr_size + EDGE_FIXED_DATA_SIZE {
-            pg_sys::UnlockReleaseBuffer(buf);
-            break;
-        }
+            // LP_DEAD: VACUUM has marked this slot dead but kept data for chain following.
+            // We skip it (don't yield) but still follow the next pointer.
+            let is_lp_dead = flags == pg_sys::LP_DEAD;
+            let is_lp_normal = flags == pg_sys::LP_NORMAL;
 
-        let item = pg_sys::PageGetItem(page as *const _, iid) as *const u8;
-        let raw = std::slice::from_raw_parts(item, item_len);
-        let data = &raw[hdr_size..];
+            if !is_lp_normal && !is_lp_dead {
+                // LP_UNUSED or other invalid — stop traversal (broken chain).
+                head_sl = 0; // signal outer loop to exit
+                break;
+            }
+            if item_len < hdr_size + EDGE_FIXED_DATA_SIZE {
+                head_sl = 0;
+                break;
+            }
 
-        // Read next pointer BEFORE releasing the lock.
-        let (next_pg, next_sl) = if is_out_chain {
-            let pg = u32::from_le_bytes(data[OFF_EDGE_NEXT_OUT_PAGE..OFF_EDGE_NEXT_OUT_PAGE + 4].try_into().unwrap());
-            let sl = u16::from_le_bytes(data[OFF_EDGE_NEXT_OUT_SLOT..OFF_EDGE_NEXT_OUT_SLOT + 2].try_into().unwrap());
-            (pg, sl)
-        } else {
-            let pg = u32::from_le_bytes(data[OFF_EDGE_NEXT_IN_PAGE..OFF_EDGE_NEXT_IN_PAGE + 4].try_into().unwrap());
-            let sl = u16::from_le_bytes(data[OFF_EDGE_NEXT_IN_SLOT..OFF_EDGE_NEXT_IN_SLOT + 2].try_into().unwrap());
-            (pg, sl)
-        };
+            let item = pg_sys::PageGetItem(page as *const _, iid) as *const u8;
+            let raw = std::slice::from_raw_parts(item, item_len);
+            let data = &raw[hdr_size..];
 
-        // Check visibility: skip logically-deleted edges.
-        let hdr = item as *const pg_sys::HeapTupleHeaderData;
-        let xmax_invalid = ((*hdr).t_infomask & pg_sys::HEAP_XMAX_INVALID as u16) != 0;
-        if xmax_invalid && is_lp_normal {
-            // Edge is alive — decode and maybe yield it.
-            if let Some(rec) = decode_edge_record(data, item_len - hdr_size, head_pg, off) {
-                let passes_filter = rel_type_filter.is_none_or(|t| t == rec.rel_type_id);
-                if passes_filter {
-                    out.push(rec);
+            // Read next pointer BEFORE potentially yielding the record.
+            let (next_pg, next_sl) = if is_out_chain {
+                let pg = u32::from_le_bytes(data[OFF_EDGE_NEXT_OUT_PAGE..OFF_EDGE_NEXT_OUT_PAGE + 4].try_into().unwrap());
+                let sl = u16::from_le_bytes(data[OFF_EDGE_NEXT_OUT_SLOT..OFF_EDGE_NEXT_OUT_SLOT + 2].try_into().unwrap());
+                (pg, sl)
+            } else {
+                let pg = u32::from_le_bytes(data[OFF_EDGE_NEXT_IN_PAGE..OFF_EDGE_NEXT_IN_PAGE + 4].try_into().unwrap());
+                let sl = u16::from_le_bytes(data[OFF_EDGE_NEXT_IN_SLOT..OFF_EDGE_NEXT_IN_SLOT + 2].try_into().unwrap());
+                (pg, sl)
+            };
+
+            // Check visibility: skip logically-deleted edges.
+            let hdr = item as *const pg_sys::HeapTupleHeaderData;
+            let xmax_invalid = ((*hdr).t_infomask & pg_sys::HEAP_XMAX_INVALID as u16) != 0;
+            if xmax_invalid && is_lp_normal {
+                // Edge is alive — decode and maybe yield it.
+                if let Some(rec) = decode_edge_record(data, item_len - hdr_size, current_pg, off) {
+                    let passes_filter = rel_type_filter.is_none_or(|t| t == rec.rel_type_id);
+                    if passes_filter {
+                        out.push(rec);
+                    }
                 }
             }
+            // If xmax is set (edge deleted) or LP_DEAD, we still follow the chain pointer.
+
+            head_pg = next_pg;
+            head_sl = next_sl;
+
+            // If the next slot is on a different page (or chain ended), release
+            // the buffer and let the outer loop re-pin the new page.
+            if head_sl == 0 || head_pg != current_pg {
+                break;
+            }
+            // Same page: continue the inner loop without releasing the lock.
         }
-        // If xmax is set (edge deleted) or LP_DEAD, we still follow the chain pointer.
 
         pg_sys::UnlockReleaseBuffer(buf);
-
-        head_pg = next_pg;
-        head_sl = next_sl;
     }
 }
 

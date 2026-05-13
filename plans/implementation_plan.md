@@ -2109,7 +2109,27 @@ of AGE (property index used); TCK ~96%.
 
 ---
 
-**v0.24.0 — Query Optimisation**:
+**v0.24.0 — Executor Quick-Win Optimisations** (OPT-2, OPT-3, OPT-6 from `plans/optimization_plan.md`):
+
+- [x] Per-transaction catalog name cache (OPT-2): thread-local `HashMap<i32, String>` for
+      label, property-key, and rel-type name lookups; cleared at every `cypher()` entry point.
+      Eliminates SPI round-trips for repeated id→name resolution during traversal.
+- [x] Query-scoped relation handle reuse (OPT-3): `ExecContext` struct holds pre-opened
+      `node_rel` / `edge_rel` / `snapshot` for the lifetime of one `execute()` call;
+      passed through the entire executor tree so `open_nodes_relation()` /
+      `open_edges_relation()` are each called only once per top-level query.
+- [x] Same-page edge-chain coalescing (OPT-6): `follow_chain` holds the buffer lock while
+      the next pointer stays on the same page, releasing only on page boundary crossings.
+      Reduces buffer pin/unpin overhead for high-degree nodes whose edges cluster on a few pages.
+
+**Target**: 5–15× improvement on multi-hop MATCH on property-rich graphs with no TCK regressions.
+
+**Exit criteria**: all 3880 TCK scenarios still pass; `benchmarks/run_ldbc_benchmark.pl`
+IS-3 ratio improves vs. v0.23.x baseline; no clippy warnings.
+
+---
+
+**v0.25.0 — Query Optimisation** (formerly v0.24.0):
 
 - [ ] Cost model for AM scan operators: estimated row counts from
       `_pg_eddy.label_index` for label selectivity; shown in `cypher_explain`
@@ -2136,7 +2156,7 @@ no regressions on LDBC IS-1/IS-3.
 
 ---
 
-**v0.25.0 — Production Readiness**:
+**v0.26.0 — Production Readiness** (formerly v0.25.0):
 
 - [ ] LDBC SNB IS-1 through IS-7 and IC-1 through IC-14 benchmarked in full
       (extending the v0.12.x IS-1/IS-3 baseline to the complete suite);

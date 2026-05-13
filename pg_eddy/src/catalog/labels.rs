@@ -1,8 +1,39 @@
 /// Label and property-key registry SPI helpers.
 ///
 /// All functions require an active transaction with SPI available.
+///
+/// # Per-statement name cache (OPT-2)
+///
+/// `label_name`, `prop_key_name`, and `rel_type_name` are called on every
+/// node/edge decoded during traversal.  Each call previously issued a full
+/// SPI round-trip.  We now maintain thread-local `HashMap<i32, String>` caches
+/// that are populated on the first lookup for each id and reused for the rest
+/// of the statement.  `clear_name_caches()` must be called at the start of
+/// every `cypher()` / `cypher_explain()` invocation to prevent stale entries
+/// after concurrent catalog DDL.
 use pgrx::prelude::*;
 use pgrx::datum::DatumWithOid;
+use std::cell::RefCell;
+
+thread_local! {
+    static LABEL_NAME_CACHE: RefCell<std::collections::HashMap<i32, String>> =
+        RefCell::new(std::collections::HashMap::new());
+    static PROP_KEY_NAME_CACHE: RefCell<std::collections::HashMap<i32, String>> =
+        RefCell::new(std::collections::HashMap::new());
+    static REL_TYPE_NAME_CACHE: RefCell<std::collections::HashMap<i32, String>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Clear all per-statement id→name caches.
+///
+/// Must be called at the start of every `cypher()` entry point so that any
+/// catalog changes made in the same session (e.g. adding a new label via
+/// `create_node`) are visible in the next query.
+pub fn clear_name_caches() {
+    LABEL_NAME_CACHE.with(|c| c.borrow_mut().clear());
+    PROP_KEY_NAME_CACHE.with(|c| c.borrow_mut().clear());
+    REL_TYPE_NAME_CACHE.with(|c| c.borrow_mut().clear());
+}
 
 /// Look up or insert a label by name, returning its `label_id`.
 ///
@@ -19,13 +50,24 @@ pub fn ensure_label(name: &str) -> i32 {
 }
 
 /// Return the name of a label by its id, or `"?"` if not found.
+///
+/// Results are cached in a per-statement thread-local map; the first call for
+/// a given `id` issues the SPI query and subsequent calls return the cached
+/// result without touching the database.
 pub fn label_name(id: i32) -> String {
-    Spi::get_one_with_args::<String>(
-        "SELECT name FROM _pg_eddy.label_registry WHERE label_id = $1",
-        &[DatumWithOid::from(id)],
-    )
-    .unwrap_or(None)
-    .unwrap_or_else(|| format!("?{id}"))
+    LABEL_NAME_CACHE.with(|cache| {
+        if let Some(name) = cache.borrow().get(&id) {
+            return name.clone();
+        }
+        let name = Spi::get_one_with_args::<String>(
+            "SELECT name FROM _pg_eddy.label_registry WHERE label_id = $1",
+            &[DatumWithOid::from(id)],
+        )
+        .unwrap_or(None)
+        .unwrap_or_else(|| format!("?{id}"));
+        cache.borrow_mut().insert(id, name.clone());
+        name
+    })
 }
 
 /// Look up or insert a property key by name, returning its `key_id`.
@@ -41,13 +83,22 @@ pub fn ensure_prop_key(name: &str) -> i32 {
 }
 
 /// Return the name of a property key by its id, or `"?"` if not found.
+///
+/// Cached in the per-statement thread-local map (see `clear_name_caches`).
 pub fn prop_key_name(id: i32) -> String {
-    Spi::get_one_with_args::<String>(
-        "SELECT name FROM _pg_eddy.property_key_registry WHERE key_id = $1",
-        &[DatumWithOid::from(id)],
-    )
-    .unwrap_or(None)
-    .unwrap_or_else(|| format!("?{id}"))
+    PROP_KEY_NAME_CACHE.with(|cache| {
+        if let Some(name) = cache.borrow().get(&id) {
+            return name.clone();
+        }
+        let name = Spi::get_one_with_args::<String>(
+            "SELECT name FROM _pg_eddy.property_key_registry WHERE key_id = $1",
+            &[DatumWithOid::from(id)],
+        )
+        .unwrap_or(None)
+        .unwrap_or_else(|| format!("?{id}"));
+        cache.borrow_mut().insert(id, name.clone());
+        name
+    })
 }
 
 /// Allocate the next node id from `_pg_eddy.node_id_seq`.
@@ -70,13 +121,22 @@ pub fn ensure_rel_type(name: &str) -> i32 {
 }
 
 /// Return the name of a relationship type by its id, or `"?"` if not found.
+///
+/// Cached in the per-statement thread-local map (see `clear_name_caches`).
 pub fn rel_type_name(id: i32) -> String {
-    Spi::get_one_with_args::<String>(
-        "SELECT name FROM _pg_eddy.rel_type_registry WHERE type_id = $1",
-        &[DatumWithOid::from(id)],
-    )
-    .unwrap_or(None)
-    .unwrap_or_else(|| format!("?{id}"))
+    REL_TYPE_NAME_CACHE.with(|cache| {
+        if let Some(name) = cache.borrow().get(&id) {
+            return name.clone();
+        }
+        let name = Spi::get_one_with_args::<String>(
+            "SELECT name FROM _pg_eddy.rel_type_registry WHERE type_id = $1",
+            &[DatumWithOid::from(id)],
+        )
+        .unwrap_or(None)
+        .unwrap_or_else(|| format!("?{id}"));
+        cache.borrow_mut().insert(id, name.clone());
+        name
+    })
 }
 
 /// Allocate the next edge id from `_pg_eddy.edge_id_seq`.
