@@ -2989,6 +2989,18 @@ fn exec_expand(
         return Ok(Vec::new());
     }
 
+    // Open relations once for the entire expand (OPT-3B).
+    // With OPT-3 the OID is cached; but table_open itself is still called
+    // once-per-edge otherwise.  Opening once per exec_expand invocation and
+    // passing through reduces table_open/table_close from O(N_edges) to O(1).
+    let (expand_node_rel, expand_edge_rel, expand_snapshot) = unsafe {
+        (
+            crate::open_nodes_relation(),
+            crate::open_edges_relation(),
+            pgrx::pg_sys::GetActiveSnapshot(),
+        )
+    };
+
     for input_row in &input_rows {
         // Look up the source variable in the row, or fall back to params (for correlated subqueries
         // where outer row bindings are passed through params by exec_pattern_inline).
@@ -3016,17 +3028,11 @@ fn exec_expand(
             None => continue, // non-node value: skip this row (0 matches, like null)
         };
 
-        // Follow adjacency chains.
+        // Follow adjacency chains (using relations opened once per exec_expand).
         let edges = unsafe {
-            let node_rel = crate::open_nodes_relation();
-            let edge_rel = crate::open_edges_relation();
-            let snapshot = pgrx::pg_sys::GetActiveSnapshot();
-            let result = adjacency_follow(
-                node_rel, edge_rel, src_node_id, dir, type_filter, snapshot,
-            );
-            pgrx::pg_sys::table_close(edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
-            pgrx::pg_sys::table_close(node_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
-            result
+            adjacency_follow(
+                expand_node_rel, expand_edge_rel, src_node_id, dir, type_filter, expand_snapshot,
+            )
         };
 
         // Multi-type filter (when more than 1 type specified).
@@ -3056,13 +3062,9 @@ fn exec_expand(
                 }
             };
 
-            // Load the destination node.
+            // Load the destination node (using the relation opened once per exec_expand).
             let dst_record = unsafe {
-                let rel = crate::open_nodes_relation();
-                let snapshot = pgrx::pg_sys::GetActiveSnapshot();
-                let r = crate::storage::node_store::find_node_by_id(rel, other_id, snapshot);
-                pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
-                r
+                crate::storage::node_store::find_node_by_id(expand_node_rel, other_id, expand_snapshot)
             };
 
             let dst_record = match dst_record {
@@ -3070,23 +3072,22 @@ fn exec_expand(
                 None => continue, // invisible or deleted
             };
 
-            // Resolve overflow.
+            // Label filter on destination BEFORE overflow resolution:
+            // skip the I/O cost of reading overflow pages for nodes that don't
+            // match the required label set.
             let mut dst_r = dst_record;
-            if dst_r.overflow_blkno != 0 && dst_r.prop_bytes.is_empty() {
-                dst_r.prop_bytes = unsafe {
-                    let rel = crate::open_nodes_relation();
-                    let bytes = crate::storage::node_store::read_overflow_block(rel, dst_r.overflow_blkno);
-                    pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
-                    bytes
-                };
-            }
-
-            // Label filter on destination.
             if !dst_label_ids.is_empty() {
                 let has_all = dst_label_ids.iter().all(|lid| dst_r.label_ids.contains(lid));
                 if !has_all {
                     continue;
                 }
+            }
+
+            // Resolve overflow props only now (after label filter passes).
+            if dst_r.overflow_blkno != 0 && dst_r.prop_bytes.is_empty() {
+                dst_r.prop_bytes = unsafe {
+                    crate::storage::node_store::read_overflow_block(expand_node_rel, dst_r.overflow_blkno)
+                };
             }
 
             let dst_labels_resolved: Vec<String> = dst_r.label_ids.iter().map(|id| label_name(*id)).collect();
@@ -3205,6 +3206,12 @@ fn exec_expand(
         null_row.insert(dst_var.to_string(), Value::Null);
         if let Some(rv) = rel_var { null_row.insert(rv.to_string(), Value::Null); }
         result.push(null_row);
+    }
+
+    // Close the relations opened once per exec_expand (OPT-3B).
+    unsafe {
+        pgrx::pg_sys::table_close(expand_edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+        pgrx::pg_sys::table_close(expand_node_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
     }
 
     Ok(result)
@@ -7252,6 +7259,7 @@ struct CatalogWriteBuffer {
     label_index:   Vec<(i32, i64)>,        // (label_id, node_id)
     edge_type_src: Vec<(i32, i64, i64)>,   // (type_id, src_node_id, edge_id)
     edge_type_dst: Vec<(i32, i64, i64)>,   // (type_id, dst_node_id, edge_id)
+    node_location: Vec<(i64, u32, u16)>,   // (node_id, page_num, offset_num)
 }
 
 impl CatalogWriteBuffer {
@@ -7285,6 +7293,24 @@ impl CatalogWriteBuffer {
                 "INSERT INTO _pg_eddy.edge_type_dst(type_id, dst_node_id, edge_id) VALUES {}",
                 vals
             )).unwrap_or_else(|e| pgrx::error!("pg_eddy: edge_type_dst bulk insert: {e}"));
+        }
+        // Bulk-insert node locations and mirror into in-process cache (OPT-1).
+        if !self.node_location.is_empty() {
+            let vals: String = self.node_location.iter()
+                .map(|(n, pg, off)| format!("({},{},{})", n, pg, off))
+                .collect::<Vec<_>>()
+                .join(",");
+            pgrx::Spi::run(&format!(
+                "INSERT INTO _pg_eddy.node_location(node_id, page_num, offset_num) VALUES {} \
+                 ON CONFLICT (node_id) DO UPDATE \
+                   SET page_num = EXCLUDED.page_num, offset_num = EXCLUDED.offset_num",
+                vals
+            )).unwrap_or_else(|e| pgrx::error!("pg_eddy: node_location bulk insert: {e}"));
+            // Mirror into in-process cache so newly-created nodes are findable
+            // within the same statement without a cache reload.
+            for (n, pg, off) in self.node_location {
+                crate::catalog::locations::cache_node_location(n, pg, off);
+            }
         }
     }
 }
@@ -7398,15 +7424,17 @@ fn create_pattern_in_row(
                 }).unwrap_or_default();
 
                 let node_id = next_node_id();
-                unsafe {
+                let (nloc_pg, nloc_off) = unsafe {
                     let rel = crate::open_nodes_relation();
-                    node_store::insert_node(rel, node_id, &label_ids, &prop_bytes);
+                    let loc = node_store::insert_node(rel, node_id, &label_ids, &prop_bytes);
                     pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
-                }
-                // Batch label_index writes.
+                    loc
+                };
+                // Batch label_index + node_location writes.
                 for lid in &label_ids {
                     buf.label_index.push((*lid, node_id));
                 }
+                buf.node_location.push((node_id, nloc_pg, nloc_off));
                 // Maintain property value index for this new node.
                 crate::catalog::indexes::index_node_insert(node_id, &label_ids, &prop_map);
                 // Enforce UNIQUE constraints before committing the new node.
@@ -7465,14 +7493,16 @@ fn create_pattern_in_row(
                                     Ok(ensure_prop_key(name))
                                 }).unwrap_or_default();
                                 let nid = next_node_id();
-                                unsafe {
+                                let (nloc_pg, nloc_off) = unsafe {
                                     let rel = crate::open_nodes_relation();
-                                    node_store::insert_node(rel, nid, &label_ids, &prop_bytes);
+                                    let loc = node_store::insert_node(rel, nid, &label_ids, &prop_bytes);
                                     pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
-                                }
+                                    loc
+                                };
                                 for lid in &label_ids {
                                     buf.label_index.push((*lid, nid));
                                 }
+                                buf.node_location.push((nid, nloc_pg, nloc_off));
                                 let node_val = Value::Node { node_id: nid, labels, properties: prop_map };
                                 if let Some(v) = var {
                                     row.insert(v.to_string(), node_val);
@@ -7495,14 +7525,16 @@ fn create_pattern_in_row(
                                 Ok(ensure_prop_key(name))
                             }).unwrap_or_default();
                             let nid = next_node_id();
-                            unsafe {
+                            let (nloc_pg, nloc_off) = unsafe {
                                 let rel = crate::open_nodes_relation();
-                                node_store::insert_node(rel, nid, &label_ids, &prop_bytes);
+                                let loc = node_store::insert_node(rel, nid, &label_ids, &prop_bytes);
                                 pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
-                            }
+                                loc
+                            };
                             for lid in &label_ids {
                                 buf.label_index.push((*lid, nid));
                             }
+                            buf.node_location.push((nid, nloc_pg, nloc_off));
                             // Mark next node element as pre-created so it doesn't create again.
                             last_node_id = Some(nid);
                             node_was_precreated = true;

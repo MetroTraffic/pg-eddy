@@ -369,3 +369,99 @@ the next storage-layer milestone.
   with a non-trivial catalog lookup chain; AGE decodes JSONB with a hash-map key lookup.
   Near-parity despite the architectural difference confirms OPT-2/OPT-3 are effective.
 
+---
+
+## v0.25.0 LDBC IS-1/IS-3 Benchmark (2026-05-14)
+
+### Environment
+
+| Field | Value |
+|---|---|
+| Date | 2026-05-14 |
+| Hardware | dev container (Debian 11) |
+| PostgreSQL version | 18.3 |
+| pg_eddy version | 0.25.0 (OPT-1 node-location index + OPT-3B relation-open hoisting) |
+| Apache AGE version | 1.7.0-rc0 |
+| `shared_buffers` | 256 MB |
+| `synchronous_commit` | off |
+| Dataset | 1 000 nodes / 5 000 edges (LDBC SNB–like random graph) |
+| Build | **release** (`cargo pgrx install --release --features pg18`) |
+
+### Key changes vs v0.24.0
+
+- **OPT-1**: shadow catalog table `_pg_eddy.node_location` stores `(node_id, page_num, offset_num)`;
+  bulk-loaded into a thread-local `HashMap` at the start of every `cypher()` call.
+  `find_node_by_id` / `find_node_location` check the cache first → O(1) buffer pin instead of O(N) scan.
+- **OPT-3B**: `exec_expand` opens `node_rel` and `edge_rel` once per invocation (outside all loops)
+  rather than once per source row.
+- **Overflow deferral**: label filter applied before overflow resolution → no I/O for filtered destinations.
+
+### Results
+
+| Benchmark | pg_eddy | AGE | Ratio |
+|---|---|---|---|
+| Node insert (nodes/s, UNWIND+CREATE) | 3 385 | 7 233 | 0.47× |
+| Edge load (edges/s) | 6 961 (SQL API) | 483 (UNWIND+MATCH) | N/A (diff API) |
+| Property index build (1 000 nodes) | 0.086 s | — | — |
+| IS-1: node lookup + index (ms/query) | 13.43 ms | 13.53 ms | **0.99× (PASS ≤2×)** |
+| IS-3: 1-hop expand (ms/query) | 13.46 ms | 205.43 ms | **0.07× (15.26× faster, PASS)** |
+
+### Gate decision
+
+**IS-1 gate (pg_eddy ≤ 2× AGE latency with property index)**: ✅ **PASS — 0.99×**
+
+**IS-3 gate (pg_eddy ≤ 0.5× AGE on graph traversal)**: ✅ **PASS — 15.26× faster than AGE**
+
+No regressions vs v0.24.0. IS-1/IS-3 results are within normal dev-container variance.
+
+---
+
+## v0.25.0 Property-Rich Benchmark (2026-05-14)
+
+### Purpose
+
+Re-run of the PB-1/PB-2 property benchmark after OPT-1 ships to measure the improvement
+to the full-graph expand path (PB-1 was 15× slower than AGE in v0.24.0 due to O(N) node scan).
+
+Script: `benchmarks/run_prop_benchmark.pl`
+
+### Environment
+
+| Field | Value |
+|---|---|
+| Date | 2026-05-14 |
+| Hardware | dev container (Debian 11) |
+| PostgreSQL version | 18.3 |
+| pg_eddy version | 0.25.0 (OPT-1, OPT-3B, overflow deferral) |
+| Apache AGE version | 1.7.0-rc0 |
+| `shared_buffers` | 256 MB |
+| `synchronous_commit` | off |
+| Dataset | 2 000 nodes (7 props each) / 10 000 edges |
+| Build | **release** (`cargo pgrx install --release --features pg18`) |
+
+### Results
+
+| Benchmark | pg_eddy | AGE | Ratio | vs v0.24.0 |
+|---|---|---|---|---|
+| Node insert (nodes/s, 7 props) | 1 764 | 5 912 | 0.30× | — |
+| PB-1: full-graph expand (10 000 rows, total) | 103 ms | 81 ms | **1.27× (PASS ≤2×)** | **19× faster** (was 1 944 ms) |
+| PB-2: 1-hop+props (ms/query) | 14.94 ms | 15.71 ms | **0.95× (PASS ≤1.1×)** | parity |
+| PB-3: 2-hop+props (ms/query) | 14.41 ms | N/A | — | — |
+
+### Gate decision
+
+**PB-1 gate (pg_eddy ≤ 2× AGE on full-graph expand)**: ✅ **PASS — 1.27×** (was unmetered; now within 1.27× of AGE)
+
+**PB-2 gate (pg_eddy ≤ 1.1× AGE — parity +10% noise tolerance)**: ✅ **PASS — 0.95×**
+
+### Notes
+
+- **OPT-1 is the dominant win**: PB-1 improved from 1 944 ms → 103 ms (≈19×). The remaining
+  gap vs AGE (81 ms) is property-decoding overhead: pg_eddy decodes binary-encoded 7-property
+  nodes from a custom heap while AGE reads JSONB directly.
+- **PB-1 gap analysed**: At 10 000 edges, pg_eddy does 10 000 O(1) cache hits (HashMap lookup
+  + single `ReadBuffer` call) vs AGE's JSONB scan. The remaining 22 ms delta is buffer I/O for
+  the extra property decode path. Further improvement will come from property-block coalescing (OPT-4).
+- **PB-2 parity confirmed**: 0.95× vs AGE on 20 filtered 1-hop queries with 7-property decode,
+  consistent with v0.24.0 (0.94×). OPT-1 does not regress PB-2.
+

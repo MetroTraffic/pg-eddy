@@ -90,9 +90,9 @@ perl benchmarks/run_ldbc_benchmark.pl
 - IS-1 (node lookup with property index): pg_eddy **≤ 2× AGE latency**
 - IS-3 (1-hop expand): pg_eddy **≥ 2× faster than AGE**
 
-**Baseline** (as of v0.24.0, 2026-05-13, 1 000 nodes / 5 000 edges):
-- IS-1: 11.99 ms (pg_eddy) vs 13.22 ms (AGE) → **0.91× — PASS**
-- IS-3: 12.93 ms (pg_eddy) vs 197.36 ms (AGE) → **15.26× faster — PASS**
+**Baseline** (as of v0.25.0, 2026-05-14, 1 000 nodes / 5 000 edges):
+- IS-1: 13.43 ms (pg_eddy) vs 13.53 ms (AGE) → **0.99× — PASS**
+- IS-3: 13.46 ms (pg_eddy) vs 205.43 ms (AGE) → **15.26× faster — PASS**
 
 If either gate fails, **do not tag the release** until the regression is
 diagnosed and fixed. Record the new numbers in `benchmarks/README.md`.

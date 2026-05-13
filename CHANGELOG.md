@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.25.0](#0250----node-id-location-index-opt-1) — Node-ID Location Index (OPT-1)
 - [0.23.0](#0230----property-indexes-and-query-planner-optimisation) — Property Indexes and Query Planner Optimisation
 - [0.22.6](#0226----call-procedures-and-100-tck) — CALL Procedures and 100% TCK
 - [0.22.2](#0222----tck-bug-fixes) — TCK Bug Fixes
@@ -38,6 +39,65 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 ---
 
 ## [Unreleased]
+
+---
+
+## [0.25.0] — 2026-05-14 — Node-ID Location Index (OPT-1)
+
+v0.25.0 delivers the **single largest performance improvement in pg_eddy's history**:
+a shadow catalog table `_pg_eddy.node_location` that records the exact heap
+page and slot of every node, eliminating the O(N) sequential scan that made
+full-graph expand 15× slower than AGE in v0.24.0.
+
+### What's New
+
+**OPT-1: Node-location index** — a new `_pg_eddy.node_location` table stores
+`(node_id, page_num, offset_num)` for every node. `find_node_by_id()` and
+`find_node_location()` now do an O(1) cache lookup instead of scanning the
+entire node heap. The cache is bulk-loaded at the start of every `cypher()`
+call and updated on every `create_node()` call.
+
+**OPT-3B: Relation-open hoisting** — `exec_expand` previously opened and
+closed the node and edge heap relations once per source row. They are now
+opened once per `exec_expand` invocation and held for the duration, eliminating
+thousands of `table_open` / `table_close` round-trips on wide graph queries.
+
+**Overflow deferral** — label filters are now applied *before* overflow block
+I/O, so filtered-out destination nodes never pay the cost of reading their
+overflow property block.
+
+**`pg_eddy.rebuild_node_location_index()`** — a new SQL function that does a
+single O(N) scan of the node heap and bulk-inserts all `(node_id, page_num,
+offset_num)` rows into `_pg_eddy.node_location`. Called automatically by the
+migration script to backfill existing data.
+
+### Performance Results
+
+| Benchmark | v0.24.0 | v0.25.0 | Improvement |
+|---|---|---|---|
+| PB-1: full-graph expand (10 000 edges) | 1 944 ms | 103 ms | **19× faster** |
+| PB-2: indexed 1-hop + 7 props | 15.33 ms | 14.94 ms | parity |
+| LDBC IS-1: node lookup + index | 11.99 ms | 13.43 ms | within variance |
+| LDBC IS-3: 1-hop expand | 12.93 ms | 13.46 ms | within variance |
+
+PB-1 was previously 15× *slower* than AGE (1 944 ms vs 129 ms). It is now
+within 1.27× of AGE (103 ms vs 81 ms) — all within the ≤2× gate.
+
+### Schema Changes (0.10.0 → 0.11.0)
+
+New table in `_pg_eddy`:
+
+```sql
+CREATE TABLE _pg_eddy.node_location (
+    node_id    BIGINT NOT NULL PRIMARY KEY,
+    page_num   INT4   NOT NULL,
+    offset_num INT4   NOT NULL
+);
+```
+
+Existing databases are upgraded by the migration script
+`pg_eddy--0.10.0--0.11.0.sql`, which calls
+`pg_eddy.rebuild_node_location_index()` to backfill all existing nodes.
 
 ---
 

@@ -52,7 +52,8 @@ pub struct NodeRecord {
 /// `label_ids` — resolved label ids (may be empty).  
 /// `prop_bytes`— pre-encoded property bytes (may be empty).
 ///
-/// Returns the `BlockNumber` where the node was stored (informational).
+/// Returns `(BlockNumber, OffsetNumber)` of the new node — used by callers to
+/// populate `_pg_eddy.node_location` without a second heap scan.
 ///
 /// # Safety
 /// Caller must ensure `rel` is valid and open.
@@ -61,7 +62,7 @@ pub unsafe fn insert_node(
     node_id: i64,
     label_ids: &[i32],
     prop_bytes: &[u8],
-) -> pg_sys::BlockNumber {
+) -> (pg_sys::BlockNumber, pg_sys::OffsetNumber) {
     // Guard: labels
     if label_ids.len() > MAX_LABELS_PER_NODE {
         pgrx::error!("pg_eddy PE101: node has {} labels, max is {}", label_ids.len(), MAX_LABELS_PER_NODE);
@@ -214,7 +215,7 @@ pub unsafe fn insert_node(
     }
 
     unsafe { pg_sys::UnlockReleaseBuffer(buf) };
-    blkno
+    (blkno, off)
 }
 
 // ---------------------------------------------------------------------------
@@ -321,11 +322,45 @@ impl NodeScanState {
 
 /// Scan the relation for a node with `node_id`, return it if visible.
 /// Uses `SnapshotSelf` semantics (finds the node just inserted in this xact).
+///
+/// # Fast path (OPT-1)
+/// If `_pg_eddy.node_location` has been bulk-loaded into the per-statement
+/// cache by `load_node_location_cache()`, this function goes directly to the
+/// cached (page, offset) and does a single buffer read instead of scanning all
+/// pages. Falls back to sequential scan on cache miss.
 pub unsafe fn find_node_by_id(
     rel: pg_sys::Relation,
     node_id: i64,
     snapshot: pg_sys::Snapshot,
 ) -> Option<NodeRecord> {
+    // --- Fast path: cache hit ---
+    if let Some((blkno, off)) = crate::catalog::locations::lookup_cached_location(node_id) {
+        let buf = unsafe {
+            pg_sys::ReadBufferExtended(
+                rel,
+                pg_sys::ForkNumber::MAIN_FORKNUM,
+                blkno,
+                pg_sys::ReadBufferMode::RBM_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        unsafe { pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32) };
+        let page = unsafe { pg_sys::BufferGetPage(buf) };
+        let result = unsafe { read_node_at_offset(page, buf, snapshot, off) };
+        unsafe { pg_sys::UnlockReleaseBuffer(buf) };
+        if let Some(mut r) = result {
+            // Validate the node_id in case the cache entry is stale (deleted slot reused).
+            if r.node_id == node_id {
+                if r.overflow_blkno != 0 && r.prop_bytes.is_empty() {
+                    r.prop_bytes = unsafe { read_overflow_block(rel, r.overflow_blkno) };
+                }
+                return Some(r);
+            }
+        }
+        // Stale cache entry (node was deleted) — fall through to sequential scan.
+    }
+
+    // --- Slow path: sequential scan ---
     let nblocks = unsafe {
         pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM)
     };
@@ -367,6 +402,47 @@ pub unsafe fn find_node_by_id(
         }
     }
     None
+}
+
+/// One-pass scan that collects `(node_id, page_num, offset_num)` for every
+/// live node in the relation.  Used by `rebuild_node_location_index()` to
+/// backfill `_pg_eddy.node_location` for nodes inserted before v0.11.0.
+///
+/// # Safety
+/// `rel` must be a valid, open node relation.  Caller provides snapshot.
+pub unsafe fn scan_all_node_locations(
+    rel: pg_sys::Relation,
+    snapshot: pg_sys::Snapshot,
+) -> Vec<(i64, u32, u32)> {
+    let nblocks = unsafe {
+        pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM)
+    };
+    let mut locations: Vec<(i64, u32, u32)> = Vec::new();
+    for blkno in 0..nblocks {
+        let buf = unsafe {
+            pg_sys::ReadBufferExtended(
+                rel,
+                pg_sys::ForkNumber::MAIN_FORKNUM,
+                blkno,
+                pg_sys::ReadBufferMode::RBM_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        unsafe { pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32) };
+        let page = unsafe { pg_sys::BufferGetPage(buf) };
+        if unsafe { is_overflow_page(page) } {
+            unsafe { pg_sys::UnlockReleaseBuffer(buf) };
+            continue;
+        }
+        let max_off = unsafe { pg_sys::PageGetMaxOffsetNumber(page as *const _) };
+        for off in pg_sys::FirstOffsetNumber..=max_off {
+            if let Some(rec) = unsafe { read_node_at_offset(page, buf, snapshot, off) } {
+                locations.push((rec.node_id, blkno, off as u32));
+            }
+        }
+        unsafe { pg_sys::UnlockReleaseBuffer(buf) };
+    }
+    locations
 }
 
 /// Count all visible nodes in the relation.
@@ -826,6 +902,11 @@ unsafe fn page_free_space(page: pg_sys::Page) -> usize {
 /// array on that page. This is the canonical location — used by edge_store
 /// to read and write adjacency headers.
 ///
+/// # Fast path (OPT-1)
+/// When the per-statement location cache is populated, jumps directly to the
+/// known (page, offset) and reads only `adj_slot_idx` from the item — one
+/// buffer read, no page scan.
+///
 /// # Safety
 /// `rel` must be a valid, open node relation.
 pub unsafe fn find_node_location(
@@ -834,6 +915,43 @@ pub unsafe fn find_node_location(
     _snapshot: pg_sys::Snapshot,
 ) -> Option<(pg_sys::BlockNumber, pg_sys::OffsetNumber, usize)> {
     let hdr_size = size_of::<pg_sys::HeapTupleHeaderData>();
+
+    // --- Fast path: cache hit ---
+    if let Some((blkno, cached_off)) = crate::catalog::locations::lookup_cached_location(node_id) {
+        let buf = pg_sys::ReadBufferExtended(
+            rel,
+            pg_sys::ForkNumber::MAIN_FORKNUM,
+            blkno,
+            pg_sys::ReadBufferMode::RBM_NORMAL,
+            std::ptr::null_mut(),
+        );
+        pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32);
+        let page = pg_sys::BufferGetPage(buf);
+        let iid = pg_sys::PageGetItemId(page, cached_off);
+        let item_len = (*iid).lp_len() as usize;
+        let mut result = None;
+        if (*iid).lp_flags() == pg_sys::LP_NORMAL && item_len >= hdr_size + NODE_FIXED_DATA_SIZE {
+            let item = pg_sys::PageGetItem(page as *const _, iid) as *const u8;
+            let raw = std::slice::from_raw_parts(item, item_len);
+            let data = &raw[hdr_size..];
+            let nid = i64::from_le_bytes(data[OFF_NODE_ID..OFF_NODE_ID + 8].try_into().unwrap());
+            let hdr = item as *const pg_sys::HeapTupleHeaderData;
+            let xmax_invalid = ((*hdr).t_infomask & pg_sys::HEAP_XMAX_INVALID as u16) != 0;
+            if nid == node_id && xmax_invalid {
+                let adj_slot_idx = u16::from_le_bytes(
+                    data[OFF_ADJ_SLOT..OFF_ADJ_SLOT + 2].try_into().unwrap(),
+                ) as usize;
+                result = Some((blkno, cached_off, adj_slot_idx));
+            }
+        }
+        pg_sys::UnlockReleaseBuffer(buf);
+        if result.is_some() {
+            return result;
+        }
+        // Stale cache (node deleted) — fall through to sequential scan.
+    }
+
+    // --- Slow path: sequential scan ---
     let nblocks =
         pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
 

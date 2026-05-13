@@ -10,3 +10,4 @@
 pub mod labels;
 pub mod indexes;
 pub mod constraints;
+pub mod locations;

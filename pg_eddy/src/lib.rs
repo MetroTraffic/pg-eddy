@@ -19,7 +19,7 @@ pgrx::pg_module_magic!();
 // ---------------------------------------------------------------------------
 // Extension SQL — schemas, registry tables, AM objects, and SQL functions.
 // ---------------------------------------------------------------------------
-extension_sql_file!("../sql/pg_eddy--0.10.0.sql", name = "pg_eddy_schema", finalize);
+extension_sql_file!("../sql/pg_eddy--0.11.0.sql", name = "pg_eddy_schema", finalize);
 
 // ---------------------------------------------------------------------------
 // _PG_init  — runs at postmaster start (shared_preload_libraries)
@@ -69,13 +69,17 @@ fn create_node(labels: Vec<String>, properties: pgrx::JsonB) -> i64 {
     // Allocate node id
     let node_id = next_node_id();
 
-    // Open the nodes table and insert
-    unsafe {
+    // Open the nodes table and insert; capture location for the shadow catalog.
+    let (blkno, off) = unsafe {
         use pgrx::pg_sys;
         let rel = open_nodes_relation();
-        crate::storage::node_store::insert_node(rel, node_id, &label_ids, &prop_bytes);
+        let loc = crate::storage::node_store::insert_node(rel, node_id, &label_ids, &prop_bytes);
         pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
-    }
+        loc
+    };
+
+    // Maintain node_location shadow catalog (OPT-1).
+    crate::catalog::locations::record_node_location(node_id, blkno, off);
 
     // Maintain label_index: insert one row per label.
     for lid in &label_ids {
@@ -1133,6 +1137,51 @@ fn drop_node_index(label: &str, prop: &str) -> bool {
     crate::catalog::indexes::drop_property_index(label, prop)
 }
 
+/// Rebuild `_pg_eddy.node_location` by scanning the node heap once.
+///
+/// Call this after upgrading from pg_eddy < 0.11.0 to populate the shadow
+/// catalog for all existing nodes.  The migration script `0.10.0→0.11.0`
+/// calls this automatically.  Safe to re-run at any time (clears and refills).
+///
+/// Returns the number of node locations recorded.
+#[pg_extern]
+fn rebuild_node_location_index() -> i64 {
+    use crate::storage::node_store::scan_all_node_locations;
+
+    // Clear existing entries first.
+    Spi::run("DELETE FROM _pg_eddy.node_location")
+        .unwrap_or_else(|e| pgrx::error!("pg_eddy: rebuild_node_location_index clear: {e}"));
+
+    let locations = unsafe {
+        use pgrx::pg_sys;
+        let rel = open_nodes_relation();
+        let snapshot = pg_sys::GetTransactionSnapshot();
+        let locs = scan_all_node_locations(rel, snapshot);
+        pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
+        locs
+    };
+
+    if locations.is_empty() {
+        return 0;
+    }
+
+    // Bulk insert in one SPI call.
+    let vals: String = locations
+        .iter()
+        .map(|(nid, pg, off)| format!("({},{},{})", nid, pg, off))
+        .collect::<Vec<_>>()
+        .join(",");
+    Spi::run(&format!(
+        "INSERT INTO _pg_eddy.node_location(node_id, page_num, offset_num) VALUES {} \
+         ON CONFLICT (node_id) DO UPDATE \
+           SET page_num = EXCLUDED.page_num, offset_num = EXCLUDED.offset_num",
+        vals
+    ))
+    .unwrap_or_else(|e| pgrx::error!("pg_eddy: rebuild_node_location_index insert: {e}"));
+
+    locations.len() as i64
+}
+
 /// List all registered property indexes.
 ///
 /// Returns one JSONB row per index: `{"label": "...", "prop": "..."}`.
@@ -1224,9 +1273,11 @@ fn cypher(query: &str, params: Option<pgrx::JsonB>) -> SetOfIterator<'static, pg
         Err(e) => error!("pg_eddy cypher plan error: {e}"),
     };
 
-    // Clear per-statement name caches (OPT-2) before execution so that each
-    // query starts with a fresh cache populated during this statement only.
+    // Clear per-statement caches (OPT-1, OPT-2) and bulk-load the node-location
+    // cache (OPT-1) so that find_node_by_id goes directly to (page, offset).
     crate::catalog::labels::clear_name_caches();
+    crate::catalog::locations::clear_node_location_cache();
+    crate::catalog::locations::load_node_location_cache();
     let rows = match cypher::executor::execute(&plan, &param_map) {
         Ok(r) => r,
         Err(e) => error!("pg_eddy cypher exec error: {e}"),
@@ -1360,6 +1411,8 @@ fn cypher_explain(query: &str, analyze: Option<bool>) -> String {
         std::collections::HashMap::new();
     let t_exec = Instant::now();
     crate::catalog::labels::clear_name_caches();
+    crate::catalog::locations::clear_node_location_cache();
+    crate::catalog::locations::load_node_location_cache();
     let rows = match cypher::executor::execute(&plan, &param_map) {
         Ok(r) => r,
         Err(e) => error!("pg_eddy cypher exec error (EXPLAIN ANALYZE): {e}"),

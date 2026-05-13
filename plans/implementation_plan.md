@@ -2129,7 +2129,44 @@ IS-3 ratio improves vs. v0.23.x baseline; no clippy warnings.
 
 ---
 
-**v0.25.0 — Query Optimisation** (formerly v0.24.0):
+**v0.25.0 — Storage Performance: Node-ID Index** (OPT-1 + OPT-3B from `plans/optimization_plan.md`):
+
+- [x] `_pg_eddy.node_location` shadow catalog table:
+      `(node_id BIGINT PRIMARY KEY, page_num INT4, offset_num INT2)`
+      — populated on `create_node()`, used by all node-by-ID lookups.
+- [x] `insert_node()` returns `(BlockNumber, OffsetNumber)` so callers can
+      write to `node_location` without a second scan.
+- [x] `rebuild_node_location_index()` SQL function: sequential scan of the
+      node heap to backfill `node_location` for nodes inserted before migration.
+      Called automatically from the `0.10.0→0.11.0` migration script.
+- [x] Thread-local bulk-load cache in `node_store.rs`:
+      `NODE_LOCATION_CACHE: HashMap<i64, (u32, u16)>` populated by a single
+      `SELECT node_id, page_num, offset_num FROM _pg_eddy.node_location` at the
+      start of each `cypher()` call (same pattern as the OPT-2 name caches).
+- [x] `find_node_by_id()` and `find_node_location()`: check `NODE_LOCATION_CACHE`
+      first; on hit, jump directly to `ReadBuffer(page_num)` + slot read — O(1);
+      on miss (node inserted in this statement after cache load), fall back to
+      sequential scan.
+- [x] `exec_expand` (OPT-3B): lift `open_nodes_relation()` / `table_close()` out
+      of the per-edge inner loop (currently called once per destination node);
+      open once per `exec_expand` invocation and pass through.
+- [x] `exec_expand`: defer overflow resolution until AFTER the label-filter check
+      so filtered-out nodes never pay the overflow I/O cost.
+- [x] Schema version bump: `Cargo.toml` `0.10.0` → `0.11.0`; add
+      `pg_eddy--0.10.0--0.11.0.sql` migration and `pg_eddy--0.11.0.sql` full DDL.
+
+**Actual benchmarks (v0.25.0, 2026-05-14)**:
+- PB-1 (full-graph expand): 103 ms pg_eddy vs 81 ms AGE → **1.27× (PASS ≤2×)** — was 1 944 ms (19× improvement)
+- PB-2 (indexed 1-hop + properties): 14.94 ms pg_eddy vs 15.71 ms AGE → **0.95× (PASS)**
+- LDBC IS-1: 13.43 ms pg_eddy vs 13.53 ms AGE → **0.99× (PASS)**
+- LDBC IS-3: 13.46 ms pg_eddy vs 205.43 ms AGE → **15.26× faster (PASS)**
+
+**Exit criteria**: ✅ all unit tests pass; ✅ `just lint` clean; ✅ LDBC IS-1/IS-3 gates
+pass; ✅ PB-1 within 2× of AGE; ✅ PB-2 within 1.1× of AGE (parity + noise tolerance).
+
+---
+
+**v0.26.0 — Query Optimisation** (formerly v0.25.0):
 
 - [ ] Cost model for AM scan operators: estimated row counts from
       `_pg_eddy.label_index` for label selectivity; shown in `cypher_explain`
@@ -2156,7 +2193,7 @@ no regressions on LDBC IS-1/IS-3.
 
 ---
 
-**v0.26.0 — Production Readiness** (formerly v0.25.0):
+**v0.27.0 — Production Readiness** (formerly v0.25.0):
 
 - [ ] LDBC SNB IS-1 through IS-7 and IC-1 through IC-14 benchmarked in full
       (extending the v0.12.x IS-1/IS-3 baseline to the complete suite);
