@@ -60,6 +60,23 @@ pub fn list_indexes() -> Vec<(String, String)> {
     })
 }
 
+/// Estimate the number of distinct values indexed for `(label_id, key_id)`.
+///
+/// Uses the primary key of `prop_value_index` which is indexed, so this is
+/// an O(count) scan but fast for small indexes.  Only call from EXPLAIN paths.
+///
+/// Not available in `pg_test` mode.
+#[cfg(not(feature = "pg_test"))]
+pub fn count_index_entries(label_id: i32, key_id: i32) -> i64 {
+    Spi::get_one_with_args::<i64>(
+        "SELECT COUNT(*) FROM _pg_eddy.prop_value_index \
+         WHERE label_id = $1 AND key_id = $2",
+        &[DatumWithOid::from(label_id), DatumWithOid::from(key_id)],
+    )
+    .unwrap_or(None)
+    .unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
 // Index management
 // ---------------------------------------------------------------------------

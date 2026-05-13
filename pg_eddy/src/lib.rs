@@ -1281,19 +1281,57 @@ fn clear() {
     }
 }
 
+/// Return the logical execution plan for a Cypher query as text.
+///
+/// When `analyze` is `true` (or `NULL`, which defaults to `false`), the query
+/// is also executed and the output includes the actual row count and wall-clock
+/// execution time.
+///
+/// The plan text includes estimated row counts at `LabelScan` and
+/// `PropertyIndexScan` nodes derived from the catalog at plan time.
+///
+/// Examples:
+/// ```sql
+/// SELECT cypher_explain('MATCH (n:Person {id: 5}) RETURN n');
+/// SELECT cypher_explain('MATCH (n:Person {id: 5}) RETURN n', true);
+/// ```
 #[pg_extern]
-fn cypher_explain(query: &str) -> String {
+fn cypher_explain(query: &str, analyze: Option<bool>) -> String {
+    use std::time::Instant;
+
+    let do_analyze = analyze.unwrap_or(false);
+
+    let t_plan = Instant::now();
     let ast = match cypher::parser::parse(query) {
         Ok(q) => q,
         Err(e) => error!("pg_eddy cypher parse error: {e}"),
     };
-
     let plan = match cypher::planner::plan(&ast) {
         Ok(p) => p,
         Err(e) => error!("pg_eddy cypher plan error: {e}"),
     };
+    let plan_ms = t_plan.elapsed().as_secs_f64() * 1000.0;
 
-    cypher::planner::explain(&plan, 0)
+    let plan_text = cypher::planner::explain(&plan, 0);
+
+    if !do_analyze {
+        return format!("Planning: {plan_ms:.3} ms\n\n{plan_text}");
+    }
+
+    // Analyze mode: execute the query, count returned rows, measure wall time.
+    let param_map: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    let t_exec = Instant::now();
+    let rows = match cypher::executor::execute(&plan, &param_map) {
+        Ok(r) => r,
+        Err(e) => error!("pg_eddy cypher exec error (EXPLAIN ANALYZE): {e}"),
+    };
+    let exec_ms = t_exec.elapsed().as_secs_f64() * 1000.0;
+    let row_count = if is_write_only_plan(&plan) { 0 } else { rows.len() };
+
+    format!(
+        "Planning: {plan_ms:.3} ms\n\n{plan_text}\n\nExecution: {exec_ms:.3} ms  Rows: {row_count}"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1785,6 +1823,7 @@ mod tests {
     fn test_cypher_explain() {
         let plan = crate::cypher_explain(
             "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a, b",
+            None,
         );
         assert!(plan.contains("LabelScan"), "explain should contain LabelScan");
         assert!(plan.contains("Expand"), "explain should contain Expand");

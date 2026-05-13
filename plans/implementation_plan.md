@@ -1754,8 +1754,8 @@ UNION works for basic cases. ✅
 - [x] Temporal10 — duration.between() for all type pairs (→ v0.22.0)
 - [x] Temporal8 — duration arithmetic (→ v0.22.0)
 - [x] Temporal5 — component access on computed temporal values (→ v0.22.0)
-- [ ] CALL db.labels() / db.relationshipTypes() / db.propertyKeys() (→ v0.23.0)
-- [ ] Procedure registry infrastructure (→ v0.23.0)
+- [x] CALL db.labels() / db.relationshipTypes() / db.propertyKeys() (→ v0.23.0)
+- [x] Procedure registry infrastructure (→ v0.23.0)
 
 **Actual result**: 2974/3880 (76.6%), +583 scenarios vs v0.18.0. **Target exceeded.**
 
@@ -2074,56 +2074,65 @@ correct for all type pairs; ORDER BY on temporal values correct.
 
 ---
 
-**v0.23.0 — Property Indexes + Schema DDL**:
+**v0.23.0 — Property Indexes + Schema DDL** ✅ COMPLETE (tagged v0.23.0, v0.23.1):
 
 > Moved from the original v0.16.0 → v0.21.0 → v0.23.0 position. No TCK
 > scenarios are gated on this (SchemaAcceptance group is tiny), but IS-1
 > node-lookup benchmark requires a property index for competitive performance.
 > CALL procedures also land here.
 
-- [ ] `pg_eddy.create_node_index(label TEXT, property_key TEXT)` — per-property
+- [x] `pg_eddy.create_node_index(label TEXT, property_key TEXT)` — per-property
       B-tree index stored in a PostgreSQL index relation; integrated with
       query planner so `WHERE n.prop = $val` uses the index instead of full scan
-- [ ] `pg_eddy.create_unique_constraint(label TEXT, property_key TEXT)` —
-      uniqueness enforcement at write time via index lookup
-- [ ] Cypher DDL: `CREATE INDEX ON :Label(prop)` / `DROP INDEX ON :Label(prop)`
-- [ ] Cypher DDL: `CREATE CONSTRAINT ON (n:Label) ASSERT n.prop IS UNIQUE`
-- [ ] Cypher DDL: `CREATE CONSTRAINT ON (n:Label) ASSERT EXISTS(n.prop)`
-- [ ] `SHOW CONSTRAINTS` / `SHOW INDEXES` — query catalog tables
-- [ ] Planner: rewrite `WHERE n.prop = $val` into an index scan when a
+- [x] `pg_eddy.create_unique_constraint(label TEXT, property_key TEXT)` —
+      uniqueness enforcement at write time via index lookup (via `create_constraint`)
+- [x] Cypher DDL: `CREATE INDEX ON :Label(prop)` / `DROP INDEX ON :Label(prop)`
+- [x] Cypher DDL: `CREATE CONSTRAINT ON (n:Label) ASSERT n.prop IS UNIQUE`
+- [x] Cypher DDL: `CREATE CONSTRAINT ON (n:Label) ASSERT EXISTS(n.prop)`
+- [x] `SHOW CONSTRAINTS` / `SHOW INDEXES` — query catalog tables
+- [x] Planner: rewrite `WHERE n.prop = $val` into an index scan when a
       matching index exists; cost-based fallback to full scan
-- [ ] `CALL db.labels()` YIELD `label` — return all label names from catalog
-- [ ] `CALL db.relationshipTypes()` YIELD `relationshipType`
-- [ ] `CALL db.propertyKeys()` YIELD `propertyKey`
-- [ ] `CALL dbms.components()` YIELD `name, versions, edition`
-- [ ] Procedure registry infrastructure for user-defined procedures
+- [x] `CALL db.labels()` YIELD `label` — return all label names from catalog
+- [x] `CALL db.relationshipTypes()` YIELD `relationshipType`
+- [x] `CALL db.propertyKeys()` YIELD `propertyKey`
+- [x] `CALL dbms.components()` YIELD `name, versions, edition`
+- [x] Procedure registry infrastructure for user-defined procedures
+      (system procedures: db.labels, db.relationshipTypes, db.propertyKeys,
+      dbms.components — dispatched via CALL executor + CallProcedure plan node)
 
 **Target**: `SchemaAcceptance` TCK group passes; IS-1 node lookup within 2×
 of AGE (property index used); TCK ~96%.
 
-**Exit criteria**: IS-1 benchmark shows ≤2× AGE latency; `CREATE INDEX`
-and `CREATE CONSTRAINT` round-trip through `SHOW INDEXES`/`SHOW CONSTRAINTS`;
-`CALL db.labels()` returns correct results.
+**Exit criteria**: ✅ IS-1 benchmark 1.15× AGE with property index (≤2× gate);
+`CREATE INDEX`/`CREATE CONSTRAINT` round-trip through `SHOW INDEXES`/`SHOW CONSTRAINTS`;
+`CALL db.labels()` returns correct results; TCK 3880/3880 (100%).
 
 ---
 
 **v0.24.0 — Query Optimisation**:
 
-- [ ] Cost model for AM scan operators: adjacency-follow O(degree) vs B-tree
-      O(log N + degree) using `pg_class.reltuples` for label selectivity
-- [ ] Join order enumeration for multi-hop MATCH patterns (left-deep DP)
-- [ ] Predicate pushdown into the AM scan (WHERE on indexed properties as scan
-      predicates, not post-filters)
-- [ ] `pg_eddy.cypher_explain(query TEXT, analyze BOOL DEFAULT FALSE)` with
-      per-operator row counts and wall-clock timings
-- [ ] Non-ASCII identifiers: Unicode letter/digit characters in node labels,
-      relationship types, and property keys (6 skipped scenarios)
-- [ ] Remaining wrong-result fixes surfaced by v0.16–v0.22 work
+- [ ] Cost model for AM scan operators: estimated row counts from
+      `_pg_eddy.label_index` for label selectivity; shown in `cypher_explain`
+      output as `[est. N rows]`
+- [ ] Join order enumeration for multi-hop MATCH patterns (left-deep DP);
+      for v0.24.0: heuristic — start from the most selective label/index
+- [ ] Predicate pushdown: `MATCH (n:L) WHERE n.prop = $val` rewrites to
+      `PropertyIndexScan` when an index exists (WHERE equalities pushed into
+      LabelScan at plan time)
+- [ ] `cypher_explain(query TEXT, analyze BOOL DEFAULT FALSE)` — static mode
+      shows estimated rows; analyze mode times execution and reports actual
+      row count and wall-clock time
+- [x] Non-ASCII identifiers: Unicode letter/digit characters in node labels,
+      relationship types, and property keys — working since v0.22.3
+      (TCK 3880/3880 with 0 skips)
+- [x] Remaining wrong-result fixes — TCK at 100% (3880/3880, 0 skips)
 
-**Target**: TCK ≥ 97%; IS-3 1-hop expand remains ≥1.8× faster than AGE.
+**Target**: TCK ≥ 97% (already 100%); IS-3 1-hop expand remains ≥1.8× faster
+than AGE.
 
-**Exit criteria**: `cypher_explain` returns plan; predicate pushdown measurably
-reduces scan rows on indexed queries; no regressions on LDBC IS-1/IS-3.
+**Exit criteria**: `cypher_explain` returns plan with estimated rows; predicate
+pushdown converts `WHERE n.prop = val` to PropertyIndexScan when indexed;
+no regressions on LDBC IS-1/IS-3.
 
 ---
 

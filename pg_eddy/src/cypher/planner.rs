@@ -1311,8 +1311,58 @@ fn plan_match_clause(
     }).cloned().collect();
     let rel_iso_filter = build_rel_isomorphism_filter(&fixed_rel_vars);
 
-    // In openCypher, different node variables CAN bind to the same node (no node isomorphism).
-    let combined = match (rel_iso_filter, where_clause.clone()) {
+    // WHERE predicate pushdown into property index scans.
+    //
+    // Extract simple equality predicates of the form `n.prop = val` from the
+    // WHERE clause.  For each extracted predicate, try to replace the
+    // corresponding LabelScan with a PropertyIndexScan.  Successfully pushed
+    // predicates are removed from the WHERE; the remainder is kept as a Filter.
+    //
+    // Only available outside `pg_test` mode because `try_property_index_scan`
+    // needs an active SPI transaction.
+    let effective_where: Option<Expr> = if let Some(wc) = where_clause.clone() {
+        #[cfg(not(feature = "pg_test"))]
+        {
+            let (equalities, remaining) = extract_pushdown_equalities(&wc);
+            if !equalities.is_empty() {
+                let (new_plan, used) = apply_where_pushdown(plan, &equalities);
+                plan = new_plan;
+                if used.is_empty() {
+                    // Nothing was pushed; restore original WHERE.
+                    Some(wc)
+                } else {
+                    // Re-build remaining WHERE from non-pushed equalities + leftover.
+                    let mut rebuilt = remaining;
+                    for (i, (var, prop, val)) in equalities.iter().enumerate() {
+                        if !used.contains(&i) {
+                            let eq_expr = Expr::Compare(
+                                Box::new(Expr::Property(
+                                    Box::new(Expr::Variable(var.clone())),
+                                    prop.clone(),
+                                )),
+                                CmpOp::Eq,
+                                Box::new(val.clone()),
+                            );
+                            rebuilt = Some(match rebuilt {
+                                Some(r) => Expr::And(Box::new(r), Box::new(eq_expr)),
+                                None => eq_expr,
+                            });
+                        }
+                    }
+                    rebuilt
+                }
+            } else {
+                Some(wc)
+            }
+        }
+        #[cfg(feature = "pg_test")]
+        { Some(wc) }
+    } else {
+        None
+    };
+
+    // Combine rel-isomorphism guard with remaining WHERE into a single Filter.
+    let combined = match (rel_iso_filter, effective_where) {
         (Some(iso), Some(wh)) => Some(Expr::And(Box::new(iso), Box::new(wh))),
         (Some(iso), None) => Some(iso),
         (None, Some(wh)) => Some(wh),
@@ -2176,6 +2226,130 @@ fn try_property_index_scan(
     } // end #[cfg(not(feature = "pg_test"))]
 }
 
+// ---------------------------------------------------------------------------
+// WHERE predicate pushdown into property index scans
+// ---------------------------------------------------------------------------
+
+/// Decompose a WHERE expression into equality predicates that can be pushed
+/// into property index scans, plus a remaining expression.
+///
+/// Only top-level AND-connected `n.prop = literal/parameter` predicates are
+/// extracted.  Others (ORs, non-equality comparisons, function calls, etc.)
+/// are left untouched in the remainder.
+///
+/// Returns `(equalities, remaining_expr)` where:
+/// - `equalities` is a Vec of `(variable, property_name, value_expr)` triples.
+/// - `remaining_expr` is the predicate with the extracted equalities removed.
+fn extract_pushdown_equalities(expr: &Expr) -> (Vec<(String, String, Expr)>, Option<Expr>) {
+    match expr {
+        Expr::And(left, right) => {
+            let (mut leq, lrem) = extract_pushdown_equalities(left);
+            let (req, rrem) = extract_pushdown_equalities(right);
+            leq.extend(req);
+            let remaining = match (lrem, rrem) {
+                (Some(l), Some(r)) => Some(Expr::And(Box::new(l), Box::new(r))),
+                (Some(l), None) | (None, Some(l)) => Some(l),
+                (None, None) => None,
+            };
+            (leq, remaining)
+        }
+        Expr::Compare(lhs, CmpOp::Eq, rhs) => {
+            // n.prop = pushable_value
+            if let Expr::Property(base, prop) = lhs.as_ref()
+                && let Expr::Variable(var) = base.as_ref()
+                && is_pushable_value(rhs)
+            {
+                return (vec![(var.clone(), prop.clone(), *rhs.clone())], None);
+            }
+            // pushable_value = n.prop
+            if let Expr::Property(base, prop) = rhs.as_ref()
+                && let Expr::Variable(var) = base.as_ref()
+                && is_pushable_value(lhs)
+            {
+                return (vec![(var.clone(), prop.clone(), *lhs.clone())], None);
+            }
+            (vec![], Some(expr.clone()))
+        }
+        other => (vec![], Some(other.clone())),
+    }
+}
+
+/// Returns true for expression types that are safe to push into an index scan:
+/// literals, query parameters, and NULL.
+fn is_pushable_value(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::IntLit(_)
+            | Expr::FloatLit(_)
+            | Expr::StringLit(_)
+            | Expr::BoolLit(_)
+            | Expr::NullLit
+            | Expr::Parameter(_)
+    )
+}
+
+/// Walk a plan tree and attempt to replace `LabelScan` nodes with
+/// `PropertyIndexScan` nodes using the provided equality predicates.
+///
+/// Returns `(new_plan, used_indices)` where `used_indices` lists the positions
+/// in `equalities` that were successfully pushed into a scan.
+///
+/// Only available outside `pg_test` mode because `try_property_index_scan`
+/// requires an active SPI transaction.
+#[cfg(not(feature = "pg_test"))]
+fn apply_where_pushdown(
+    plan: LogicalPlan,
+    equalities: &[(String, String, Expr)],
+) -> (LogicalPlan, Vec<usize>) {
+    match plan {
+        LogicalPlan::LabelScan {
+            ref variable,
+            label: Some(ref lname),
+            ref inline_props,
+            optional,
+        } => {
+            // Try each equality targeting this variable.
+            for (i, (eq_var, eq_prop, eq_val)) in equalities.iter().enumerate() {
+                if eq_var == variable {
+                    let mut merged = inline_props.clone();
+                    merged.push((eq_prop.clone(), eq_val.clone()));
+                    if let Some(idx_scan) =
+                        try_property_index_scan(variable, lname, &merged, optional)
+                    {
+                        return (idx_scan, vec![i]);
+                    }
+                }
+            }
+            (plan, vec![])
+        }
+        // Recurse into single-input nodes.
+        LogicalPlan::Filter { input, predicate } => {
+            let (new_in, used) = apply_where_pushdown(*input, equalities);
+            (LogicalPlan::Filter { input: Box::new(new_in), predicate }, used)
+        }
+        LogicalPlan::Expand {
+            input, src_var, rel_var, dst_var, rel_types, direction,
+            rel_props, dst_labels, dst_props, optional,
+        } => {
+            let (new_in, used) = apply_where_pushdown(*input, equalities);
+            (LogicalPlan::Expand {
+                input: Box::new(new_in), src_var, rel_var, dst_var,
+                rel_types, direction, rel_props, dst_labels, dst_props, optional,
+            }, used)
+        }
+        LogicalPlan::CrossProduct { left, right } => {
+            let (new_l, lu) = apply_where_pushdown(*left, equalities);
+            let (new_r, mut ru) = apply_where_pushdown(*right, equalities);
+            ru.extend(lu);
+            (LogicalPlan::CrossProduct {
+                left: Box::new(new_l),
+                right: Box::new(new_r),
+            }, ru)
+        }
+        other => (other, vec![]),
+    }
+}
+
 /// Check that a property access like `r.name` doesn't target a path variable.
 fn check_path_property_access(expr: &Expr, var_kinds: &HashMap<String, VarKind>) -> Result<(), PlanError> {    match expr {
         Expr::Property(base, _) => {
@@ -2488,7 +2662,19 @@ pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
                 let keys: Vec<&str> = inline_props.iter().map(|(k, _)| k.as_str()).collect();
                 format!(" props=[{}]", keys.join(", "))
             };
-            format!("{prefix}LabelScan({variable}:{label_str}{props_str})")
+            // Cost-model estimate: count nodes with this label from the catalog.
+            #[cfg(not(feature = "pg_test"))]
+            let est_str = {
+                let n = if let Some(lname) = label.as_deref() {
+                    crate::catalog::labels::count_label_nodes(lname)
+                } else {
+                    crate::catalog::labels::estimate_total_nodes()
+                };
+                format!(" [est. {} rows]", n)
+            };
+            #[cfg(feature = "pg_test")]
+            let est_str = String::new();
+            format!("{prefix}LabelScan({variable}:{label_str}{props_str}){est_str}")
         }
         LogicalPlan::Expand {
             input, src_var, rel_var, dst_var, rel_types, direction, ..
@@ -2614,8 +2800,16 @@ pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
             let kind = if *all { "ALL" } else { "" };
             format!("{prefix}Union{kind}\n{l}\n{r}")
         }
-        LogicalPlan::PropertyIndexScan { variable, label, prop, .. } => {
-            format!("{prefix}PropertyIndexScan({variable}:{label} [{prop}=?])")
+        LogicalPlan::PropertyIndexScan { variable, label, prop, label_id, key_id, .. } => {
+            // Cost estimate: count indexed entries for this (label, prop) pair.
+            #[cfg(not(feature = "pg_test"))]
+            let est_str = {
+                let n = crate::catalog::indexes::count_index_entries(*label_id, *key_id);
+                format!(" [est. {} rows]", n)
+            };
+            #[cfg(feature = "pg_test")]
+            let est_str = String::new();
+            format!("{prefix}PropertyIndexScan({variable}:{label} [{prop}=?]){est_str}")
         }
         LogicalPlan::CreateIndex { label, prop } => {
             format!("{prefix}CreateIndex(:{label}({prop}))")

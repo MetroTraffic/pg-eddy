@@ -220,3 +220,44 @@ Both gates clear. Property index reduces IS-1 latency from 108 ms (no index, v0.
 - **Node insert still slower**: 0.41× vs AGE. Per-connection overhead in safe_psql batching
   is the dominant cost; bulk insert optimisation is a future milestone.
 
+---
+
+## v0.24.0 LDBC IS-1/IS-3 Benchmark (2026-05-13)
+
+### Environment
+
+| Field | Value |
+|---|---|
+| Date | 2026-05-13 |
+| Hardware | dev container (Debian 11) |
+| PostgreSQL version | 18.3 |
+| pg_eddy version | 0.24.0 (WHERE predicate pushdown, cost model, cypher_explain analyze) |
+| Apache AGE version | 1.7.0-rc0 |
+| `shared_buffers` | 256 MB |
+| `synchronous_commit` | off |
+| Dataset | 1 000 nodes / 5 000 edges (LDBC SNB–like random graph) |
+
+### Key change vs v0.23.1
+
+No algorithm changes to IS-1/IS-3 paths. This run verifies no regressions from
+v0.24.0's query optimisation work (WHERE predicate pushdown, cost model, explain).
+
+### Results
+
+| Benchmark | pg_eddy | AGE | Ratio |
+|---|---|---|---|
+| Node insert (nodes/s, UNWIND+CREATE) | 3 944 | 8 351 | 0.47× |
+| Edge load (edges/s) | 9 589 (SQL API) | 597 (UNWIND+MATCH) | N/A (diff API) |
+| Property index build (1 000 nodes) | 0.101 s | — | — |
+| IS-1: node lookup + index (ms/query) | 11.51 ms | 11.80 ms | **0.98× (PASS ≤2×)** |
+| IS-3: 1-hop expand (ms/query) | 11.31 ms | 157.02 ms | **0.07× (13.9× faster, PASS)** |
+
+### Gate decision
+
+**IS-1 gate (pg_eddy ≤ 2× AGE latency with property index)**: ✅ **PASS — 0.98× (faster than AGE)**
+
+**IS-3 gate (pg_eddy ≤ 0.5× AGE on graph traversal)**: ✅ **PASS — 13.9× faster than AGE**
+
+No regressions vs v0.23.1. IS-1 improved from 14.84 ms to 11.51 ms (18% faster)
+and is now marginally faster than AGE (0.98×). IS-3 remains ≫2× faster than AGE.
+

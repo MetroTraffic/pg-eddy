@@ -139,3 +139,42 @@ pub fn all_prop_keys() -> Vec<String> {
             .collect()
     })
 }
+
+// ---------------------------------------------------------------------------
+// Cost-model helpers (used by cypher_explain)
+// ---------------------------------------------------------------------------
+
+/// Estimate the number of nodes carrying a specific label.
+///
+/// Uses an index scan on `_pg_eddy.label_index(label_id)`.  Only call from
+/// EXPLAIN paths — the COUNT(*) is fast for indexed columns but not free.
+///
+/// Not available in `pg_test` mode (no active SPI transaction).
+#[cfg(not(feature = "pg_test"))]
+pub fn count_label_nodes(label_name: &str) -> i64 {
+    let label_id = match label_id_by_name(label_name) {
+        Some(id) => id,
+        None => return 0,
+    };
+    Spi::get_one_with_args::<i64>(
+        "SELECT COUNT(*) FROM _pg_eddy.label_index WHERE label_id = $1",
+        &[DatumWithOid::from(label_id)],
+    )
+    .unwrap_or(None)
+    .unwrap_or(0)
+}
+
+/// Estimate the total node count using the sequence's last-allocated value.
+///
+/// This is an O(1) approximation (may overcount deleted nodes) suitable for
+/// EXPLAIN estimates.
+///
+/// Not available in `pg_test` mode.
+#[cfg(not(feature = "pg_test"))]
+pub fn estimate_total_nodes() -> i64 {
+    Spi::get_one::<i64>(
+        "SELECT last_value FROM _pg_eddy.node_id_seq",
+    )
+    .unwrap_or(None)
+    .unwrap_or(0)
+}
