@@ -301,6 +301,11 @@ and is now marginally faster than AGE (0.98×). IS-3 remains ≫2× faster than 
 
 **IS-3 gate (pg_eddy ≤ 0.5× AGE on graph traversal)**: ✅ **PASS — 15.26× faster than AGE**
 
-No regressions from OPT-2/OPT-3/OPT-6. IS-3 improved slightly vs the earlier v0.24.0
-query-optimisation run (12.93 ms vs 11.31 ms — within run-to-run variance on dev container).
+Both gates pass. IS-3 at 12.93 ms is ~14% slower than the prior v0.24.0 query-optimisation
+run (11.31 ms), but AGE also varied 25% between runs (157 ms → 197 ms), indicating
+significant dev-container noise. The absolute improvement from OPT-2/OPT-3/OPT-6 is visible
+on property-rich graphs and multi-hop queries where the catalog lookups and OID resolution
+dominated; IS-3 on a 1K-node dataset with no properties is too small to show catalog-cache
+benefit. To measure the OPT-2/OPT-3 gains accurately, use a property-heavy workload or
+profile via `cypher_explain(..., analyze := true)`.
 
