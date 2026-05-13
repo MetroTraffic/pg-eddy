@@ -64,6 +64,39 @@ The project includes three test suites:
 line 6: `[![OpenCypher TCK](https://img.shields.io/badge/OpenCypher%20TCK-NN%2FNNNN%20passed-orange.svg)](tests/tck/)`
 Replace `NN/NNNN` with the new count (e.g., `82/3881 passed`).
 
+## Performance Benchmarks
+
+**Any commit that touches the storage layer, executor, or catalog must be
+benchmarked to confirm it does not introduce a performance regression.**
+
+Run the benchmark against a **release build** only — debug builds are 30–60×
+slower and produce meaningless numbers:
+
+```bash
+# 1. Install release build
+cargo pgrx install --release --features pg18
+
+# 2. Clear any leftover temp cluster from a previous run
+rm -rf tmp_check/t_run_ldbc_benchmark_ldbc_bench_data
+
+# 3. Run benchmark (requires AGE extension installed)
+PG_REGRESS='/usr/lib/postgresql/18/lib/pgxs/src/test/regress/pg_regress' \
+PERL5LIB="/usr/lib/postgresql/18/lib/pgxs/src/test/perl" \
+PATH="/usr/lib/postgresql/18/bin:${PATH}" \
+perl benchmarks/run_ldbc_benchmark.pl
+```
+
+**Pass gates** (both must hold):
+- IS-1 (node lookup with property index): pg_eddy **≤ 2× AGE latency**
+- IS-3 (1-hop expand): pg_eddy **≥ 2× faster than AGE**
+
+**Baseline** (as of v0.24.0, 2026-05-13, 1 000 nodes / 5 000 edges):
+- IS-1: 11.99 ms (pg_eddy) vs 13.22 ms (AGE) → **0.91× — PASS**
+- IS-3: 12.93 ms (pg_eddy) vs 197.36 ms (AGE) → **15.26× faster — PASS**
+
+If either gate fails, **do not tag the release** until the regression is
+diagnosed and fixed. Record the new numbers in `benchmarks/README.md`.
+
 ## Versioning Policy
 
 There are **two independent version axes**:
@@ -125,11 +158,17 @@ Before releasing a new version:
    `cargo clippy --features pg18 -- -D warnings`) and ensure there are zero warnings.
    Do not use bare `cargo clippy --features pg18` — it does not treat warnings as errors.
    Do not proceed to tagging if clippy fails.
-6. **Run TAP tests** — Execute `prove tests/tap/*.pl` to verify crash recovery
+6. **Run performance benchmark** — ⚠️ **REQUIRED GATE for any commit touching storage,
+   executor, or catalog** — Install a release build (`cargo pgrx install --release
+   --features pg18`), clear the temp dir, and run `perl benchmarks/run_ldbc_benchmark.pl`
+   (with the env vars from the Performance Benchmarks section above). Both IS-1 (≤2×
+   AGE latency) and IS-3 (≥2× faster than AGE) gates must pass. Record the new numbers
+   in `benchmarks/README.md`. Do not tag if either gate fails.
+7. **Run TAP tests** — Execute `prove tests/tap/*.pl` to verify crash recovery
    and edge cases work correctly.
-7. **Run TCK tests** — Execute `perl tests/tck/run_tck.pl` and update the badge
+8. **Run TCK tests** — Execute `perl tests/tck/run_tck.pl` and update the badge
    in `README.md` line 6 if the pass rate changes: 
    `[![OpenCypher TCK](https://img.shields.io/badge/OpenCypher%20TCK-NN%2FNNNN%20passed-orange.svg)](tests/tck/)`
    Replace `NN/NNNN` with the new count (e.g., `82/3881 passed`).
-8. **Create git tag** — Tag the release with `git tag vX.Y.Z` and push to
+9. **Create git tag** — Tag the release with `git tag vX.Y.Z` and push to
    repository. (Only after all gates above pass.)
