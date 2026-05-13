@@ -98,6 +98,18 @@ pub enum QueryClause {
         /// per spec: CREATE, SET, REMOVE, DELETE, MERGE, FOREACH).
         clauses: Vec<QueryClause>,
     },
+    /// CREATE INDEX ON :Label(prop) — register a property index.
+    CreateIndex {
+        label: String,
+        prop: String,
+    },
+    /// DROP INDEX ON :Label(prop) — remove a property index.
+    DropIndex {
+        label: String,
+        prop: String,
+    },
+    /// SHOW INDEXES — list registered property indexes.
+    ShowIndexes,
 }
 
 /// A SET item: one of four forms.

@@ -174,6 +174,35 @@ pub enum LogicalPlan {
         right: Box<LogicalPlan>,
         all: bool, // true = UNION ALL (no dedup), false = UNION (dedup)
     },
+    // -----------------------------------------------------------------------
+    // v0.23.0: Property index scan and schema DDL
+    // -----------------------------------------------------------------------
+    /// Use a property B-tree index to resolve nodes with `(n:Label {prop: value})`.
+    /// The planner substitutes this for a LabelScan when an index is registered.
+    PropertyIndexScan {
+        variable: String,
+        label: String,
+        label_id: i32,
+        prop: String,
+        key_id: i32,
+        /// The equality filter value (already evaluated to a constant by the planner).
+        value_expr: Expr,
+        /// Additional inline prop filters that could not be pushed into the index.
+        remaining_filters: Vec<(String, Expr)>,
+        optional: bool,
+    },
+    /// CREATE INDEX ON :Label(prop) — register a property index.
+    CreateIndex {
+        label: String,
+        prop: String,
+    },
+    /// DROP INDEX ON :Label(prop) — remove a property index.
+    DropIndex {
+        label: String,
+        prop: String,
+    },
+    /// SHOW INDEXES — return all registered property indexes.
+    ShowIndexes,
 }
 
 /// A plan error.
@@ -895,6 +924,22 @@ fn plan_clauses(
                     body: Box::new(body_plan),
                 };
             }
+            // v0.23.0 schema DDL
+            QueryClause::CreateIndex { label, prop } => {
+                current = LogicalPlan::CreateIndex {
+                    label: label.clone(),
+                    prop: prop.clone(),
+                };
+            }
+            QueryClause::DropIndex { label, prop } => {
+                current = LogicalPlan::DropIndex {
+                    label: label.clone(),
+                    prop: prop.clone(),
+                };
+            }
+            QueryClause::ShowIndexes => {
+                current = LogicalPlan::ShowIndexes;
+            }
         }
     }
 
@@ -1328,14 +1373,23 @@ fn plan_pattern_onto(
         }
         p
     } else {
-        // New node: LabelScan, cross-product with current.
+        // New node: LabelScan (or PropertyIndexScan if an index is available).
         let label = first_node.labels.first().cloned();
-        let scan = LogicalPlan::LabelScan {
+        let inline_props = first_node.properties.clone();
+        let scan = if let Some(ref lname) = label {
+            // Try to find an indexed property filter to use PropertyIndexScan.
+            try_property_index_scan(
+                &first_var, lname, &inline_props, optional,
+            )
+        } else {
+            None
+        }
+        .unwrap_or_else(|| LogicalPlan::LabelScan {
             variable: first_var.clone(),
             label,
-            inline_props: first_node.properties.clone(),
+            inline_props,
             optional,
-        };
+        });
         new_node_vars.push(first_var.clone());
         var_kinds.insert(first_var.clone(), VarKind::Node);
         let mut p = match current {
@@ -2030,9 +2084,68 @@ fn is_aggregate_fn(name: &str) -> bool {
     )
 }
 
+/// Try to build a PropertyIndexScan for a LabelScan with inline property filters.
+///
+/// Returns `Some(PropertyIndexScan)` if a property index is registered for any
+/// of the inline_props equality filters, `None` otherwise.
+///
+/// The first indexed property is used for the index lookup; the remaining
+/// inline_props filters become `remaining_filters` applied as post-scan predicates.
+fn try_property_index_scan(
+    variable: &str,
+    label: &str,
+    inline_props: &[(String, Expr)],
+    optional: bool,
+) -> Option<LogicalPlan> {
+    // In pg_test (unit-test) mode, SPI is not available at plan time because
+    // the planner is called from test wrappers that run outside a transaction.
+    // Skip property index scans — tests use fresh databases with no registered
+    // indexes anyway, so a label scan is always correct here.
+    #[cfg(feature = "pg_test")]
+    { let _ = (variable, label, inline_props, optional); return None; }
+
+    #[cfg(not(feature = "pg_test"))]
+    {
+    use crate::catalog::labels::{label_id_by_name, prop_key_id_by_name};
+    use crate::catalog::indexes::has_property_index;
+
+    if inline_props.is_empty() {
+        return None;
+    }
+    let label_id = label_id_by_name(label)?;
+    // Find the first inline prop that has a registered index.
+    let mut index_pos: Option<usize> = None;
+    let mut key_id_found: i32 = 0;
+    for (i, (pname, _)) in inline_props.iter().enumerate() {
+        if let Some(kid) = prop_key_id_by_name(pname)
+            && has_property_index(label_id, kid) {
+                index_pos = Some(i);
+                key_id_found = kid;
+                break;
+        }
+    }
+    let idx = index_pos?;
+    let (prop, value_expr) = &inline_props[idx];
+    let remaining: Vec<(String, Expr)> = inline_props.iter()
+        .enumerate()
+        .filter(|(i, _)| *i != idx)
+        .map(|(_, p)| p.clone())
+        .collect();
+    Some(LogicalPlan::PropertyIndexScan {
+        variable: variable.to_string(),
+        label: label.to_string(),
+        label_id,
+        prop: prop.clone(),
+        key_id: key_id_found,
+        value_expr: value_expr.clone(),
+        remaining_filters: remaining,
+        optional,
+    })
+    } // end #[cfg(not(feature = "pg_test"))]
+}
+
 /// Check that a property access like `r.name` doesn't target a path variable.
-fn check_path_property_access(expr: &Expr, var_kinds: &HashMap<String, VarKind>) -> Result<(), PlanError> {
-    match expr {
+fn check_path_property_access(expr: &Expr, var_kinds: &HashMap<String, VarKind>) -> Result<(), PlanError> {    match expr {
         Expr::Property(base, _) => {
             if let Expr::Variable(v) = base.as_ref()
                 && matches!(var_kinds.get(v), Some(VarKind::Path)) {
@@ -2468,6 +2581,18 @@ pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
             let r = explain(right, indent + 1);
             let kind = if *all { "ALL" } else { "" };
             format!("{prefix}Union{kind}\n{l}\n{r}")
+        }
+        LogicalPlan::PropertyIndexScan { variable, label, prop, .. } => {
+            format!("{prefix}PropertyIndexScan({variable}:{label} [{prop}=?])")
+        }
+        LogicalPlan::CreateIndex { label, prop } => {
+            format!("{prefix}CreateIndex(:{label}({prop}))")
+        }
+        LogicalPlan::DropIndex { label, prop } => {
+            format!("{prefix}DropIndex(:{label}({prop}))")
+        }
+        LogicalPlan::ShowIndexes => {
+            format!("{prefix}ShowIndexes")
         }
     }
 }

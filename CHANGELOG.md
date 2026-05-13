@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.23.0](#0230----property-indexes-and-query-planner-optimisation) — Property Indexes and Query Planner Optimisation
 - [0.22.6](#0226----call-procedures-and-100-tck) — CALL Procedures and 100% TCK
 - [0.22.2](#0222----tck-bug-fixes) — TCK Bug Fixes
 - [0.22.1](#0221----100-tck-compliance) — 100% TCK Compliance
@@ -37,6 +38,68 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 ---
 
 ## [Unreleased]
+
+---
+
+## [0.23.0] — 2026-05-13 — Property Indexes and Query Planner Optimisation
+
+v0.23.0 introduces **property value indexes** — B-tree indexes on node
+properties that allow the query planner to resolve
+`MATCH (n:Label {prop: $val})` in **O(log N)** time instead of scanning all
+nodes with that label. This is the first performance-oriented feature in
+pg_eddy; the schema version advances to **0.10.0**.
+
+### What's New
+
+**Property index DDL** — three new Cypher DDL statements:
+- `CREATE INDEX ON :Label(prop)` — register a property index and backfill
+  existing nodes
+- `DROP INDEX ON :Label(prop)` — remove the index and all index data
+- `SHOW INDEXES` — list all registered property indexes
+
+**SQL API** — equivalent SQL functions:
+- `pg_eddy.create_node_index(label, prop)` — returns the new `index_id`
+- `pg_eddy.drop_node_index(label, prop)` — returns `true` if an index was removed
+- `pg_eddy.show_indexes()` — returns SETOF JSONB `{label, prop}` rows
+
+**Automatic index maintenance** — when a node is created, updated, or
+deleted, pg_eddy transparently maintains `_pg_eddy.prop_value_index` so the
+index is always consistent.
+
+**Query planner optimisation** — `MATCH (n:Label {prop: $val})` patterns now
+check for a registered property index at plan time. When one exists, the
+planner substitutes a `PropertyIndexScan` node instead of a full
+`LabelScan + filter`, reducing per-query complexity from O(|label|) to
+O(log N + |results|).
+
+**`CALL dbms.components()`** — a built-in procedure that returns
+`{name: "pg_eddy", versions: ["0.10.0"], edition: "community"}`.
+
+### Schema Changes (0.9.0 → 0.10.0)
+
+Two new tables in `_pg_eddy`:
+- `prop_index_catalog(index_id, label_name, prop_name, UNIQUE(label_name, prop_name))`
+- `prop_value_index(entry_id, label_id, key_id, value_text, node_id, INDEX(label_id, key_id, value_text))`
+
+Migration file: `pg_eddy--0.9.0--0.10.0.sql`
+
+### Implementation Details
+
+- `catalog/indexes.rs` — new module: property index CRUD, backfill, and
+  lookup; all maintenance functions use SPI only (no raw storage access)
+- `cypher/planner.rs` — `try_property_index_scan()` checks the index catalog
+  at plan time; short-circuits to `None` in `pg_test` mode (no SPI at plan
+  time in unit tests)
+- `cypher/executor.rs` — `exec_property_index_scan()` evaluates the index
+  lookup, fetches full node records, verifies label membership, and applies
+  remaining property filters
+- Linker fix — `try_property_index_scan` guarded with
+  `#[cfg(not(feature = "pg_test"))]` to prevent SPI symbols from appearing
+  in the test binary's dead-code GC roots
+
+### TCK
+
+**3880/3880 passed, 0 skipped, 0 failures** — no regressions.
 
 ---
 

@@ -8,3 +8,4 @@
 /// All public functions **must be called inside a transaction** (SPI requires
 /// an active transaction context).
 pub mod labels;
+pub mod indexes;

@@ -19,7 +19,7 @@ pgrx::pg_module_magic!();
 // ---------------------------------------------------------------------------
 // Extension SQL — schemas, registry tables, AM objects, and SQL functions.
 // ---------------------------------------------------------------------------
-extension_sql_file!("../sql/pg_eddy--0.6.0.sql", name = "pg_eddy_schema", finalize);
+extension_sql_file!("../sql/pg_eddy--0.10.0.sql", name = "pg_eddy_schema", finalize);
 
 // ---------------------------------------------------------------------------
 // _PG_init  — runs at postmaster start (shared_preload_libraries)
@@ -85,6 +85,9 @@ fn create_node(labels: Vec<String>, properties: pgrx::JsonB) -> i64 {
         )
         .unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index insert failed: {e}"));
     }
+
+    // Maintain property value index.
+    crate::catalog::indexes::index_node_insert(node_id, &label_ids, &prop_obj);
 
     node_id
 }
@@ -613,6 +616,8 @@ fn update_node(node_id: i64, labels: Vec<String>, properties: pgrx::JsonB) -> bo
             )
             .unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index insert failed: {e}"));
         }
+        // Refresh property value index.
+        crate::catalog::indexes::index_node_update(node_id, &label_ids, &prop_obj);
     }
 
     found
@@ -637,6 +642,7 @@ fn delete_node(node_id: i64) -> bool {
             &[DatumWithOid::from(node_id)],
         )
         .unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index delete failed: {e}"));
+        crate::catalog::indexes::index_node_delete(node_id);
     }
     found
 }
@@ -837,6 +843,7 @@ fn detach_delete_node(node_id: i64) -> bool {
             &[DatumWithOid::from(node_id)],
         )
         .unwrap_or_else(|e| pgrx::error!("pg_eddy: label_index delete failed: {e}"));
+        crate::catalog::indexes::index_node_delete(node_id);
     }
 
     found
@@ -1065,6 +1072,47 @@ fn am_stats() -> pgrx::JsonB {
 // ---------------------------------------------------------------------------
 // Cypher query API (Phase 5)
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Property index API (v0.23.0)
+// ---------------------------------------------------------------------------
+
+/// Register a property index for a label/property pair and backfill existing
+/// nodes.  After this call, `MATCH (n:Label {prop: $val})` patterns will
+/// use the B-tree index instead of a full label scan + property filter.
+///
+/// Example:
+/// ```sql
+/// SELECT pg_eddy.create_node_index('Person', 'name');
+/// ```
+#[pg_extern]
+fn create_node_index(label: &str, prop: &str) -> i32 {
+    crate::catalog::indexes::create_property_index(label, prop)
+}
+
+/// Drop a previously registered property index, removing all index data.
+///
+/// Returns `true` if the index existed and was dropped, `false` if no such
+/// index was registered.
+#[pg_extern]
+fn drop_node_index(label: &str, prop: &str) -> bool {
+    crate::catalog::indexes::drop_property_index(label, prop)
+}
+
+/// List all registered property indexes.
+///
+/// Returns one JSONB row per index: `{"label": "...", "prop": "..."}`.
+#[pg_extern]
+fn show_indexes() -> SetOfIterator<'static, pgrx::JsonB> {
+    let pairs = crate::catalog::indexes::list_indexes();
+    let rows: Vec<pgrx::JsonB> = pairs
+        .into_iter()
+        .map(|(label, prop)| {
+            pgrx::JsonB(serde_json::json!({"label": label, "prop": prop}))
+        })
+        .collect();
+    SetOfIterator::new(rows)
+}
 
 /// Execute a Cypher query and return results as SETOF JSONB.
 ///

@@ -255,8 +255,37 @@ impl Parser {
                 // v0.12.0 write clauses
                 Token::Create => {
                     self.advance();
-                    let patterns = self.parse_patterns()?;
-                    clauses.push(QueryClause::Create { patterns });
+                    // CREATE INDEX ON :Label(prop) — schema DDL
+                    if *self.peek() == Token::Index {
+                        self.advance(); // consume INDEX
+                        self.expect(&Token::On)?;
+                        self.expect(&Token::Colon)?;
+                        let label = self.eat_ident_flexible()?;
+                        self.expect(&Token::LParen)?;
+                        let prop = self.eat_ident_flexible()?;
+                        self.expect(&Token::RParen)?;
+                        clauses.push(QueryClause::CreateIndex { label, prop });
+                    } else {
+                        let patterns = self.parse_patterns()?;
+                        clauses.push(QueryClause::Create { patterns });
+                    }
+                }
+                Token::Drop => {
+                    self.advance();
+                    self.expect(&Token::Index)?;
+                    self.expect(&Token::On)?;
+                    self.expect(&Token::Colon)?;
+                    let label = self.eat_ident_flexible()?;
+                    self.expect(&Token::LParen)?;
+                    let prop = self.eat_ident_flexible()?;
+                    self.expect(&Token::RParen)?;
+                    clauses.push(QueryClause::DropIndex { label, prop });
+                }
+                Token::Show => {
+                    self.advance();
+                    self.expect(&Token::Indexes)?;
+                    clauses.push(QueryClause::ShowIndexes);
+                    break; // SHOW INDEXES is a terminal statement
                 }
                 Token::Delete => {
                     self.advance();
@@ -849,6 +878,11 @@ impl Parser {
             Token::When       => { self.advance(); Ok("when".to_string()) }
             Token::Then       => { self.advance(); Ok("then".to_string()) }
             Token::Else       => { self.advance(); Ok("else".to_string()) }
+            Token::Show       => { self.advance(); Ok("show".to_string()) }
+            Token::Index      => { self.advance(); Ok("index".to_string()) }
+            Token::Indexes    => { self.advance(); Ok("indexes".to_string()) }
+            Token::Drop       => { self.advance(); Ok("drop".to_string()) }
+            Token::Constraint => { self.advance(); Ok("constraint".to_string()) }
             other => Err(ParseError {
                 message: format!("expected identifier, got {:?}", other),
                 offset: self.offset(),

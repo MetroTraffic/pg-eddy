@@ -95,6 +95,15 @@ pub fn label_id_by_name(name: &str) -> Option<i32> {
     .unwrap_or(None)
 }
 
+/// Look up a property key by name, returning its `key_id` if it exists.
+pub fn prop_key_id_by_name(name: &str) -> Option<i32> {
+    Spi::get_one_with_args::<i32>(
+        "SELECT key_id FROM _pg_eddy.property_key_registry WHERE name = $1",
+        &[DatumWithOid::from(name)],
+    )
+    .unwrap_or(None)
+}
+
 /// Return all label names in the registry.
 pub fn all_labels() -> Vec<String> {
     Spi::connect(|client| {

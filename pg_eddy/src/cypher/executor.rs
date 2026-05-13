@@ -2645,6 +2645,36 @@ pub fn execute(
         LogicalPlan::LeftJoin { outer, inner, null_vars } => {
             exec_left_join(outer, inner, null_vars, params)
         }
+        // v0.23.0 plan nodes
+        LogicalPlan::PropertyIndexScan {
+            variable, label, label_id, prop: _, key_id, value_expr,
+            remaining_filters, optional,
+        } => {
+            exec_property_index_scan(
+                variable, label, *label_id, *key_id,
+                value_expr, remaining_filters, *optional, params,
+            )
+        }
+        LogicalPlan::CreateIndex { label, prop } => {
+            crate::catalog::indexes::create_property_index(label, prop);
+            Ok(Vec::new())
+        }
+        LogicalPlan::DropIndex { label, prop } => {
+            let dropped = crate::catalog::indexes::drop_property_index(label, prop);
+            let mut row = Row::new();
+            row.insert("dropped".to_string(), Value::Bool(dropped));
+            Ok(vec![row])
+        }
+        LogicalPlan::ShowIndexes => {
+            let pairs = crate::catalog::indexes::list_indexes();
+            let rows: Vec<Row> = pairs.into_iter().map(|(label, prop)| {
+                let mut r = Row::new();
+                r.insert("label".to_string(), Value::Str(label));
+                r.insert("prop".to_string(), Value::Str(prop));
+                r
+            }).collect();
+            Ok(rows)
+        }
     }
 }
 
@@ -2769,6 +2799,118 @@ fn exec_label_scan(
 
     Ok(rows)
 }
+
+/// Use a property B-tree index to resolve nodes with equality filter on a
+/// specific (label, property) pair.  Falls back to no results (not a full scan)
+/// when the index has no entries for the given value.
+#[allow(clippy::too_many_arguments)]
+fn exec_property_index_scan(
+    variable: &str,
+    label: &str,
+    label_id: i32,
+    key_id: i32,
+    value_expr: &Expr,
+    remaining_filters: &[(String, Expr)],
+    optional: bool,
+    params: &HashMap<String, serde_json::Value>,
+) -> Result<Vec<Row>, ExecError> {
+    use crate::catalog::labels::{label_name, prop_key_name};
+    use crate::catalog::indexes::lookup_nodes_by_property;
+    use crate::storage::prop_store;
+
+    // Evaluate the equality value in an empty row (it's a constant/parameter).
+    let empty_row = Row::new();
+    let filter_val = eval_expr(value_expr, &empty_row, params)?;
+
+    // Serialise the value to an index key string (same encoding as store time).
+    let value_text = serde_json::to_string(&filter_val.to_json())
+        .unwrap_or_default();
+
+    // Query the property value index.
+    let node_ids = lookup_nodes_by_property(label_id, key_id, &value_text);
+
+    if node_ids.is_empty() && optional {
+        let mut null_row = Row::new();
+        null_row.insert(variable.to_string(), Value::Null);
+        return Ok(vec![null_row]);
+    }
+
+    let mut rows = Vec::new();
+
+    for nid in node_ids {
+        let record = unsafe {
+            let rel = crate::open_nodes_relation();
+            let snap = pgrx::pg_sys::GetActiveSnapshot();
+            let r = crate::storage::node_store::find_node_by_id(rel, nid, snap);
+            pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+            r
+        };
+
+        if let Some(mut r) = record {
+            // Resolve overflow properties.
+            if r.overflow_blkno != 0 && r.prop_bytes.is_empty() {
+                r.prop_bytes = unsafe {
+                    let rel = crate::open_nodes_relation();
+                    let bytes = crate::storage::node_store::read_overflow_block(rel, r.overflow_blkno);
+                    pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
+                    bytes
+                };
+            }
+
+            // Verify this node actually has the expected label (index might be stale).
+            if !r.label_ids.contains(&label_id) {
+                continue;
+            }
+
+            let labels: Vec<String> = r.label_ids.iter().map(|id| label_name(*id)).collect();
+            let properties = prop_store::decode(&r.prop_bytes, prop_key_name);
+
+            // Sanity check: only return nodes whose label matches.
+            if !labels.iter().any(|l| l == label) {
+                continue;
+            }
+
+            let val = Value::Node {
+                node_id: nid,
+                labels,
+                properties,
+            };
+
+            // Apply any remaining inline property filters.
+            if !remaining_filters.is_empty() {
+                let mut matches = true;
+                let mut scan_row = Row::new();
+                for (k, v) in params {
+                    scan_row.insert(k.clone(), json_to_value(v));
+                }
+                for (key, expr) in remaining_filters {
+                    let prop_val = val.get_property(key);
+                    let expected = eval_expr(expr, &scan_row, params)?;
+                    if !values_equal(&prop_val, &expected) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if !matches {
+                    continue;
+                }
+            }
+
+            let mut row = Row::new();
+            row.insert(variable.to_string(), val);
+            rows.push(row);
+        }
+    }
+
+    if optional && rows.is_empty() {
+        let mut null_row = Row::new();
+        null_row.insert(variable.to_string(), Value::Null);
+        return Ok(vec![null_row]);
+    }
+
+    Ok(rows)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn exec_expand(
     input: &LogicalPlan,
@@ -6894,6 +7036,16 @@ fn call_procedure(name: &str, args: &[Value], params: &HashMap<String, serde_jso
             }).collect();
             Ok(rows)
         }
+        "dbms.components" => {
+            let mut r = Row::new();
+            r.insert("name".to_string(), Value::Str("pg_eddy".to_string()));
+            r.insert(
+                "versions".to_string(),
+                Value::Json(serde_json::json!(["0.10.0"])),
+            );
+            r.insert("edition".to_string(), Value::Str("community".to_string()));
+            Ok(vec![r])
+        }
         _ => {
             Err(ExecError {
                 message: format!("ProcedureNotFound: {name}"),
@@ -7230,6 +7382,8 @@ fn create_pattern_in_row(
                 for lid in &label_ids {
                     buf.label_index.push((*lid, node_id));
                 }
+                // Maintain property value index for this new node.
+                crate::catalog::indexes::index_node_insert(node_id, &label_ids, &prop_map);
 
                 let node_val = Value::Node { node_id, labels: labels.clone(), properties: prop_map };
                 if let Some(v) = var {
@@ -7485,6 +7639,8 @@ fn exec_set_prop(
                         node_store::update_node(rel, node_id, &rec.label_ids, &new_bytes);
                         pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                     }
+                    // Maintain property value index.
+                    crate::catalog::indexes::index_node_update(node_id, &rec.label_ids, &props);
                     // Update in-memory row value.
                     if let Some(Value::Node { properties, .. }) = row.get_mut(&var) {
                         if val == Value::Null {
@@ -7534,6 +7690,8 @@ fn exec_set_prop(
                             node_store::update_node(rel, node_id, &rec.label_ids, &new_bytes);
                             pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                         }
+                        // Maintain property value index.
+                        crate::catalog::indexes::index_node_update(node_id, &rec.label_ids, &new_props);
                         if let Some(Value::Node { properties, .. }) = row.get_mut(var) {
                             *properties = new_props;
                         }
@@ -7609,6 +7767,8 @@ fn exec_set_prop(
                             node_store::update_node(rel, node_id, &rec.label_ids, &new_bytes);
                             pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                         }
+                        // Maintain property value index.
+                        crate::catalog::indexes::index_node_update(node_id, &rec.label_ids, &props);
                         if let Some(Value::Node { properties, .. }) = row.get_mut(var) {
                             for (k, v) in &extra {
                                 if v.is_null() {

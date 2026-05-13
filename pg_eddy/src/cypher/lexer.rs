@@ -43,6 +43,11 @@ pub enum Token {
     Then,     // THEN result
     Else,     // ELSE default
     End,      // END of CASE
+    Show,     // SHOW INDEXES / SHOW CONSTRAINTS (v0.23.0)
+    Index,    // INDEX keyword (v0.23.0)
+    Indexes,  // INDEXES keyword (v0.23.0)
+    Drop,     // DROP INDEX (v0.23.0)
+    Constraint, // CONSTRAINT keyword (v0.23.0)
 
     // Identifiers and literals
     Ident(String),
@@ -499,6 +504,11 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
                 "THEN" => Token::Then,
                 "ELSE" => Token::Else,
                 "END" => Token::End,
+                "SHOW" => Token::Show,
+                "INDEX" => Token::Index,
+                "INDEXES" => Token::Indexes,
+                "DROP" => Token::Drop,
+                "CONSTRAINT" => Token::Constraint,
                 _ => Token::Ident(word.to_string()),
             };
             tokens.push(SpannedToken { token, offset: start });
