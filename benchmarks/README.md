@@ -169,3 +169,54 @@ penalty (no property index) inflates the IS-3 baseline.
   outperforms AGE's Cypher planner on 1-hop expansion even without a property index,
   confirming the storage-engine advantage established in v0.5.1.
 
+---
+
+## v0.23.1 LDBC IS-1/IS-3 Benchmark (2026-05-13)
+
+### Environment
+
+| Field | Value |
+|---|---|
+| Date | 2026-05-13 |
+| Hardware | dev container (Debian 11) |
+| PostgreSQL version | 18.3 |
+| pg_eddy version | 0.23.1 (property index via `create_node_index`, constraint DDL) |
+| Apache AGE version | 1.7.0-rc0 |
+| `shared_buffers` | 256 MB |
+| `synchronous_commit` | off |
+| Dataset | 1 000 nodes / 5 000 edges (LDBC SNB–like random graph) |
+
+### Key change vs v0.12.x
+
+Property index (`create_node_index('Person', 'id')`) is now created before IS-1 queries,
+eliminating the full node-scan penalty that caused the 7× slowdown in the v0.12.x run.
+
+### Results
+
+| Benchmark | pg_eddy | AGE | Ratio |
+|---|---|---|---|
+| Node insert (nodes/s, UNWIND+CREATE) | 2 592 | 6 352 | 0.41× |
+| Edge load (edges/s) | 6 667 (SQL API) | 456 (UNWIND+MATCH) | N/A (diff API) |
+| Property index build (1 000 nodes) | 0.112 s | — | — |
+| IS-1: node lookup + index (ms/query) | 14.84 ms | 12.89 ms | **1.15× (PASS ≤2×)** |
+| IS-3: 1-hop expand (ms/query) | 13.63 ms | 201.68 ms | **0.07× (14.8× faster, PASS)** |
+
+### Gate decision
+
+**IS-1 gate (pg_eddy ≤ 2× AGE latency with property index)**: ✅ **PASS — 1.15× (within 2×)**
+
+**IS-3 gate (pg_eddy ≤ 0.5× AGE on graph traversal)**: ✅ **PASS — 14.8× faster than AGE**
+
+Both gates clear. Property index reduces IS-1 latency from 108 ms (no index, v0.12.x) to
+14.84 ms (with index) — a 7.3× improvement — and brings pg_eddy to near-parity with AGE.
+
+### Notes
+
+- **Property index**: `SELECT create_node_index('Person', 'id')` creates a GIN/B-tree index
+  on `prop_value_index` for the given label+property. IS-1 queries now go through the index
+  instead of a full `node_properties` scan.
+- **IS-3 massive improvement**: AGE's UNWIND+MATCH+CREATE edge loading at 456 edges/s
+  causes AGE's IS-3 to degrade (graph store is fragmented). pg_eddy's IS-3 is 14.8× faster.
+- **Node insert still slower**: 0.41× vs AGE. Per-connection overhead in safe_psql batching
+  is the dominant cost; bulk insert optimisation is a future milestone.
+

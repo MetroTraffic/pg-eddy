@@ -265,6 +265,39 @@ impl Parser {
                         let prop = self.eat_ident_flexible()?;
                         self.expect(&Token::RParen)?;
                         clauses.push(QueryClause::CreateIndex { label, prop });
+                    } else if *self.peek() == Token::Constraint {
+                        // CREATE CONSTRAINT ON (n:Label) ASSERT n.prop IS UNIQUE
+                        // CREATE CONSTRAINT ON (n:Label) ASSERT EXISTS(n.prop)
+                        self.advance(); // consume CONSTRAINT
+                        self.expect(&Token::On)?;
+                        self.expect(&Token::LParen)?;
+                        let _var = self.eat_ident_flexible()?; // node variable (ignored)
+                        self.expect(&Token::Colon)?;
+                        let label = self.eat_ident_flexible()?;
+                        self.expect(&Token::RParen)?;
+                        self.expect(&Token::Assert)?;
+                        // Determine kind: EXISTS(...) or <var>.<prop> IS UNIQUE
+                        let (prop, kind) = if *self.peek() == Token::Ident("exists".to_string())
+                            || *self.peek() == Token::Ident("EXISTS".to_string())
+                        {
+                            // EXISTS(n.prop) form
+                            self.advance(); // consume EXISTS ident
+                            self.expect(&Token::LParen)?;
+                            let _var2 = self.eat_ident_flexible()?;
+                            self.expect(&Token::Dot)?;
+                            let prop = self.eat_ident_flexible()?;
+                            self.expect(&Token::RParen)?;
+                            (prop, "EXISTS".to_string())
+                        } else {
+                            // n.prop IS UNIQUE form
+                            let _var2 = self.eat_ident_flexible()?;
+                            self.expect(&Token::Dot)?;
+                            let prop = self.eat_ident_flexible()?;
+                            self.expect(&Token::Is)?;
+                            self.expect(&Token::Unique)?;
+                            (prop, "UNIQUE".to_string())
+                        };
+                        clauses.push(QueryClause::CreateConstraint { label, prop, kind });
                     } else {
                         let patterns = self.parse_patterns()?;
                         clauses.push(QueryClause::Create { patterns });
@@ -272,20 +305,57 @@ impl Parser {
                 }
                 Token::Drop => {
                     self.advance();
-                    self.expect(&Token::Index)?;
-                    self.expect(&Token::On)?;
-                    self.expect(&Token::Colon)?;
-                    let label = self.eat_ident_flexible()?;
-                    self.expect(&Token::LParen)?;
-                    let prop = self.eat_ident_flexible()?;
-                    self.expect(&Token::RParen)?;
-                    clauses.push(QueryClause::DropIndex { label, prop });
+                    if *self.peek() == Token::Constraint {
+                        // DROP CONSTRAINT ON (n:Label) ASSERT n.prop IS UNIQUE/EXISTS(...)
+                        self.advance(); // consume CONSTRAINT
+                        self.expect(&Token::On)?;
+                        self.expect(&Token::LParen)?;
+                        let _var = self.eat_ident_flexible()?;
+                        self.expect(&Token::Colon)?;
+                        let label = self.eat_ident_flexible()?;
+                        self.expect(&Token::RParen)?;
+                        self.expect(&Token::Assert)?;
+                        let (prop, kind) = if *self.peek() == Token::Ident("exists".to_string())
+                            || *self.peek() == Token::Ident("EXISTS".to_string())
+                        {
+                            self.advance();
+                            self.expect(&Token::LParen)?;
+                            let _var2 = self.eat_ident_flexible()?;
+                            self.expect(&Token::Dot)?;
+                            let prop = self.eat_ident_flexible()?;
+                            self.expect(&Token::RParen)?;
+                            (prop, "EXISTS".to_string())
+                        } else {
+                            let _var2 = self.eat_ident_flexible()?;
+                            self.expect(&Token::Dot)?;
+                            let prop = self.eat_ident_flexible()?;
+                            self.expect(&Token::Is)?;
+                            self.expect(&Token::Unique)?;
+                            (prop, "UNIQUE".to_string())
+                        };
+                        clauses.push(QueryClause::DropConstraint { label, prop, kind });
+                    } else {
+                        // DROP INDEX ON :Label(prop)
+                        self.expect(&Token::Index)?;
+                        self.expect(&Token::On)?;
+                        self.expect(&Token::Colon)?;
+                        let label = self.eat_ident_flexible()?;
+                        self.expect(&Token::LParen)?;
+                        let prop = self.eat_ident_flexible()?;
+                        self.expect(&Token::RParen)?;
+                        clauses.push(QueryClause::DropIndex { label, prop });
+                    }
                 }
                 Token::Show => {
                     self.advance();
-                    self.expect(&Token::Indexes)?;
-                    clauses.push(QueryClause::ShowIndexes);
-                    break; // SHOW INDEXES is a terminal statement
+                    if *self.peek() == Token::Constraints {
+                        self.advance();
+                        clauses.push(QueryClause::ShowConstraints);
+                    } else {
+                        self.expect(&Token::Indexes)?;
+                        clauses.push(QueryClause::ShowIndexes);
+                    }
+                    break; // SHOW ... is a terminal statement
                 }
                 Token::Delete => {
                     self.advance();
@@ -883,6 +953,9 @@ impl Parser {
             Token::Indexes    => { self.advance(); Ok("indexes".to_string()) }
             Token::Drop       => { self.advance(); Ok("drop".to_string()) }
             Token::Constraint => { self.advance(); Ok("constraint".to_string()) }
+            Token::Assert     => { self.advance(); Ok("assert".to_string()) }
+            Token::Unique     => { self.advance(); Ok("unique".to_string()) }
+            Token::Constraints => { self.advance(); Ok("constraints".to_string()) }
             other => Err(ParseError {
                 message: format!("expected identifier, got {:?}", other),
                 offset: self.offset(),

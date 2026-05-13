@@ -1114,6 +1114,54 @@ fn show_indexes() -> SetOfIterator<'static, pgrx::JsonB> {
     SetOfIterator::new(rows)
 }
 
+/// Register a UNIQUE or EXISTS constraint on a label+property pair.
+///
+/// `kind` must be `'UNIQUE'` or `'EXISTS'`.
+///
+/// Example:
+/// ```sql
+/// SELECT pg_eddy.create_constraint('Person', 'email', 'UNIQUE');
+/// ```
+#[pg_extern]
+fn create_constraint(label: &str, prop: &str, kind: &str) -> i32 {
+    use crate::catalog::constraints::ConstraintKind;
+    let ck = match kind.to_uppercase().as_str() {
+        "UNIQUE" => ConstraintKind::Unique,
+        "EXISTS" => ConstraintKind::Exists,
+        _ => pgrx::error!("pg_eddy.create_constraint: kind must be 'UNIQUE' or 'EXISTS', got '{kind}'"),
+    };
+    crate::catalog::constraints::create_constraint(label, prop, ck)
+}
+
+/// Drop a previously registered constraint.
+///
+/// Returns `true` if the constraint existed and was dropped, `false` otherwise.
+#[pg_extern]
+fn drop_constraint(label: &str, prop: &str, kind: &str) -> bool {
+    use crate::catalog::constraints::ConstraintKind;
+    let ck = match kind.to_uppercase().as_str() {
+        "UNIQUE" => ConstraintKind::Unique,
+        "EXISTS" => ConstraintKind::Exists,
+        _ => return false,
+    };
+    crate::catalog::constraints::drop_constraint(label, prop, ck)
+}
+
+/// List all registered constraints.
+///
+/// Returns one JSONB row per constraint: `{"label": "...", "prop": "...", "kind": "..."}`.
+#[pg_extern]
+fn show_constraints() -> SetOfIterator<'static, pgrx::JsonB> {
+    let triples = crate::catalog::constraints::list_constraints();
+    let rows: Vec<pgrx::JsonB> = triples
+        .into_iter()
+        .map(|(label, prop, kind)| {
+            pgrx::JsonB(serde_json::json!({"label": label, "prop": prop, "kind": kind}))
+        })
+        .collect();
+    SetOfIterator::new(rows)
+}
+
 /// Execute a Cypher query and return results as SETOF JSONB.
 ///
 /// `query`  — a Cypher MATCH…RETURN statement.

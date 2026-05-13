@@ -9,3 +9,4 @@
 /// an active transaction context).
 pub mod labels;
 pub mod indexes;
+pub mod constraints;

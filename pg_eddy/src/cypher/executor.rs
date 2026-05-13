@@ -2675,6 +2675,31 @@ pub fn execute(
             }).collect();
             Ok(rows)
         }
+        LogicalPlan::CreateConstraint { label, prop, kind } => {
+            use crate::catalog::constraints::{ConstraintKind, create_constraint};
+            let ck = if kind == "UNIQUE" { ConstraintKind::Unique } else { ConstraintKind::Exists };
+            create_constraint(label, prop, ck);
+            Ok(Vec::new())
+        }
+        LogicalPlan::DropConstraint { label, prop, kind } => {
+            use crate::catalog::constraints::{ConstraintKind, drop_constraint};
+            let ck = if kind == "UNIQUE" { ConstraintKind::Unique } else { ConstraintKind::Exists };
+            let dropped = drop_constraint(label, prop, ck);
+            let mut row = Row::new();
+            row.insert("dropped".to_string(), Value::Bool(dropped));
+            Ok(vec![row])
+        }
+        LogicalPlan::ShowConstraints => {
+            let triples = crate::catalog::constraints::list_constraints();
+            let rows: Vec<Row> = triples.into_iter().map(|(label, prop, kind)| {
+                let mut r = Row::new();
+                r.insert("label".to_string(), Value::Str(label));
+                r.insert("prop".to_string(), Value::Str(prop));
+                r.insert("kind".to_string(), Value::Str(kind));
+                r
+            }).collect();
+            Ok(rows)
+        }
     }
 }
 
@@ -7384,6 +7409,19 @@ fn create_pattern_in_row(
                 }
                 // Maintain property value index for this new node.
                 crate::catalog::indexes::index_node_insert(node_id, &label_ids, &prop_map);
+                // Enforce UNIQUE constraints before committing the new node.
+                for label_name in &labels {
+                    for (prop_name, prop_val) in &prop_map {
+                        if crate::catalog::constraints::has_unique_constraint(label_name, prop_name) {
+                            let value_text = crate::catalog::indexes::value_to_index_text(prop_val);
+                            if let Some(vt) = value_text {
+                                crate::catalog::constraints::enforce_unique_on_insert(
+                                    label_name, prop_name, &vt, node_id,
+                                );
+                            }
+                        }
+                    }
+                }
 
                 let node_val = Value::Node { node_id, labels: labels.clone(), properties: prop_map };
                 if let Some(v) = var {

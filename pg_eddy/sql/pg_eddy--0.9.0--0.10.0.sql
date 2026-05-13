@@ -34,3 +34,14 @@ CREATE INDEX ON _pg_eddy.prop_value_index USING btree (label_id, key_id, value_t
 
 -- Maintenance lookup: given node_id → all its index entries (for DELETE / UPDATE)
 CREATE INDEX ON _pg_eddy.prop_value_index USING btree (node_id);
+
+-- ---------------------------------------------------------------------------
+-- Constraint catalog — UNIQUE / EXISTS constraints
+-- ---------------------------------------------------------------------------
+CREATE TABLE _pg_eddy.constraint_catalog (
+    constraint_id  INT  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    label_name     TEXT NOT NULL,
+    prop_name      TEXT NOT NULL,
+    kind           TEXT NOT NULL CHECK (kind IN ('UNIQUE', 'EXISTS')),
+    UNIQUE (label_name, prop_name, kind)
+);

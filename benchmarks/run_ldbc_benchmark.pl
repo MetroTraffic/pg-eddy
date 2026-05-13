@@ -1,15 +1,17 @@
 #!/usr/bin/env perl
-# benchmarks/run_ldbc_benchmark.pl — pg_eddy v0.12.x LDBC IS-1/IS-3 benchmark
+# benchmarks/run_ldbc_benchmark.pl — pg_eddy v0.23.x LDBC IS-1/IS-3 benchmark
 #
 # Measures:
 #   1. Batch node insert throughput  (UNWIND + CREATE via Cypher)
 #   2. Edge loading                  (SQL create_edge() for pg_eddy; UNWIND+CREATE for AGE)
-#   3. IS-1: single-node lookup by property (MATCH (n:Person {id: $id}))
-#   4. IS-3: 1-hop neighbour expansion    (MATCH (n:Person {id:$id})-[:KNOWS]-(f))
+#   3. Property index build          (create_node_index('Person','id') on 1 000 nodes)
+#   4. IS-1: single-node lookup by property (MATCH (n:Person {id: $id}) — with index)
+#   5. IS-3: 1-hop neighbour expansion    (MATCH (n:Person {id:$id})-[:KNOWS]-(f))
 #
 # Runs pg_eddy and Apache AGE side-by-side on the same dataset.
 # Note: pg_eddy loads edges via the SQL create_edge() API (sequential node IDs
-# from the sequence are used directly) since no property index is implemented yet.
+# from the sequence are used directly) since Cypher MATCH still does a full scan
+# for edge creation; a property-indexed MATCH is a future milestone.
 # AGE loads edges via UNWIND+MATCH+CREATE (AGE has B-tree index on properties).
 #
 # Scale: 1 000 nodes / 5 000 edges (adjust $N_*)
@@ -18,7 +20,8 @@
 #   PG_REGRESS=/usr/lib/postgresql/18/lib/pgxs/src/test/regress/pg_regress \
 #   PERL5LIB="/usr/lib/postgresql/18/lib/pgxs/src/test/perl:$PERL5LIB"    \
 #   PATH="/usr/lib/postgresql/18/bin:$PATH"                                 \
-#   perl benchmarks/run_ldbc_benchmark.pl
+#   prove -v benchmarks/run_ldbc_benchmark.pl
+#   # Results go to log/regress_log_run_ldbc_benchmark
 
 use strict;
 use warnings;
@@ -180,7 +183,16 @@ if ($age_ok) {
 }
 
 # ---------------------------------------------------------------------------
-# SECTION 4: IS-1 — single-node lookup by property
+# Create property index on Person.id for IS-1/IS-3 optimization
+# ---------------------------------------------------------------------------
+print "--- Creating property index on Person.id ---\n";
+my $idx_time = timeit("CREATE INDEX ON :Person(id)", sub {
+    $node->safe_psql('postgres', "SELECT create_node_index('Person', 'id')");
+});
+printf "  Index build time: %.3f s\n\n", $idx_time;
+
+# ---------------------------------------------------------------------------
+# SECTION 4: IS-1 — single-node lookup by property (with index)
 # ---------------------------------------------------------------------------
 print "--- IS-1: single-node lookup (MATCH (n:Person {id: X})) ---\n";
 
@@ -264,7 +276,7 @@ printf "%-35s %10d/s %12s %8s\n",
     $age_ok ? sprintf("%d/s", $age_edges_per_s) : "N/A",
     "N/A (diff API)";
 printf "%-35s %11.2f ms %11s %8s\n",
-    "IS-1 (node lookup, ms/query)",
+    "IS-1 (node lookup+index, ms/query)",
     $eddy_is1_ms,
     $age_ok ? sprintf("%.2f ms", $age_is1_ms) : "N/A",
     $age_ok ? sprintf("%.2fx", $eddy_is1_ms / ($age_is1_ms || 0.001)) : "N/A";

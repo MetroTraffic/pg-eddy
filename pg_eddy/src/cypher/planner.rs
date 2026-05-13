@@ -203,6 +203,20 @@ pub enum LogicalPlan {
     },
     /// SHOW INDEXES — return all registered property indexes.
     ShowIndexes,
+    /// CREATE CONSTRAINT ON (n:Label) ASSERT n.prop IS UNIQUE/EXISTS(...)
+    CreateConstraint {
+        label: String,
+        prop: String,
+        kind: String,
+    },
+    /// DROP CONSTRAINT ON (n:Label) ASSERT n.prop IS UNIQUE/EXISTS(...)
+    DropConstraint {
+        label: String,
+        prop: String,
+        kind: String,
+    },
+    /// SHOW CONSTRAINTS — list all registered constraints.
+    ShowConstraints,
 }
 
 /// A plan error.
@@ -939,6 +953,24 @@ fn plan_clauses(
             }
             QueryClause::ShowIndexes => {
                 current = LogicalPlan::ShowIndexes;
+            }
+            // v0.23.0 constraint DDL
+            QueryClause::CreateConstraint { label, prop, kind } => {
+                current = LogicalPlan::CreateConstraint {
+                    label: label.clone(),
+                    prop: prop.clone(),
+                    kind: kind.clone(),
+                };
+            }
+            QueryClause::DropConstraint { label, prop, kind } => {
+                current = LogicalPlan::DropConstraint {
+                    label: label.clone(),
+                    prop: prop.clone(),
+                    kind: kind.clone(),
+                };
+            }
+            QueryClause::ShowConstraints => {
+                current = LogicalPlan::ShowConstraints;
             }
         }
     }
@@ -2593,6 +2625,15 @@ pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
         }
         LogicalPlan::ShowIndexes => {
             format!("{prefix}ShowIndexes")
+        }
+        LogicalPlan::CreateConstraint { label, prop, kind } => {
+            format!("{prefix}CreateConstraint(:{label}({prop}) {kind})")
+        }
+        LogicalPlan::DropConstraint { label, prop, kind } => {
+            format!("{prefix}DropConstraint(:{label}({prop}) {kind})")
+        }
+        LogicalPlan::ShowConstraints => {
+            format!("{prefix}ShowConstraints")
         }
     }
 }

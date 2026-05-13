@@ -48,6 +48,9 @@ pub enum Token {
     Indexes,  // INDEXES keyword (v0.23.0)
     Drop,     // DROP INDEX (v0.23.0)
     Constraint, // CONSTRAINT keyword (v0.23.0)
+    Assert,   // ASSERT keyword (v0.23.0)
+    Unique,   // UNIQUE keyword (v0.23.0)
+    Constraints, // CONSTRAINTS keyword (v0.23.0)
 
     // Identifiers and literals
     Ident(String),
@@ -509,6 +512,9 @@ pub fn lex(input: &str) -> Result<Vec<SpannedToken>, LexError> {
                 "INDEXES" => Token::Indexes,
                 "DROP" => Token::Drop,
                 "CONSTRAINT" => Token::Constraint,
+                "ASSERT" => Token::Assert,
+                "UNIQUE" => Token::Unique,
+                "CONSTRAINTS" => Token::Constraints,
                 _ => Token::Ident(word.to_string()),
             };
             tokens.push(SpannedToken { token, offset: start });

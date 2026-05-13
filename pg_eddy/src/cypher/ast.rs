@@ -110,6 +110,21 @@ pub enum QueryClause {
     },
     /// SHOW INDEXES — list registered property indexes.
     ShowIndexes,
+    /// CREATE CONSTRAINT ON (n:Label) ASSERT n.prop IS UNIQUE
+    /// CREATE CONSTRAINT ON (n:Label) ASSERT EXISTS(n.prop)
+    CreateConstraint {
+        label: String,
+        prop: String,
+        kind: String, // "UNIQUE" or "EXISTS"
+    },
+    /// DROP CONSTRAINT ON (n:Label) ASSERT n.prop IS UNIQUE/EXISTS(...)
+    DropConstraint {
+        label: String,
+        prop: String,
+        kind: String,
+    },
+    /// SHOW CONSTRAINTS — list registered constraints.
+    ShowConstraints,
 }
 
 /// A SET item: one of four forms.
