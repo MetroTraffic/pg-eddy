@@ -2209,17 +2209,24 @@ gates pass; ✅ PB-1 at or below AGE latency; ✅ PB-2 ≤ 1.1× AGE.
 
 **v0.27.0 — Query Optimisation** (formerly v0.26.0, originally v0.25.0):
 
-- [ ] Cost model for AM scan operators: estimated row counts from
+- [x] Cost model for AM scan operators: estimated row counts from
       `_pg_eddy.label_index` for label selectivity; shown in `cypher_explain`
       output as `[est. N rows]`
-- [ ] Join order enumeration for multi-hop MATCH patterns (left-deep DP);
-      for v0.24.0: heuristic — start from the most selective label/index
-- [ ] Predicate pushdown: `MATCH (n:L) WHERE n.prop = $val` rewrites to
+- [x] Join order enumeration for multi-hop MATCH patterns (left-deep DP);
+      heuristic — CrossProduct operands swapped when left side has more
+      estimated rows; Expand reversed when dst label has ≥ 2× fewer nodes
+      than src (optimize_join_order + estimate_plan_rows in planner.rs)
+- [x] Predicate pushdown: `MATCH (n:L) WHERE n.prop = $val` rewrites to
       `PropertyIndexScan` when an index exists (WHERE equalities pushed into
-      LabelScan at plan time)
-- [ ] `cypher_explain(query TEXT, analyze BOOL DEFAULT FALSE)` — static mode
+      LabelScan at plan time) — existing apply_where_pushdown, confirmed
+- [x] `cypher_explain(query TEXT, analyze BOOL DEFAULT FALSE)` — static mode
       shows estimated rows; analyze mode times execution and reports actual
-      row count and wall-clock time
+      row count and wall-clock time — existing cypher_explain in lib.rs
+- [x] OPT-4 bug fixes: NamedPath element vars now marked as fully needed so
+      path node/edge properties are not stripped; MERGE internal match now
+      uses plan_without_opt4 to prevent ON MATCH property loss
+- [x] OPT-1 bug fix: clear() now truncates _pg_eddy.node_location so stale
+      cache entries do not cause "could not read blocks" on next test run
 - [x] Non-ASCII identifiers: Unicode letter/digit characters in node labels,
       relationship types, and property keys — working since v0.22.3
       (TCK 3880/3880 with 0 skips)

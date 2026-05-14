@@ -285,7 +285,27 @@ pub fn plan(query: &Query) -> Result<LogicalPlan, PlanError> {
         left
     };
     // OPT-4: annotate Expand nodes with needed destination properties.
-    Ok(annotate_needed_properties(result))
+    // Join-order optimisation runs first so OPT-4 sees final variable assignments.
+    Ok(annotate_needed_properties(optimize_join_order(result)))
+}
+
+/// Like `plan()` but skips OPT-4 property annotation.
+///
+/// Used by `exec_merge_pattern` for the internal pattern-match plan so that
+/// matched nodes always carry their full property maps.  Without this, OPT-4
+/// would strip all properties from nodes returned by the internal MATCH (since
+/// no properties are referenced within the internal plan itself), causing
+/// those stripped values to overwrite the correctly-loaded outer bindings when
+/// `exec_merge_pattern` builds the ON-MATCH context.
+pub fn plan_without_opt4(query: &Query) -> Result<LogicalPlan, PlanError> {
+    let left = plan_single(query)?;
+    let result = if let Some((all, right_q)) = &query.union {
+        let right = plan_without_opt4(right_q)?;
+        LogicalPlan::Union { left: Box::new(left), right: Box::new(right), all: *all }
+    } else {
+        left
+    };
+    Ok(optimize_join_order(result))
 }
 
 fn plan_single(query: &Query) -> Result<LogicalPlan, PlanError> {
@@ -2811,7 +2831,6 @@ pub fn collect_needed_properties(plan: &LogicalPlan) -> HashMap<String, Option<H
             }
             LogicalPlan::VarLengthExpand { input, .. }
             | LogicalPlan::BoundRelListExpand { input, .. }
-            | LogicalPlan::NamedPath { input, .. }
             | LogicalPlan::CallProcedure { input, .. }
             | LogicalPlan::CreatePattern { input, .. }
             | LogicalPlan::SetProp { input, .. }
@@ -2819,6 +2838,16 @@ pub fn collect_needed_properties(plan: &LogicalPlan) -> HashMap<String, Option<H
             | LogicalPlan::DeleteNodes { input, .. }
             | LogicalPlan::MergePattern { input, .. }
             | LogicalPlan::Foreach { input, .. } => {
+                scan_plan(map, input);
+            }
+            LogicalPlan::NamedPath { input, element_vars, .. } => {
+                // All element variables in a named path need their full node/edge
+                // data because the path value includes complete property maps.
+                // Without this, OPT-4 would strip properties from nodes/edges
+                // that appear only inside a named path and not elsewhere.
+                for ev in element_vars {
+                    mark_all(map, ev);
+                }
                 scan_plan(map, input);
             }
             LogicalPlan::PropertyIndexScan { .. }
@@ -2962,6 +2991,365 @@ fn annotate_plan(plan: LogicalPlan, needed: &HashMap<String, Option<HashSet<Stri
     }
 }
 
+// ---------------------------------------------------------------------------
+// v0.27.0: Join order optimisation (cost-model-based)
+// ---------------------------------------------------------------------------
+
+/// Estimate the output cardinality of a plan node.
+///
+/// Uses catalog counts (SPI) — only available outside `pg_test` mode.
+/// The estimates are rough: they do not model edge fan-out or filter
+/// selectivity beyond a fixed 10× factor for Filter nodes.
+#[cfg(not(feature = "pg_test"))]
+fn estimate_plan_rows(plan: &LogicalPlan) -> i64 {
+    use crate::catalog::labels::{count_label_nodes, estimate_total_nodes};
+    use crate::catalog::indexes::count_index_entries;
+    match plan {
+        LogicalPlan::LabelScan { label: Some(l), .. } => count_label_nodes(l).max(1),
+        LogicalPlan::LabelScan { label: None, .. } => estimate_total_nodes().max(1),
+        LogicalPlan::PropertyIndexScan { label_id, key_id, .. } => {
+            count_index_entries(*label_id, *key_id).max(1)
+        }
+        LogicalPlan::Expand { input, .. } => {
+            // Estimate: input rows (number of source nodes scanned).
+            // The actual output depends on fan-out; use input estimate as
+            // a conservative lower bound so the optimizer prefers starting
+            // from a PropertyIndexScan/small label over a full LabelScan.
+            estimate_plan_rows(input).max(1)
+        }
+        LogicalPlan::Filter { input, .. } => (estimate_plan_rows(input) / 10).max(1),
+        LogicalPlan::CrossProduct { left, right } => {
+            estimate_plan_rows(left).saturating_mul(estimate_plan_rows(right))
+        }
+        LogicalPlan::Project { input, .. }
+        | LogicalPlan::Unwind { input, .. }
+        | LogicalPlan::SetProp { input, .. }
+        | LogicalPlan::RemoveProp { input, .. }
+        | LogicalPlan::DeleteNodes { input, .. }
+        | LogicalPlan::MergePattern { input, .. }
+        | LogicalPlan::CreatePattern { input, .. }
+        | LogicalPlan::Foreach { input, .. }
+        | LogicalPlan::NamedPath { input, .. }
+        | LogicalPlan::CallProcedure { input, .. } => estimate_plan_rows(input),
+        LogicalPlan::Apply { outer, .. } | LogicalPlan::LeftJoin { outer, .. } => {
+            estimate_plan_rows(outer)
+        }
+        LogicalPlan::SingleRow => 1,
+        LogicalPlan::Union { left, right, .. } => {
+            estimate_plan_rows(left).saturating_add(estimate_plan_rows(right))
+        }
+        _ => 100,
+    }
+}
+
+/// Rewrite the plan for better join order:
+///
+/// 1. **CrossProduct reordering**: put the lower-cardinality child on the left
+///    (outer loop), so the higher-cardinality side is cached once as the inner.
+///
+/// 2. **Expand anchor reversal**: when a plain `LabelScan(src)` feeds an
+///    `Expand` and the destination label has fewer nodes than the source label,
+///    reverse the Expand (In ↔ Out) and start from the cheaper destination
+///    label instead.  This applies only to non-optional, reversible (Out/In)
+///    single-hop Expands where the source has no inline property filters.
+///
+/// This pass runs after `plan_single()` and before `annotate_needed_properties()`
+/// so that OPT-4 projection pushdown sees the final variable assignments.
+pub fn optimize_join_order(plan: LogicalPlan) -> LogicalPlan {
+    #[cfg(feature = "pg_test")]
+    { return plan; }  // SPI not available in unit-test mode — skip optimisation.
+
+    #[cfg(not(feature = "pg_test"))]
+    optimize_join_order_inner(plan)
+}
+
+#[cfg(not(feature = "pg_test"))]
+fn optimize_join_order_inner(plan: LogicalPlan) -> LogicalPlan {
+    use crate::catalog::labels::{count_label_nodes, estimate_total_nodes};
+    match plan {
+        // ----------------------------------------------------------------
+        // CrossProduct: put smaller cardinality child on the left.
+        // ----------------------------------------------------------------
+        LogicalPlan::CrossProduct { left, right } => {
+            let left = Box::new(optimize_join_order_inner(*left));
+            let right = Box::new(optimize_join_order_inner(*right));
+            let left_est = estimate_plan_rows(&left);
+            let right_est = estimate_plan_rows(&right);
+            // Swap so the smaller (cheaper) side is the outer loop.
+            if left_est > right_est {
+                LogicalPlan::CrossProduct { left: right, right: left }
+            } else {
+                LogicalPlan::CrossProduct { left, right }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Expand: try to reverse when the destination label is much
+        // smaller than the source label being scanned.
+        // ----------------------------------------------------------------
+        LogicalPlan::Expand {
+            input,
+            src_var,
+            rel_var,
+            dst_var,
+            rel_types,
+            direction,
+            rel_props,
+            dst_labels,
+            dst_props,
+            optional,
+            needed_dst_props,
+        } => {
+            // Recursively optimise the input first.
+            let input = Box::new(optimize_join_order_inner(*input));
+
+            // Reversal conditions:
+            // • direction is Out or In (not Both — cannot be reversed cleanly)
+            // • not optional (OPTIONAL MATCH semantics must not be altered)
+            // • dst_labels has exactly one label (single target label)
+            // • input is a plain LabelScan with no inline_props and
+            //   whose variable matches src_var (freshly scanned, not pre-bound)
+            let should_reverse = !optional
+                && matches!(direction, RelDirection::Out | RelDirection::In)
+                && dst_labels.len() == 1
+                && matches!(
+                    *input,
+                    LogicalPlan::LabelScan {
+                        ref variable,
+                        ref inline_props,
+                        optional: false,
+                        ..
+                    } if variable == &src_var && inline_props.is_empty()
+                );
+
+            if should_reverse {
+                // Extract source scan details.
+                let (src_label_opt, src_optional) =
+                    if let LogicalPlan::LabelScan { ref label, optional, .. } = *input {
+                        (label.clone(), optional)
+                    } else {
+                        unreachable!()
+                    };
+
+                let src_est = match &src_label_opt {
+                    Some(l) => count_label_nodes(l),
+                    None => estimate_total_nodes(),
+                };
+                let dst_est = count_label_nodes(&dst_labels[0]);
+
+                // Reverse only when dst is at least 2× cheaper than src.
+                if dst_est * 2 < src_est {
+                    let new_direction = match direction {
+                        RelDirection::Out => RelDirection::In,
+                        RelDirection::In => RelDirection::Out,
+                        RelDirection::Both => RelDirection::Both,
+                    };
+                    // New source: scan the original destination label.
+                    // dst_props become inline filters on the new scan;
+                    // try_property_index_scan may upgrade to a PropertyIndexScan.
+                    let new_scan = if !dst_props.is_empty() {
+                        try_property_index_scan(
+                            &dst_var,
+                            &dst_labels[0],
+                            &dst_props,
+                            src_optional,
+                        )
+                        .unwrap_or_else(|| LogicalPlan::LabelScan {
+                            variable: dst_var.clone(),
+                            label: Some(dst_labels[0].clone()),
+                            inline_props: dst_props.clone(),
+                            optional: src_optional,
+                            needed_props: None,
+                        })
+                    } else {
+                        LogicalPlan::LabelScan {
+                            variable: dst_var.clone(),
+                            label: Some(dst_labels[0].clone()),
+                            inline_props: vec![],
+                            optional: src_optional,
+                            needed_props: None,
+                        }
+                    };
+                    // New destination label filter: the original source label.
+                    let new_dst_labels = match &src_label_opt {
+                        Some(l) => vec![l.clone()],
+                        None => vec![],
+                    };
+                    return LogicalPlan::Expand {
+                        input: Box::new(new_scan),
+                        src_var: dst_var,
+                        rel_var,
+                        dst_var: src_var,
+                        rel_types,
+                        direction: new_direction,
+                        rel_props,
+                        dst_labels: new_dst_labels,
+                        dst_props: vec![], // moved to new LabelScan inline_props
+                        optional,
+                        needed_dst_props: None, // OPT-4 will re-annotate
+                    };
+                }
+            }
+
+            LogicalPlan::Expand {
+                input,
+                src_var,
+                rel_var,
+                dst_var,
+                rel_types,
+                direction,
+                rel_props,
+                dst_labels,
+                dst_props,
+                optional,
+                needed_dst_props,
+            }
+        }
+
+        // Recurse into single-input plan nodes.
+        LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
+            input: Box::new(optimize_join_order_inner(*input)),
+            predicate,
+        },
+        LogicalPlan::Project { input, items, distinct, order_by, skip, limit } => {
+            LogicalPlan::Project {
+                input: Box::new(optimize_join_order_inner(*input)),
+                items,
+                distinct,
+                order_by,
+                skip,
+                limit,
+            }
+        }
+        LogicalPlan::Unwind { input, expr, alias } => LogicalPlan::Unwind {
+            input: Box::new(optimize_join_order_inner(*input)),
+            expr,
+            alias,
+        },
+        LogicalPlan::Apply { outer, inner } => LogicalPlan::Apply {
+            outer: Box::new(optimize_join_order_inner(*outer)),
+            inner: Box::new(optimize_join_order_inner(*inner)),
+        },
+        LogicalPlan::LeftJoin { outer, inner, null_vars } => LogicalPlan::LeftJoin {
+            outer: Box::new(optimize_join_order_inner(*outer)),
+            inner: Box::new(optimize_join_order_inner(*inner)),
+            null_vars,
+        },
+        LogicalPlan::NamedPath { input, path_var, element_vars } => LogicalPlan::NamedPath {
+            input: Box::new(optimize_join_order_inner(*input)),
+            path_var,
+            element_vars,
+        },
+        LogicalPlan::Union { left, right, all } => LogicalPlan::Union {
+            left: Box::new(optimize_join_order_inner(*left)),
+            right: Box::new(optimize_join_order_inner(*right)),
+            all,
+        },
+        // CreatePattern chains can be 400+ nodes deep (one node per CREATE clause),
+        // which would cause a stack overflow from naive recursion.  Use the same
+        // iterative unwinding that exec_create_pattern uses at execution time.
+        LogicalPlan::CreatePattern { input, patterns } => {
+            let mut chain: Vec<Vec<Pattern>> = vec![patterns];
+            let mut cur: Box<LogicalPlan> = input;
+            while let LogicalPlan::CreatePattern { input: inner, patterns: pats } = *cur {
+                chain.push(pats);
+                cur = inner;
+            }
+            chain.reverse(); // bottom-up: base input first
+            // Optimise the base (non-CreatePattern) input.
+            let mut optimized = optimize_join_order_inner(*cur);
+            // Rebuild the chain from bottom up.
+            for pats in chain {
+                optimized = LogicalPlan::CreatePattern {
+                    input: Box::new(optimized),
+                    patterns: pats,
+                };
+            }
+            optimized
+        }
+        LogicalPlan::SetProp { input, items } => LogicalPlan::SetProp {
+            input: Box::new(optimize_join_order_inner(*input)),
+            items,
+        },
+        LogicalPlan::RemoveProp { input, items } => LogicalPlan::RemoveProp {
+            input: Box::new(optimize_join_order_inner(*input)),
+            items,
+        },
+        LogicalPlan::DeleteNodes { input, exprs, detach } => LogicalPlan::DeleteNodes {
+            input: Box::new(optimize_join_order_inner(*input)),
+            exprs,
+            detach,
+        },
+        LogicalPlan::MergePattern { input, pattern, on_create, on_match } => {
+            LogicalPlan::MergePattern {
+                input: Box::new(optimize_join_order_inner(*input)),
+                pattern,
+                on_create,
+                on_match,
+            }
+        }
+        LogicalPlan::Foreach { input, variable, list_expr, body } => LogicalPlan::Foreach {
+            input: Box::new(optimize_join_order_inner(*input)),
+            variable,
+            list_expr,
+            body: Box::new(optimize_join_order_inner(*body)),
+        },
+        LogicalPlan::CallProcedure {
+            input,
+            proc_name,
+            args,
+            yield_items,
+            implicit,
+        } => LogicalPlan::CallProcedure {
+            input: Box::new(optimize_join_order_inner(*input)),
+            proc_name,
+            args,
+            yield_items,
+            implicit,
+        },
+        LogicalPlan::VarLengthExpand {
+            input,
+            src_var,
+            rel_var,
+            dst_var,
+            rel_types,
+            direction,
+            min_hops,
+            max_hops,
+            optional,
+            path_carry_var,
+            excluded_rel_vars,
+        } => LogicalPlan::VarLengthExpand {
+            input: Box::new(optimize_join_order_inner(*input)),
+            src_var,
+            rel_var,
+            dst_var,
+            rel_types,
+            direction,
+            min_hops,
+            max_hops,
+            optional,
+            path_carry_var,
+            excluded_rel_vars,
+        },
+        LogicalPlan::BoundRelListExpand {
+            input,
+            src_var,
+            list_var,
+            dst_var,
+            direction,
+        } => LogicalPlan::BoundRelListExpand {
+            input: Box::new(optimize_join_order_inner(*input)),
+            src_var,
+            list_var,
+            dst_var,
+            direction,
+        },
+        // Leaf nodes: no children to recurse into.
+        other => other,
+    }
+}
+
 /// Format a plan as a human-readable explain string.
 pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
     let prefix = "  ".repeat(indent);
@@ -2989,7 +3377,7 @@ pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
             format!("{prefix}LabelScan({variable}:{label_str}{props_str}){est_str}")
         }
         LogicalPlan::Expand {
-            input, src_var, rel_var, dst_var, rel_types, direction, ..
+            input, src_var, rel_var, dst_var, rel_types, direction, dst_labels, ..
         } => {
             let dir_str = match direction {
                 RelDirection::Out => "->",
@@ -3002,9 +3390,27 @@ pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
                 rel_types.join("|")
             };
             let rv = rel_var.as_deref().unwrap_or("_");
+            let dst_label_str = if dst_labels.is_empty() {
+                String::new()
+            } else {
+                format!(":{}", dst_labels.join(":"))
+            };
+            // Cost estimate: count nodes in the destination label(s).
+            #[cfg(not(feature = "pg_test"))]
+            let est_str = {
+                use crate::catalog::labels::{count_label_nodes, estimate_total_nodes};
+                let n = if let Some(lbl) = dst_labels.first() {
+                    count_label_nodes(lbl)
+                } else {
+                    estimate_total_nodes()
+                };
+                format!(" [est. {} dst rows]", n)
+            };
+            #[cfg(feature = "pg_test")]
+            let est_str = String::new();
             let child = explain(input, indent + 1);
             format!(
-                "{prefix}Expand({src_var})-[{rv}:{types_str}]{dir_str}({dst_var})\n{child}"
+                "{prefix}Expand({src_var})-[{rv}:{types_str}]{dir_str}({dst_var}{dst_label_str}){est_str}\n{child}"
             )
         }
         LogicalPlan::CrossProduct { left, right } => {
@@ -3256,8 +3662,9 @@ mod tests {
         let q = parse("MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a, b").unwrap();
         let p = plan(&q).unwrap();
         let s = explain(&p, 0);
-        assert!(s.contains("Expand(a)-[r:KNOWS]->(b)"));
-        assert!(s.contains("LabelScan(a:Person)"));
+        // explain() now includes destination labels: "Expand(a)-[r:KNOWS]->(b:Person)"
+        assert!(s.contains("Expand(a)-[r:KNOWS]->(b:Person)"), "expected Expand in plan: {s}");
+        assert!(s.contains("LabelScan(a:Person)"), "expected LabelScan in plan: {s}");
     }
 
     #[test]

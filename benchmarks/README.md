@@ -534,3 +534,52 @@ Script: `benchmarks/run_prop_benchmark.pl`
 
 No regressions from v0.25.0. Both gates pass.
 
+---
+
+## v0.27.0 LDBC IS-1/IS-3 Benchmark (2026-05-14)
+
+### Environment
+
+| Field | Value |
+|---|---|
+| Date | 2026-05-14 |
+| Hardware | dev container (Debian 11) |
+| PostgreSQL version | 18.3 |
+| pg_eddy version | 0.27.0 (join order optimizer, OPT-4 NamedPath+MERGE fixes, OPT-1 clear() fix) |
+| Apache AGE version | 1.7.0-rc0 |
+| `shared_buffers` | 256 MB |
+| `synchronous_commit` | off |
+| Dataset | 1 000 nodes / 5 000 edges (LDBC SNB–like random graph) |
+| Build | **release** (`cargo pgrx install --release --features pg18`) |
+
+### Key changes vs v0.26.0
+
+- **Join order optimizer**: `optimize_join_order_inner` reorders CrossProduct operands
+  (cheaper side left) and reverses Expand direction (prefer smaller dst label).
+  `estimate_plan_rows` queries `_pg_eddy.label_index` via SPI for cost estimates.
+- **OPT-4 NamedPath fix**: element variables inside named paths are now marked as
+  fully needed so their properties are not stripped by projection pushdown.
+- **OPT-4 MERGE fix**: `exec_merge_pattern` now uses `plan_without_opt4` for its
+  internal MATCH so ON MATCH SET receives full property data.
+- **OPT-1 clear() fix**: `clear()` now truncates `_pg_eddy.node_location` to prevent
+  stale cache entries from causing "could not read blocks" errors.
+
+### Results
+
+| Benchmark | pg_eddy | AGE | Ratio |
+|---|---|---|---|
+| Node insert (nodes/s, UNWIND+CREATE) | 3 546 | 7 459 | 0.48× |
+| Edge load (edges/s) | 9 009 (SQL API) | 571 (UNWIND+MATCH) | N/A (diff API) |
+| IS-1: node lookup + index (ms/query) | 13.89 ms | 13.31 ms | **1.04× (PASS ≤2×)** |
+| IS-3: 1-hop expand (ms/query) | 14.23 ms | 180.30 ms | **0.08× (12.67× faster, PASS)** |
+
+### Gate decision
+
+**IS-1 gate (pg_eddy ≤ 2× AGE latency with property index)**: ✅ **PASS — 1.04×**
+
+**IS-3 gate (pg_eddy ≤ 0.5× AGE on graph traversal)**: ✅ **PASS — 12.67× faster than AGE**
+
+No regressions from v0.26.0. IS-1/IS-3 results are within normal dev-container variance.
+The join order optimizer targets multi-hop MATCH patterns; IS-1 (single-node lookup) and
+IS-3 (1-hop expand) are not significantly affected as they contain no CrossProduct nodes.
+

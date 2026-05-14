@@ -1326,7 +1326,7 @@ fn is_write_only_plan(plan: &cypher::planner::LogicalPlan) -> bool {
 fn clear() {
     // 1. Truncate the catalog index tables (regular heap — TRUNCATE is fast).
     Spi::run(
-        "TRUNCATE _pg_eddy.label_index, _pg_eddy.edge_type_src, _pg_eddy.edge_type_dst",
+        "TRUNCATE _pg_eddy.label_index, _pg_eddy.edge_type_src, _pg_eddy.edge_type_dst, _pg_eddy.node_location",
     )
     .unwrap_or_else(|e| pgrx::error!("pg_eddy clear: catalog truncate failed: {e}"));
 

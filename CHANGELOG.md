@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.27.0](#0270----join-order-optimizer--opt-4-bug-fixes) — Join Order Optimizer & OPT-4 Bug Fixes
 - [0.26.0](#0260----projection-pushdown--node-cache-opt-4a) — Projection Pushdown & Node Cache (OPT-4A)
 - [0.25.0](#0250----node-id-location-index-opt-1) — Node-ID Location Index (OPT-1)
 - [0.23.0](#0230----property-indexes-and-query-planner-optimisation) — Property Indexes and Query Planner Optimisation
@@ -40,6 +41,72 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 ---
 
 ## [Unreleased]
+
+---
+
+## [0.27.0] — 2026-05-14 — Join Order Optimizer & OPT-4 Bug Fixes
+
+v0.27.0 delivers the **join order optimizer** — the first cost-based query
+optimization step in pg_eddy's planner — and fixes four pre-existing correctness
+bugs in projection pushdown (OPT-4) and the node-location cache (OPT-1).
+
+### What's New
+
+**Join order optimizer** — `optimize_join_order_inner` rewrites the logical plan
+before execution to reduce the number of intermediate rows:
+
+- **CrossProduct reordering**: when a MATCH pattern generates a Cartesian product
+  of two sub-patterns, the operand with more estimated rows is placed on the right
+  (probe) side. Cost estimates come from `_pg_eddy.label_index` via SPI (O(1) lookup).
+- **Expand reversal**: when following a relationship from label A to label B, and
+  label B has ≥ 2× fewer nodes than label A, the traversal is reversed (start from
+  B and follow incoming edges) to reduce the fan-out.
+- **Cost model** — `estimate_plan_rows(plan)` queries `count_label_nodes()` and
+  `count_index_entries()` for label selectivity; results shown in `cypher_explain`
+  output as `[est. N rows]`.
+- **Safe in pg_test mode**: the optimizer is skipped during `cargo pgrx test pg18`
+  (SPI not available in test harness). All plan shapes are still exercised via the
+  existing unit tests.
+
+**OPT-4 NamedPath fix** — `collect_needed_properties` now marks all element variables
+inside a named path as fully needed. Previously, node/edge variables that appeared
+*only* inside a named path were marked as not needed, causing projection pushdown to
+strip all properties from them. Affected TCK scenarios: Match6[2], Match6[3], With6[4].
+
+**OPT-4 MERGE fix** — `exec_merge_pattern` now builds its internal MATCH plan via
+`plan_without_opt4` (a new helper that skips `annotate_needed_properties`). Previously,
+the internal plan stripped all node properties (nothing was referenced inside the
+sub-query itself), so ON MATCH SET received a property-less node and silently
+overwrote the outer context. Affected TCK scenarios: Merge1[3], Merge5[19], Merge7[4].
+
+**OPT-1 `clear()` fix** — `clear()` now includes `_pg_eddy.node_location` in its
+`TRUNCATE` list. Previously, stale location entries survived `clear()`, and the next
+test's `load_node_location_cache()` would populate the in-process cache with stale
+block/offset pairs pointing to blocks that no longer existed, causing "could not read
+blocks" errors on edge insertion. Affected TCK scenario: Create4[2].
+
+### Performance Results
+
+| Benchmark | v0.27.0 | v0.26.0 | vs AGE |
+|---|---|---|---|
+| LDBC IS-1: node lookup + index | 13.89 ms | 10.82 ms | 1.04× (PASS ≤2×) |
+| LDBC IS-3: 1-hop expand | 14.23 ms | 11.91 ms | **12.67× faster (PASS)** |
+
+IS-1 and IS-3 are single-node lookups and single-hop expansions — they do not contain
+CrossProduct nodes and are not affected by join reordering. Within normal dev-container
+variance. Both IS-1 and IS-3 gates pass.
+
+### No Schema Changes
+
+This release is Rust-only — no catalog or SQL changes. The schema version remains at 0.11.0.
+
+### Testing
+
+- **Unit tests**: 85/85 pass (`cargo pgrx test pg18`)
+- **Lint**: zero warnings (`just lint`)
+- **TAP tests**: 11/11 pass — crash recovery, edge crash recovery, MVCC isolation,
+  and concurrent inserts all verified
+- **TCK**: 3880/3880 pass (100%) — six pre-existing OPT-4/OPT-1 bugs fixed
 
 ---
 

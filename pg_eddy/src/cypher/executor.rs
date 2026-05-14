@@ -8267,8 +8267,6 @@ fn exec_merge_pattern(
     on_match: &[SetItem],
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<Vec<Row>, ExecError> {
-    use crate::cypher::planner::plan;
-
     let input_rows = execute(input, params)?;
     let mut result = Vec::new();
 
@@ -8279,7 +8277,11 @@ fn exec_merge_pattern(
         where_clause: None,
     };
     let match_query = crate::cypher::ast::Query { clauses: vec![match_clause], union: None };
-    let match_plan = plan(&match_query).map_err(|e| ExecError { message: e.message })?;
+    // Use plan_without_opt4 so the internal MATCH returns full property data.
+    // OPT-4 strips properties that appear not-referenced within the plan, but
+    // those properties are needed by the outer query context (e.g. ON MATCH SET).
+    let match_plan = crate::cypher::planner::plan_without_opt4(&match_query)
+        .map_err(|e| ExecError { message: e.message })?;
 
     for outer_row in input_rows {
         // Inject outer row bindings into params.
