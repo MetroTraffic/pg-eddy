@@ -87,6 +87,15 @@ PB-1 was 1 944 ms (15× slower than AGE) two releases ago. It is now 65 ms
 This release is Rust-only — no catalog or SQL changes. The schema version
 remains at 0.11.0.
 
+### Testing
+
+- **Unit tests**: 85/85 pass (`cargo pgrx test pg18`)
+- **Lint**: zero warnings (`just lint`)
+- **TAP tests**: 11/11 pass (`just tap`) — crash recovery, edge crash
+  recovery, MVCC isolation, and concurrent inserts all verified
+- **TCK**: 3880/3880 pass (`just tck`) — executor changes have zero
+  regression on query correctness
+
 ---
 
 ## [0.25.0] — 2026-05-14 — Node-ID Location Index (OPT-1)

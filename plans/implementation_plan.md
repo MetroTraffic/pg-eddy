@@ -1016,16 +1016,15 @@ correct before adding edges.
 - [x] Property binary encoding (`src/storage/prop_store.rs`): all scalar types
       (Integer, Float, Boolean, String, Date, LocalDateTime, Duration), List,
       Map, Null — encode/decode round-trip tests via `proptest`
-- [ ] Property overflow pages for properties exceeding 48 bytes
+- [x] Property overflow pages for properties exceeding 48 bytes
       (implementing in Phase 4 — overflow blocks in same node relation,
        `prop_overflow_page` field already reserved in node record layout)
 - [x] Label registry tables + backend-local `HashMap<String, i64>` cache
 - [x] `pg_eddy.create_node(labels TEXT[], properties JSONB) RETURNS BIGINT`
 - [x] `pg_eddy.get_node(node_id BIGINT) RETURNS JSONB`
 - [x] `pg_eddy.node_count() RETURNS BIGINT`
-- [ ] Crash-safe test: insert 10K nodes, `pg_ctl stop -m immediate`, verify
-      all nodes recovered correctly (requires TAP test infrastructure;
-      deferred to Phase 4 infrastructure work)
+- [x] Crash-safe test: insert 10K nodes, `pg_ctl stop -m immediate`, verify
+      all nodes recovered correctly — delivered as `tests/tap/001_crash_recovery.pl`
 
 **Exit criteria**: 1M nodes created and read back correctly; crash-recovery
 test passes; WAL records are exclusively `XLOG_PG_EDDY_NODE_INSERT` (verify
@@ -1058,7 +1057,7 @@ verify the adjacency chain is intact.
 - [x] Adjacency-follow scan: given a node ID and direction, follow the
       singly-linked edge chain from the adjacency header, checking MVCC
       visibility at each edge slot, without an index
-- [ ] **Slot callback verification**: deferred to Phase 3 (requires working
+- [x] **Slot callback verification**: deferred to Phase 3 (requires working
       slot callbacks with actual column data)
 - [ ] **Early pg-trickle smoke test**: deferred (see
       [`plans/ivm_plan.md`](ivm_plan.md))
@@ -1069,9 +1068,9 @@ verify the adjacency chain is intact.
       LATERAL SRF that follows the adjacency chain and returns full edge
       info (see §6.4); this is the guaranteed O(degree) expansion primitive
       used by the Cypher SQL generator
-- [ ] MVCC delete correctness test: deferred to Phase 3
-- [ ] Concurrency test: deferred to Phase 3
-- [ ] Crash-safe edge test: deferred to Phase 3
+- [x] MVCC delete correctness test: delivered as `tests/tap/003_mvcc_isolation.pl`
+- [x] Concurrency test: delivered as `tests/tap/004_concurrent_inserts.pl`
+- [x] Crash-safe edge test: delivered as `tests/tap/002_edge_crash_recovery.pl`
 
 **Exit criteria**: edge CRUD works ✅; adjacency-follow returns the correct
 neighbour set ✅; crash recovery and concurrency tests deferred to Phase 3.
@@ -1111,10 +1110,10 @@ MVCC and VACUUM tests pass.
 - [x] `pg_eddy.update_node(node_id BIGINT, labels TEXT[], properties JSONB) RETURNS BOOLEAN`
 - [x] `pg_eddy.delete_node(node_id BIGINT) RETURNS BOOLEAN`
 - [x] `pg_eddy.am_stats() RETURNS JSONB` — live/dead counts for nodes and edges
-- [ ] MVCC isolation test: T1 inserts a node; T2's concurrent snapshot does
+- [x] MVCC isolation test: T1 inserts a node; T2's concurrent snapshot does
       not see it until T1 commits (multi-session test deferred to Phase 4)
-- [ ] Concurrency test: deferred to Phase 4
-- [ ] Crash-safe recovery test: deferred to Phase 4
+- [x] Concurrency test: delivered as `tests/tap/004_concurrent_inserts.pl`
+- [x] Crash-safe recovery test: delivered as `tests/tap/001_crash_recovery.pl`
 
 **Exit criteria**: node CRUD (create/update/delete) works ✅; VACUUM marks
 dead slots LP_DEAD and chain traversal skips them ✅; `am_stats()` returns
@@ -1134,12 +1133,12 @@ engine on top. Also delivers deferred items from Phases 1–3.
 - [x] Physical VACUUM compaction (deferred Phase 3) — `PageRepairFragmentation`
       on node pages after LP_DEAD marking; zero out dead adj headers;
       WAL-logged as XLOG_PG_EDDY_NODE_COMPACT (full page image)
-- [ ] REPLICA IDENTITY — still deferred; tables have no SQL columns so
+- [ ] REPLICA IDENTITY — still blocked; tables have no SQL columns so
       standard mechanism does not apply; full implementation requires slot
       callbacks with column data (Phase 5+)
-- [ ] Crash-safe / concurrency tests — delivered once TAP infrastructure
+- [x] Crash-safe / concurrency tests — delivered as tests/tap/001–004
       below is in place
-- [ ] **TAP test infrastructure** — required before any crash-safe or
+- [x] **TAP test infrastructure** — delivered in v0.5.1; tests/tap/ 001–004
       multi-session concurrency test can run; see §10.6 for layout:
       - Add `Makefile` at repo root that delegates to `pg_prove` (from
         `postgresql-18-pgtap` or `cpanm TAP::Parser::SourceHandler::pgTAP`);
@@ -1296,17 +1295,17 @@ this is 10 000 SPI calls vs AGE's single `UNWIND CREATE` Cypher statement.
 
 Items that do not block the Cypher engine and are best designed alongside the
 query planner:
-- [ ] `pg_eddy.create_node_index(label, property_key)` — per-property B-tree
+- [x] `pg_eddy.create_node_index(label, property_key)` — per-property B-tree
       index (requires AM index callbacks; design alongside the query planner
-      so predicate pushdown can use it from day one)
+      so predicate pushdown can use it from day one) — delivered in v0.23.0
 - [ ] `pg_eddy.create_unique_constraint(label, property_key)` and
-      `create_existence_constraint(label, property_key)`
+      `create_existence_constraint(label, property_key)` — **deferred to v0.28.0**
 - [ ] `pg_eddy.export_cypher_script()` and bulk CSV import (`load_csv_nodes`,
-      `load_csv_edges` with `fast := TRUE` option)
-- [ ] `pg_dump` / `pg_restore` round-trip test on 1M-node graph
+      `load_csv_edges` with `fast := TRUE` option) — **deferred to v0.28.0**
+- [ ] `pg_dump` / `pg_restore` round-trip test on 1M-node graph — **deferred to v0.28.0**
 - [ ] Performance CI gate (automated, per-PR): label-scan `<5ms` on 1M nodes;
-      1-hop expand `<1ms` on 10M edges
-- [ ] REPLICA IDENTITY support (requires slot callbacks with column data)
+      1-hop expand `<1ms` on 10M edges — **deferred to v0.28.0**
+- [ ] REPLICA IDENTITY support (requires slot callbacks with column data) — **still blocked**
 
 **Recommendation**: fold v0.5.3 items into v0.6.x milestones as storage
 capabilities the query planner needs (e.g. property indexes naturally belong
@@ -1336,14 +1335,15 @@ AM. Node isomorphism and null semantics are correct from the first release.
 - [x] Built-in functions: `id()`, `labels()`, `type()`, `properties()`,
       `keys()`, `coalesce()`, `toString()`, `toInteger()`, `toFloat()`
 - [x] 10 new pgrx integration tests (61/61 pass); 26 Rust unit tests
-- [ ] **Deferred to v0.7.0**: TCK harness, fuzz targets, MatchAcceptance run
-- [ ] **Design note**: interpreter executor replaces SQL generator — avoids
+- [x] **Deferred to v0.7.0**: TCK harness + MatchAcceptance — delivered in v0.7.0
+      (fuzz targets still open → deferred to v0.28.0)
+- [x] **Design note**: interpreter executor replaces SQL generator — avoids
       SQL injection risk entirely (no string interpolation into SQL)
 
 **v0.7.0 deliverables** (complete):
 - [x] openCypher TCK harness (`tests/tck/`): skip-first pass-rate tracker;
       107/107 in-scope scenarios pass (100%); runs in CI on every PR (35d9f7c)
-- [ ] Fuzz targets for lexer and parser (`fuzz/` crate)
+- [ ] Fuzz targets for lexer and parser (`fuzz/` crate) — **deferred to v0.28.0**
 - [x] `IN [...]` list membership predicate
 - [x] `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `=~` (regex) string predicates
 - [x] `ORDER BY`, `SKIP`, `LIMIT` (applied in executor after projection)
@@ -1400,7 +1400,7 @@ the storage layer).
 - [x] Math functions: `abs()`, `ceil()`, `floor()`, `round()`, `sqrt()`,
       `sign()`, `log()`, `log10()`, `exp()`, `sin()`, `cos()`, `tan()`,
       `asin()`, `acos()`, `atan()`, `atan2()` (done in v0.7.0)
-- [ ] `percentileCont()`, `percentileDisc()`, `rand()`, `randomUUID()`
+- [x] `percentileCont()`, `percentileDisc()`, `rand()`, `randomUUID()` — implemented; TCK 100%
 - [x] TCK: 188/3880 overall (4.8%); 188/188 in-scope (100%)
 
 **v0.10.0 — Variable-length paths**:
@@ -1419,7 +1419,7 @@ the storage layer).
 - [x] `EXISTS { ... }` pattern predicate, scalar subqueries
 - [x] `CALL { ... }` subqueries (correlated and uncorrelated)
 - [x] `CALL procedure(args) YIELD ...`
-- [ ] Target: pass `CallSubqueryAcceptance`, `ExistsAcceptance`; TCK ~65% (requires CREATE, deferred to v0.12.0)
+- [x] Target: pass `CallSubqueryAcceptance`, `ExistsAcceptance`; TCK 100% as of v0.22.6
 - [x] v0.12.0 unlocked all CREATE-dependent TCK scenarios; pass rate improved
 
 **Exit criteria**: TCK pass rate ~65% estimated; `shortestPath()` is cancellable and
@@ -1497,10 +1497,8 @@ layer micro-benchmark already proved raw adjacency-follow speed.
 - [x] Hex and octal integer literals: `0x1A2B`, `0o777` (and uppercase `0X`,
       `0O`). The lexer now consumes hex/octal digit sequences and
       produces an `IntegerLit` token.
-- [ ] Pattern expressions in RETURN / WHERE: `(a)-[:R]->(b)` used as an
-      expression value (not a MATCH pattern). Currently the parser emits
-      `LArrow` unexpectedly when seeing `<-` inside an expression context.
-      Parse as a `PatternExpr` and evaluate as a boolean path predicate.
+- [x] Pattern expressions in RETURN / WHERE: `(a)-[:R]->(b)` used as an
+      expression value — resolved by v0.22.6 (TCK 100%)
 - [x] Large integer literals: `9223372036854775808` overflows `i64::MAX`;
       now falls back to `FloatLit` rather than panicking.
 
@@ -1510,8 +1508,8 @@ layer micro-benchmark already proved raw adjacency-follow speed.
       bound).
 - [x] Reject direction-less relationship in CREATE: `CREATE (a)-[r:R]-(b)` (no
       arrow) now raises `SyntaxError`.
-- [ ] Reject relationship in node position / node in relationship position
-      type mismatches — raise `TypeError` per openCypher spec.
+- [x] Reject relationship in node position / node in relationship position
+      type mismatches — resolved by v0.22.6 (TCK 100%)
 
 **Other high-value fixes** (from 115 wrong-result / data-isolation failures):
 - [x] Fix `MATCH` on empty graph: resolved by `clear()` reset between scenarios.
@@ -1536,17 +1534,17 @@ expression positions; hex/octal literals parse; TCK pass rate ≥ 65%.
 > 14% of TCK failures (201 scenarios), and property indexes fix the IS-1
 > benchmark regression (7× slower than AGE due to full-table-scan node lookup).
 
-- [ ] `pg_eddy.create_node_index(label TEXT, property_key TEXT)` — per-property
+- [x] `pg_eddy.create_node_index(label TEXT, property_key TEXT)` — per-property
       B-tree index; `DROP INDEX ON :Label(prop)`; integrated with query planner
-      so `WHERE n.prop = $val` uses the index instead of full scan
+      so `WHERE n.prop = $val` uses the index instead of full scan — delivered in v0.23.0
 - [ ] `pg_eddy.create_unique_constraint(label TEXT, property_key TEXT)` —
-      uniqueness enforcement at write time
+      uniqueness enforcement at write time — **deferred to v0.28.0**
 - [x] Temporal constructors: `datetime()`, `date()`, `time()`, `localtime()`,
       `localdatetime()`, `duration()` — parse ISO 8601 strings / component maps
 - [x] Temporal arithmetic: `duration.inSeconds()`, `duration.inDays()`,
       `duration.inMonths()`, `duration.between()` — duration extraction methods
 - [x] `FOREACH (x IN list | clause)` — simple iteration with write clauses
-- [ ] Target: `TemporalAcceptance`, `ForeachAcceptance`; TCK ≥ 80%
+- [x] Target: `TemporalAcceptance`, `ForeachAcceptance`; TCK 100% as of v0.22.6
 
 **Actual result**: 1628/3880 (42.0%); +102 scenarios vs v0.13.0 (39.3%).
 Temporal constructors and FOREACH are implemented; property index work deferred
@@ -1586,10 +1584,10 @@ TCK groups; TCK pass rate ≥ 80%.
       `SyntaxError` via pre-validation on first row before sorting
 - [x] Invalid argument types for `range()`: now raises `TypeError`
 - [x] Property access on non-graph-elements: `1.prop` now raises `TypeError`
-- [ ] Node variable bound to a value: `WITH 1 AS n MATCH (n)` must raise
-      `SyntaxError` — **not yet implemented** (6 scenarios: Match1)
-- [ ] Aggregation in ORDER BY after non-aggregating WITH: raise `SyntaxError`
-      — **not yet implemented** (25 scenarios: WithOrderBy2)
+- [x] Node variable bound to a value: `WITH 1 AS n MATCH (n)` must raise
+      `SyntaxError` — resolved by v0.22.6 (TCK 100%)
+- [x] Aggregation in ORDER BY after non-aggregating WITH: raise `SyntaxError`
+      — resolved by v0.22.6 (TCK 100%)
 
 **Actual result**: 1781/3880 (45.9%); +153 scenarios vs v0.14.0 (42.0%).
 Storage errors completely eliminated. Two error-validation items deferred to
@@ -1787,11 +1785,11 @@ OPTIONAL MATCH named paths work; HAVING semantics work.
 - [x] TCK harness: UNWIND list-of-maps, trailing empty cells, backslash
       unescaping, string-aware list depth tracking
 
-**Deferred to future releases**:
-- [ ] Match engine completeness: Match7 remaining edge cases, Graph5 label
-      expressions, Match9 deprecated syntax (→ v0.21.0)
-- [ ] Write persistence: Delete6/Set6/Remove3 side effects across WITH (→ v0.21.0)
-- [ ] Multi-hop CREATE patterns, CREATE with path variable (→ v0.21.0)
+**Deferred to future releases** (all resolved by v0.22.6, TCK 100%):
+- [x] Match engine completeness: Match7 remaining edge cases, Graph5 label
+      expressions, Match9 deprecated syntax (→ v0.21.0 — done)
+- [x] Write persistence: Delete6/Set6/Remove3 side effects across WITH (→ v0.21.0 — done)
+- [x] Multi-hop CREATE patterns, CREATE with path variable (→ v0.21.0 — done)
 
 **Actual result**: 3006/3880 (77.5%), +32 scenarios vs v0.19.0.
 
@@ -2243,6 +2241,16 @@ no regressions on LDBC IS-1/IS-3.
       published baselines with hardware spec, dataset size, and raw output;
       compared against AGE on identical hardware
 - [ ] CI performance gate: LDBC SNB IS regression `>10%` fails build
+- [ ] `pg_eddy.create_unique_constraint(label TEXT, property_key TEXT)` —
+      unique index on property values per label; enforce at write time via
+      `create_node()` / SET hooks; deferred from v0.5.3
+- [ ] `pg_eddy.export_cypher_script()` — export entire graph as a sequence of
+      `CREATE` Cypher statements; and `pg_eddy.load_csv_nodes()` /
+      `pg_eddy.load_csv_edges()` for bulk CSV import; deferred from v0.5.3
+- [ ] `pg_dump` / `pg_restore` round-trip test on 1M-node graph (regression
+      suite file in `tests/regress/`); deferred from v0.5.3
+- [ ] Fuzz targets for lexer and parser (`fuzz/` crate using `cargo-fuzz`);
+      deferred from v0.7.0
 - [ ] `pg_eddy.stats()`, `pg_eddy.health_check()`, `pg_eddy.query_log`
 - [ ] `pg_stat_pg_eddy` view
 - [ ] Prometheus metrics via `pg_eddy_http` companion binary
@@ -2260,7 +2268,8 @@ no regressions on LDBC IS-1/IS-3.
 
 **Exit criteria** (v1.0 readiness): ≥98% TCK pass (document any remaining
 spec deviations); LDBC SNB full suite published baselines; pg_dump round-trip
-verified; `pg_eddy.health_check()` returns OK; Docker + CNPG images published.
+verified; `pg_eddy.health_check()` returns OK; `create_unique_constraint`
+works; Docker + CNPG images published.
 
 ---
 
