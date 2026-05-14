@@ -1273,9 +1273,11 @@ fn cypher(query: &str, params: Option<pgrx::JsonB>) -> SetOfIterator<'static, pg
         Err(e) => error!("pg_eddy cypher plan error: {e}"),
     };
 
-    // Clear per-statement caches (OPT-1, OPT-2) and bulk-load the node-location
-    // cache (OPT-1) so that find_node_by_id goes directly to (page, offset).
+    // Clear per-statement caches (OPT-1, OPT-2, OPT-7, OPT-8, OPT-10) and
+    // bulk-load the node-location cache (OPT-1) so that find_node_by_id goes
+    // directly to (page, offset).
     crate::catalog::labels::clear_name_caches();
+    crate::catalog::indexes::clear_prop_index_cache();
     crate::catalog::locations::clear_node_location_cache();
     crate::catalog::locations::load_node_location_cache();
     let rows = match cypher::executor::execute(&plan, &param_map) {
@@ -1411,6 +1413,7 @@ fn cypher_explain(query: &str, analyze: Option<bool>) -> String {
         std::collections::HashMap::new();
     let t_exec = Instant::now();
     crate::catalog::labels::clear_name_caches();
+    crate::catalog::indexes::clear_prop_index_cache();
     crate::catalog::locations::clear_node_location_cache();
     crate::catalog::locations::load_node_location_cache();
     let rows = match cypher::executor::execute(&plan, &param_map) {

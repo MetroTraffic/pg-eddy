@@ -13,8 +13,35 @@
 ///   - Null           → not indexed
 ///
 /// All public functions must be called inside an active transaction.
+///
+/// # OPT-10: indexed-props-per-label cache
+///
+/// `index_node_insert` previously called `SELECT prop_name FROM
+/// prop_index_catalog WHERE label_name = $1` for every single node created.
+/// For a 100-node `UNWIND+CREATE` batch with no property index, this was 100
+/// SPI calls that all returned empty results.  The result is now cached in a
+/// thread-local `HashMap<String, Vec<String>>` (keyed by label name).  The
+/// cache is cleared at the start of every `cypher()` call via
+/// `clear_prop_index_cache()`.
 use pgrx::prelude::*;
 use pgrx::datum::DatumWithOid;
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+thread_local! {
+    /// OPT-10: per-label cache of indexed property names.
+    static INDEXED_PROPS_CACHE: RefCell<HashMap<String, Vec<String>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Clear the per-statement indexed-props cache.
+///
+/// Must be called alongside `clear_name_caches()` at the start of every
+/// `cypher()` invocation so DDL changes (e.g. `create_node_index`) are
+/// reflected immediately.
+pub fn clear_prop_index_cache() {
+    INDEXED_PROPS_CACHE.with(|c| c.borrow_mut().clear());
+}
 
 // ---------------------------------------------------------------------------
 // Index catalog queries
@@ -236,19 +263,26 @@ pub fn index_node_insert(
     // For each label the node has, check if any prop is indexed.
     for &lid in label_ids {
         let lname = label_name(lid);
-        // Get all indexed props for this label.
-        let indexed_props = Spi::connect(|client| {
-            client
-                .select(
-                    "SELECT prop_name FROM _pg_eddy.prop_index_catalog \
-                     WHERE label_name = $1",
-                    None,
-                    &[DatumWithOid::from(lname.as_str())],
-                )
-                .unwrap_or_else(|e| pgrx::error!("pg_eddy: index_node_insert SPI: {e}"))
-                .filter_map(|row| row.get::<String>(1).ok().flatten())
-                .collect::<Vec<_>>()
-        });
+        // OPT-10: cache indexed props per label — avoids repeated SPI on cache hit.
+        let cached = INDEXED_PROPS_CACHE.with(|c| c.borrow().get(&lname).cloned());
+        let indexed_props = if let Some(props) = cached {
+            props
+        } else {
+            let props = Spi::connect(|client| {
+                client
+                    .select(
+                        "SELECT prop_name FROM _pg_eddy.prop_index_catalog \
+                         WHERE label_name = $1",
+                        None,
+                        &[DatumWithOid::from(lname.as_str())],
+                    )
+                    .unwrap_or_else(|e| pgrx::error!("pg_eddy: index_node_insert SPI: {e}"))
+                    .filter_map(|row| row.get::<String>(1).ok().flatten())
+                    .collect::<Vec<_>>()
+            });
+            INDEXED_PROPS_CACHE.with(|c| { c.borrow_mut().insert(lname.clone(), props.clone()); });
+            props
+        };
 
         for pname in indexed_props {
             if let Some(v) = props.get(&pname)

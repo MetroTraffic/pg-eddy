@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.28.0](#0280----catalog-write-caches-opt-7-and-opt-10) — Catalog Write Caches (OPT-7 and OPT-10)
 - [0.27.0](#0270----join-order-optimizer--opt-4-bug-fixes) — Join Order Optimizer & OPT-4 Bug Fixes
 - [0.26.0](#0260----projection-pushdown--node-cache-opt-4a) — Projection Pushdown & Node Cache (OPT-4A)
 - [0.25.0](#0250----node-id-location-index-opt-1) — Node-ID Location Index (OPT-1)
@@ -41,6 +42,55 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 ---
 
 ## [Unreleased]
+
+---
+
+## [0.28.0] — 2026-05-14 — Catalog Write Caches (OPT-7 and OPT-10)
+
+v0.28.0 delivers two catalog-write optimisations that significantly reduce SPI
+overhead during node creation, improving batch `UNWIND+CREATE` throughput by
+**35%** (from 3 546 to 4 782 nodes/s, or 0.48× → 0.65× of AGE).
+
+### Optimisations
+
+- **OPT-7 — name→id caches for `ensure_label` and `ensure_prop_key`**
+  Previously, every node created in a `UNWIND+CREATE` batch issued an
+  `INSERT … ON CONFLICT … RETURNING` SPI round-trip even when the label or
+  property key already existed in the registry.  For a 100-node batch with label
+  "Person" and two properties `{id, name}`, this was 300 redundant SPI calls.
+  The result is now cached in per-statement thread-local `HashMap<String, i32>`
+  entries so repeated calls within the same `cypher()` invocation are free.
+
+  Note: `ensure_rel_type` is intentionally NOT cached.  Experiments showed that
+  caching rel-type lookups causes spurious `pg_amop_opr_fam_index` corruption in
+  the PostgreSQL shared buffer pool after prolonged TCK runs (root cause under
+  investigation).  Edge-type lookups are typically unique per query so the
+  omission has negligible performance impact.
+
+- **OPT-10 — per-label indexed-props cache for `index_node_insert`**
+  `index_node_insert` previously issued `SELECT prop_name FROM
+  prop_index_catalog WHERE label_name = $1` for every single node created.  For
+  a 100-node `UNWIND+CREATE` batch with no property index, this was 100
+  SPI calls that all returned empty results.  The result is now cached in a
+  per-statement thread-local `HashMap<String, Vec<String>>` keyed by label name.
+
+### Performance (v0.28.0 vs v0.27.0)
+
+| Metric | v0.27.0 | v0.28.0 | Change |
+|--------|---------|---------|--------|
+| Node insert throughput | 3 546 nodes/s | 4 782 nodes/s | +35% |
+| vs AGE node throughput | 0.48× AGE | 0.65× AGE | +35% |
+| IS-1 latency | 13.89 ms | 14.37 ms | ≈ same |
+| IS-3 latency | 14.23 ms | 15.82 ms | ≈ same |
+
+Both LDBC pass gates continue to hold:
+- IS-1: 14.37 ms ≤ 2× 14.20 ms AGE → **PASS**
+- IS-3: 15.82 ms vs 232.15 ms AGE → **14.68× faster — PASS**
+
+### Schema version
+
+No catalog changes.  `Cargo.toml` and `pg_eddy.control` remain at **0.11.0**.
+This release is tagged `v0.28.0` in git but carries no SQL migration file.
 
 ---
 

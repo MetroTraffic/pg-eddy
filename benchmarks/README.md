@@ -583,3 +583,48 @@ No regressions from v0.26.0. IS-1/IS-3 results are within normal dev-container v
 The join order optimizer targets multi-hop MATCH patterns; IS-1 (single-node lookup) and
 IS-3 (1-hop expand) are not significantly affected as they contain no CrossProduct nodes.
 
+---
+
+## v0.28.0 LDBC IS-1/IS-3 Benchmark (2026-05-14)
+
+### Environment
+
+| Field | Value |
+|---|---|
+| Date | 2026-05-14 |
+| Hardware | dev container (Debian 11) |
+| PostgreSQL version | 18.3 |
+| pg_eddy version | 0.28.0 (OPT-7 label/prop-key caches, OPT-10 indexed-props cache) |
+| Apache AGE version | 1.7.0-rc0 |
+| `shared_buffers` | 256 MB |
+| `synchronous_commit` | off |
+| Dataset | 1 000 nodes / 5 000 edges (LDBC SNB–like random graph) |
+| Build | **release** (`cargo pgrx install --release --features pg18`) |
+
+### Key changes vs v0.27.0
+
+- **OPT-7**: thread-local `HashMap<String, i32>` caches for `ensure_label` and
+  `ensure_prop_key` — eliminates redundant `INSERT … ON CONFLICT … RETURNING` SPI
+  calls on repeated label/prop-key lookups within the same `cypher()` statement.
+- **OPT-10**: per-label indexed-props cache in `index_node_insert` — eliminates
+  repeated `SELECT prop_name FROM prop_index_catalog WHERE label_name = $1` calls
+  for nodes with the same label.
+
+### Results
+
+| Benchmark | pg_eddy | AGE | Ratio |
+|---|---|---|---|
+| Node insert (nodes/s, UNWIND+CREATE) | 4 782 | 7 392 | 0.65× |
+| Edge load (edges/s) | 9 123 (SQL API) | 525 (UNWIND+MATCH) | N/A (diff API) |
+| IS-1: node lookup + index (ms/query) | 14.37 ms | 14.20 ms | **1.01× (PASS ≤2×)** |
+| IS-3: 1-hop expand (ms/query) | 15.82 ms | 232.15 ms | **0.07× (14.68× faster, PASS)** |
+
+### Gate decision
+
+**IS-1 gate (pg_eddy ≤ 2× AGE latency with property index)**: ✅ **PASS — 1.01×**
+
+**IS-3 gate (pg_eddy ≤ 0.5× AGE on graph traversal)**: ✅ **PASS — 14.68× faster than AGE**
+
+Node insert throughput improved **35%** vs v0.27.0 (3 546 → 4 782 nodes/s), lifting
+pg_eddy from 0.48× to 0.65× of AGE. Both pass gates hold.
+

@@ -2241,7 +2241,26 @@ no regressions on LDBC IS-1/IS-3.
 
 ---
 
-**v0.28.0 — Production Readiness** (formerly v0.27.0):
+**v0.28.0 — Node Insert Throughput (OPT-7 + OPT-10)**
+
+- [x] **OPT-7**: thread-local `HashMap<String, i32>` caches for `ensure_label`
+      and `ensure_prop_key` — eliminates redundant `INSERT … ON CONFLICT
+      … RETURNING` SPI calls on repeated lookups within the same `cypher()`
+      statement.  For a 100-node `UNWIND+CREATE` batch with 2 properties, this
+      eliminates ~200 redundant SPI calls.
+      Note: `ensure_rel_type` is intentionally NOT cached; caching it causes
+      spurious `pg_amop_opr_fam_index` buffer corruption after ~111 TCK tests
+      (root cause under investigation).
+- [x] **OPT-10**: per-label indexed-props cache in `index_node_insert` —
+      eliminates `SELECT prop_name FROM prop_index_catalog WHERE label_name =
+      $1` for every node in a batch (100 SPI calls → 1 per distinct label).
+
+**Outcome**: Node insert throughput improved 35% (3 546 → 4 782 nodes/s,
+0.48× → 0.65× of AGE). Both LDBC pass gates hold (IS-1: 1.01×, IS-3: 14.68×).
+
+---
+
+**v0.29.0 — Production Readiness** (formerly v0.28.0, formerly v0.27.0):
 
 - [ ] LDBC SNB IS-1 through IS-7 and IC-1 through IC-14 benchmarked in full
       (extending the v0.12.x IS-1/IS-3 baseline to the complete suite);
