@@ -12,6 +12,7 @@ use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Offset, Timelike};
 use chrono_tz::Tz;
 use pgrx::prelude::*;
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 /// A row of bindings: variable name → Value.
 pub type Row = HashMap<String, Value>;
@@ -2555,18 +2556,19 @@ pub fn execute(
         LogicalPlan::SingleRow => {
             Ok(vec![HashMap::new()])
         }
-        LogicalPlan::LabelScan { variable, label, inline_props, optional } => {
-            exec_label_scan(variable, label.as_deref(), inline_props, *optional, params)
+        LogicalPlan::LabelScan { variable, label, inline_props, optional, needed_props } => {
+            exec_label_scan(variable, label.as_deref(), inline_props, *optional, needed_props.as_ref(), params)
         }
         LogicalPlan::Expand {
             input, src_var, rel_var, dst_var,
             rel_types, direction, rel_props,
             dst_labels, dst_props, optional,
+            needed_dst_props,
         } => {
             exec_expand(
                 input, src_var, rel_var.as_deref(), dst_var,
                 rel_types, *direction, rel_props, dst_labels, dst_props,
-                *optional, params,
+                *optional, needed_dst_props.as_ref(), params,
             )
         }
         LogicalPlan::CrossProduct { left, right } => {
@@ -2709,9 +2711,10 @@ fn exec_label_scan(
     label: Option<&str>,
     inline_props: &[(String, Expr)],
     optional: bool,
+    needed_props: Option<&HashSet<String>>,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<Vec<Row>, ExecError> {
-    use crate::catalog::labels::{label_name, label_id_by_name, prop_key_name};
+    use crate::catalog::labels::{label_name, label_id_by_name, prop_key_name, prop_key_id_by_name};
     use crate::storage::prop_store;
 
     // Get candidate node IDs.
@@ -2756,6 +2759,11 @@ fn exec_label_scan(
         }
     };
 
+    // OPT-4: resolve needed property names to key_ids for selective decoding.
+    let wanted_key_ids: Option<std::collections::HashSet<i32>> = needed_props.map(|names| {
+        names.iter().filter_map(|n| prop_key_id_by_name(n)).collect()
+    });
+
     let mut rows = Vec::new();
 
     for nid in node_ids {
@@ -2768,8 +2776,13 @@ fn exec_label_scan(
         };
 
         if let Some(mut r) = record {
-            // Resolve overflow properties.
-            if r.overflow_blkno != 0 && r.prop_bytes.is_empty() {
+            // Resolve overflow properties only if we need them (OPT-4).
+            // When no properties are needed (empty wanted set, no inline filters),
+            // skip overflow entirely.
+            let skip_overflow = wanted_key_ids.as_ref().is_some_and(|wk| wk.is_empty())
+                && inline_props.is_empty();
+
+            if !skip_overflow && r.overflow_blkno != 0 && r.prop_bytes.is_empty() {
                 r.prop_bytes = unsafe {
                     let rel = crate::open_nodes_relation();
                     let bytes = crate::storage::node_store::read_overflow_block(rel, r.overflow_blkno);
@@ -2779,7 +2792,13 @@ fn exec_label_scan(
             }
 
             let labels: Vec<String> = r.label_ids.iter().map(|id| label_name(*id)).collect();
-            let properties = prop_store::decode(&r.prop_bytes, prop_key_name);
+
+            // OPT-4: selective property decode.
+            let properties = if let Some(ref wk) = wanted_key_ids {
+                prop_store::decode_selected(&r.prop_bytes, wk, prop_key_name)
+            } else {
+                prop_store::decode(&r.prop_bytes, prop_key_name)
+            };
 
             let val = Value::Node {
                 node_id: nid,
@@ -2948,9 +2967,10 @@ fn exec_expand(
     dst_labels: &[String],
     dst_props: &[(String, Expr)],
     optional: bool,
+    needed_dst_props: Option<&HashSet<String>>,
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<Vec<Row>, ExecError> {
-    use crate::catalog::labels::{ensure_rel_type, label_name, prop_key_name, rel_type_name, label_id_by_name};
+    use crate::catalog::labels::{ensure_rel_type, label_name, prop_key_name, rel_type_name, label_id_by_name, prop_key_id_by_name};
     use crate::storage::edge_store::{Direction, adjacency_follow};
     use crate::storage::prop_store;
 
@@ -3000,6 +3020,22 @@ fn exec_expand(
             pgrx::pg_sys::GetActiveSnapshot(),
         )
     };
+
+    // OPT-4: resolve needed destination-property names to key_ids for
+    // selective decoding.  If all properties are needed (None), fall back to
+    // full decode.
+    let wanted_key_ids: Option<std::collections::HashSet<i32>> = needed_dst_props.map(|names| {
+        names.iter().filter_map(|n| prop_key_id_by_name(n)).collect()
+    });
+
+    // Node materialization cache: avoids re-reading and re-decoding the same
+    // destination node when it appears as the target of multiple edges.
+    // The cached value is `None` if the node was not visible, or was filtered
+    // out by label/property checks — subsequent hits skip immediately.
+    let mut dst_node_cache: HashMap<i64, Option<(Value, bool)>> = HashMap::new();
+    // `bool` in the cache entry = true if dst_props inline filter passed (to
+    // avoid re-evaluating the filter on cache hits, since the filter is
+    // deterministic within one exec_expand with fixed dst_props).
 
     for input_row in &input_rows {
         // Look up the source variable in the row, or fall back to params (for correlated subqueries
@@ -3062,57 +3098,87 @@ fn exec_expand(
                 }
             };
 
-            // Load the destination node (using the relation opened once per exec_expand).
-            let dst_record = unsafe {
-                crate::storage::node_store::find_node_by_id(expand_node_rel, other_id, expand_snapshot)
-            };
-
-            let dst_record = match dst_record {
-                Some(r) => r,
-                None => continue, // invisible or deleted
-            };
-
-            // Label filter on destination BEFORE overflow resolution:
-            // skip the I/O cost of reading overflow pages for nodes that don't
-            // match the required label set.
-            let mut dst_r = dst_record;
-            if !dst_label_ids.is_empty() {
-                let has_all = dst_label_ids.iter().all(|lid| dst_r.label_ids.contains(lid));
-                if !has_all {
-                    continue;
+            // -----------------------------------------------------------
+            // Node materialization cache: if we've already read and
+            // processed this destination node, reuse the cached result.
+            // -----------------------------------------------------------
+            let (dst_val, dst_props_ok) = if let Some(cached) = dst_node_cache.get(&other_id) {
+                match cached {
+                    Some((val, props_ok)) => (val.clone(), *props_ok),
+                    None => continue, // previously filtered out / invisible
                 }
-            }
-
-            // Resolve overflow props only now (after label filter passes).
-            if dst_r.overflow_blkno != 0 && dst_r.prop_bytes.is_empty() {
-                dst_r.prop_bytes = unsafe {
-                    crate::storage::node_store::read_overflow_block(expand_node_rel, dst_r.overflow_blkno)
+            } else {
+                // Cache miss — read, filter, decode, then cache.
+                let dst_record = unsafe {
+                    crate::storage::node_store::find_node_by_id(expand_node_rel, other_id, expand_snapshot)
                 };
-            }
 
-            let dst_labels_resolved: Vec<String> = dst_r.label_ids.iter().map(|id| label_name(*id)).collect();
-            let dst_properties = prop_store::decode(&dst_r.prop_bytes, prop_key_name);
+                let dst_record = match dst_record {
+                    Some(r) => r,
+                    None => {
+                        dst_node_cache.insert(other_id, None);
+                        continue;
+                    }
+                };
 
-            let dst_val = Value::Node {
-                node_id: other_id,
-                labels: dst_labels_resolved,
-                properties: dst_properties,
-            };
-
-            // Destination inline property filter.
-            if !dst_props.is_empty() {
-                let mut matches = true;
-                for (key, expr) in dst_props {
-                    let prop_val = dst_val.get_property(key);
-                    let expected = eval_expr(expr, input_row, params)?;
-                    if !values_equal(&prop_val, &expected) {
-                        matches = false;
-                        break;
+                // Label filter BEFORE overflow resolution.
+                let mut dst_r = dst_record;
+                if !dst_label_ids.is_empty() {
+                    let has_all = dst_label_ids.iter().all(|lid| dst_r.label_ids.contains(lid));
+                    if !has_all {
+                        dst_node_cache.insert(other_id, None);
+                        continue;
                     }
                 }
-                if !matches {
+
+                // Resolve overflow props only now (after label filter passes).
+                if dst_r.overflow_blkno != 0 && dst_r.prop_bytes.is_empty() {
+                    dst_r.prop_bytes = unsafe {
+                        crate::storage::node_store::read_overflow_block(expand_node_rel, dst_r.overflow_blkno)
+                    };
+                }
+
+                let dst_labels_resolved: Vec<String> = dst_r.label_ids.iter().map(|id| label_name(*id)).collect();
+
+                // OPT-4: selective property decode when the planner knows
+                // which properties are needed downstream.
+                let dst_properties = if let Some(ref wk) = wanted_key_ids {
+                    prop_store::decode_selected(&dst_r.prop_bytes, wk, prop_key_name)
+                } else {
+                    prop_store::decode(&dst_r.prop_bytes, prop_key_name)
+                };
+
+                let val = Value::Node {
+                    node_id: other_id,
+                    labels: dst_labels_resolved,
+                    properties: dst_properties,
+                };
+
+                // Destination inline property filter.
+                let mut props_ok = true;
+                if !dst_props.is_empty() {
+                    for (key, expr) in dst_props {
+                        let prop_val = val.get_property(key);
+                        let expected = eval_expr(expr, input_row, params)?;
+                        if !values_equal(&prop_val, &expected) {
+                            props_ok = false;
+                            break;
+                        }
+                    }
+                }
+
+                if !props_ok {
+                    dst_node_cache.insert(other_id, None);
                     continue;
                 }
+
+                dst_node_cache.insert(other_id, Some((val.clone(), props_ok)));
+                (val, props_ok)
+            };
+
+            // Skip if inline dst_props filter failed (only possible from cache path).
+            if !dst_props_ok {
+                continue;
             }
 
             // Build edge value.

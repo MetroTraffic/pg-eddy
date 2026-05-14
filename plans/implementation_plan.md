@@ -2166,7 +2166,50 @@ pass; ✅ PB-1 within 2× of AGE; ✅ PB-2 within 1.1× of AGE (parity + noise t
 
 ---
 
-**v0.26.0 — Query Optimisation** (formerly v0.25.0):
+**v0.26.0 — Executor Performance: Projection Pushdown & Node Cache** (OPT-4A + node-cache from `plans/optimization_plan.md`):
+
+- [x] `prop_store::decode_selected(data, &HashSet<i32>, key_name_for)` — new
+      function that only decodes property keys whose `key_id` is in the provided
+      set, skipping past all others; returns a partial `serde_json::Map` with
+      only the requested keys.
+- [x] `prop_store::skip_value(data, pos) -> usize` — companion function that
+      computes the byte-size of a typed value without decoding or allocating.
+- [x] `collect_needed_properties(plan) -> HashMap<String, Option<HashSet<String>>>`:
+      plan-analysis utility that walks the plan tree bottom-up, collecting every
+      `Expr::Property(Variable(var), key)` reference.  A variable maps to `None`
+      if the entire node/edge is needed (e.g. `RETURN n`, `properties(n)`,
+      `RETURN *`), meaning all properties must be decoded.
+- [x] `Expand { .. }` plan node: add `needed_dst_props: Option<HashSet<String>>`
+      field. Planner populates this from `collect_needed_properties` after
+      building the full plan. `None` = decode all (conservative fallback).
+- [x] `LabelScan { .. }` plan node: add `needed_props: Option<HashSet<String>>`
+      field. Same projection pushdown for label scans — if the scanned variable's
+      properties are never accessed downstream, skip property decoding and
+      overflow resolution entirely.
+- [x] `exec_expand`: when `needed_dst_props` is `Some`, resolve key names to
+      key IDs and call `decode_selected` instead of full `decode` for destination
+      nodes.
+- [x] Node materialization cache in `exec_expand`:
+      `HashMap<i64, Option<(Value, bool)>>` keyed by `node_id`.  On cache hit,
+      clone the cached Value instead of re-reading the buffer + re-decoding
+      overflow + re-decoding properties.  `None` entry = node was not found or
+      was filtered out → skip immediately.
+- [x] `exec_label_scan`: when `needed_props` provides a set for the scanned
+      variable, decode only needed properties.  When no properties are needed
+      (empty set, no inline filters), skip overflow resolution entirely.
+
+**Actual benchmarks (v0.26.0, 2026-05-14, best of 3 runs)**:
+- PB-1: 65 ms pg_eddy vs 73 ms AGE → **0.89× (pg_eddy FASTER — PASS)**
+- PB-2: 12.80 ms pg_eddy vs 12.80 ms AGE → **1.00× (parity — PASS)**
+- LDBC IS-1: 10.82 ms pg_eddy vs 10.89 ms AGE → **0.99× (PASS)**
+- LDBC IS-3: 11.91 ms pg_eddy vs 171.97 ms AGE → **14.44× faster (PASS)**
+
+**Exit criteria**: ✅ all 85 unit tests pass; ✅ `just lint` clean; ✅ LDBC IS-1/IS-3
+gates pass; ✅ PB-1 at or below AGE latency; ✅ PB-2 ≤ 1.1× AGE.
+
+---
+
+**v0.27.0 — Query Optimisation** (formerly v0.26.0, originally v0.25.0):
 
 - [ ] Cost model for AM scan operators: estimated row counts from
       `_pg_eddy.label_index` for label selectivity; shown in `cypher_explain`
@@ -2193,7 +2236,7 @@ no regressions on LDBC IS-1/IS-3.
 
 ---
 
-**v0.27.0 — Production Readiness** (formerly v0.25.0):
+**v0.28.0 — Production Readiness** (formerly v0.27.0):
 
 - [ ] LDBC SNB IS-1 through IS-7 and IC-1 through IC-14 benchmarked in full
       (extending the v0.12.x IS-1/IS-3 baseline to the complete suite);

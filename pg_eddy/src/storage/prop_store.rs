@@ -148,6 +148,88 @@ where
     map
 }
 
+/// Decode only the properties whose `key_id` is in `wanted_keys`, skipping
+/// all others without allocating strings or JSON values for them.
+///
+/// When the set of needed properties is known at plan time (projection
+/// pushdown / OPT-4), this avoids decoding properties that will never be
+/// accessed, saving both CPU and allocation overhead.
+pub fn decode_selected<F>(
+    data: &[u8],
+    wanted_keys: &std::collections::HashSet<i32>,
+    mut key_name_for: F,
+) -> serde_json::Map<String, Json>
+where
+    F: FnMut(i32) -> String,
+{
+    let mut map = serde_json::Map::new();
+    let mut pos = 0usize;
+    while pos + 5 <= data.len() {
+        let kid = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or([0; 4]));
+        pos += 4;
+        if wanted_keys.contains(&kid) {
+            let (value, consumed) = decode_value(data, pos);
+            pos += consumed;
+            map.insert(key_name_for(kid), value);
+        } else {
+            // Skip past the value bytes without decoding.
+            let skipped = skip_value(data, pos);
+            pos += skipped;
+        }
+    }
+    map
+}
+
+/// Compute the number of bytes occupied by a typed value starting at `pos`
+/// without allocating or decoding it.  Used by `decode_selected` to skip
+/// properties that are not in the projection set.
+fn skip_value(data: &[u8], pos: usize) -> usize {
+    if pos >= data.len() {
+        return 0;
+    }
+    let tag = data[pos];
+    let rest = pos + 1;
+    match tag {
+        TAG_NULL => 1,
+        TAG_BOOL => 2,
+        TAG_INTEGER | TAG_FLOAT | TAG_LOCALDATETIME => 9,
+        TAG_DATE => 5,
+        TAG_DURATION => 17,
+        TAG_STR_SHORT if rest < data.len() => {
+            let len = data[rest] as usize;
+            2 + len
+        }
+        TAG_STR_LONG if rest + 4 <= data.len() => {
+            let len = u32::from_le_bytes(data[rest..rest + 4].try_into().unwrap()) as usize;
+            5 + len
+        }
+        TAG_LIST if rest + 4 <= data.len() => {
+            let count = u32::from_le_bytes(data[rest..rest + 4].try_into().unwrap()) as usize;
+            let mut inner = rest + 4;
+            for _ in 0..count {
+                let s = skip_value(data, inner);
+                if s == 0 { break; }
+                inner += s;
+            }
+            inner - pos
+        }
+        TAG_MAP if rest + 4 <= data.len() => {
+            let count = u32::from_le_bytes(data[rest..rest + 4].try_into().unwrap()) as usize;
+            let mut inner = rest + 4;
+            for _ in 0..count {
+                let ks = skip_value(data, inner);
+                if ks == 0 { break; }
+                inner += ks;
+                let vs = skip_value(data, inner);
+                if vs == 0 { break; }
+                inner += vs;
+            }
+            inner - pos
+        }
+        _ => 1,
+    }
+}
+
 /// Decode a single typed value from `data` starting at `pos`.
 /// Returns `(value, bytes_consumed)`.
 pub fn decode_value(data: &[u8], pos: usize) -> (Json, usize) {

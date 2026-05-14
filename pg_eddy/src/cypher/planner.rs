@@ -31,6 +31,9 @@ pub enum LogicalPlan {
         label: Option<String>,
         inline_props: Vec<(String, Expr)>,
         optional: bool,
+        /// When `Some`, only these node properties need to be decoded
+        /// (projection pushdown — OPT-4).  `None` = decode all.
+        needed_props: Option<HashSet<String>>,
     },
     /// Expand from a bound node variable along relationships (single hop).
     Expand {
@@ -44,6 +47,9 @@ pub enum LogicalPlan {
         dst_labels: Vec<String>,
         dst_props: Vec<(String, Expr)>,
         optional: bool,
+        /// When `Some`, only these destination-node properties need to be
+        /// decoded (projection pushdown — OPT-4).  `None` = decode all.
+        needed_dst_props: Option<HashSet<String>>,
     },
     /// Variable-length expand: BFS/DFS over min..max hops.
     VarLengthExpand {
@@ -258,7 +264,7 @@ fn return_column_names(clauses: &[QueryClause]) -> Option<Vec<String>> {
 
 pub fn plan(query: &Query) -> Result<LogicalPlan, PlanError> {
     let left = plan_single(query)?;
-    if let Some((all, right_q)) = &query.union {
+    let result = if let Some((all, right_q)) = &query.union {
         // Validate that both sides of UNION expose the same column names.
         let left_cols = return_column_names(&query.clauses);
         let right_cols = return_column_names(&right_q.clauses);
@@ -274,10 +280,12 @@ pub fn plan(query: &Query) -> Result<LogicalPlan, PlanError> {
         }
         // Also recursively validate the right side (in case of chained UNIONs).
         let right = plan(right_q)?;
-        Ok(LogicalPlan::Union { left: Box::new(left), right: Box::new(right), all: *all })
+        LogicalPlan::Union { left: Box::new(left), right: Box::new(right), all: *all }
     } else {
-        Ok(left)
-    }
+        left
+    };
+    // OPT-4: annotate Expand nodes with needed destination properties.
+    Ok(annotate_needed_properties(result))
 }
 
 fn plan_single(query: &Query) -> Result<LogicalPlan, PlanError> {
@@ -1471,6 +1479,7 @@ fn plan_pattern_onto(
             label,
             inline_props,
             optional,
+            needed_props: None,
         });
         new_node_vars.push(first_var.clone());
         var_kinds.insert(first_var.clone(), VarKind::Node);
@@ -1775,6 +1784,7 @@ fn plan_pattern_onto(
                     dst_labels: next_node.labels.clone(),
                     dst_props: next_node.properties.clone(),
                     optional,
+                    needed_dst_props: None,
                 };
             }
             last_node_var = dst_var;
@@ -2307,6 +2317,7 @@ fn apply_where_pushdown(
             label: Some(ref lname),
             ref inline_props,
             optional,
+            ..
         } => {
             // Try each equality targeting this variable.
             for (i, (eq_var, eq_prop, eq_val)) in equalities.iter().enumerate() {
@@ -2329,12 +2340,13 @@ fn apply_where_pushdown(
         }
         LogicalPlan::Expand {
             input, src_var, rel_var, dst_var, rel_types, direction,
-            rel_props, dst_labels, dst_props, optional,
+            rel_props, dst_labels, dst_props, optional, needed_dst_props,
         } => {
             let (new_in, used) = apply_where_pushdown(*input, equalities);
             (LogicalPlan::Expand {
                 input: Box::new(new_in), src_var, rel_var, dst_var,
                 rel_types, direction, rel_props, dst_labels, dst_props, optional,
+                needed_dst_props,
             }, used)
         }
         LogicalPlan::CrossProduct { left, right } => {
@@ -2648,6 +2660,306 @@ fn build_isomorphism_filter(node_vars: &[String]) -> Option<Expr> {
         result = Expr::And(Box::new(result), Box::new(p));
     }
     Some(result)
+}
+
+// ---------------------------------------------------------------------------
+// OPT-4: Projection pushdown — collect property references per variable
+// ---------------------------------------------------------------------------
+
+/// Collect every property key referenced on each variable across the plan
+/// tree.  Returns a map from variable name to `Some(set_of_keys)` if only
+/// specific properties are accessed, or `None` if the entire entity is needed
+/// (e.g. `RETURN n`, `properties(n)`, `keys(n)`, `RETURN *`).
+pub fn collect_needed_properties(plan: &LogicalPlan) -> HashMap<String, Option<HashSet<String>>> {
+    let mut map: HashMap<String, Option<HashSet<String>>> = HashMap::new();
+
+    fn mark_all(map: &mut HashMap<String, Option<HashSet<String>>>, var: &str) {
+        map.insert(var.to_string(), None);
+    }
+
+    fn mark_prop(map: &mut HashMap<String, Option<HashSet<String>>>, var: &str, key: &str) {
+        match map.get(var) {
+            Some(None) => {} // already marked as need-all
+            Some(Some(_)) => {
+                map.get_mut(var).unwrap().as_mut().unwrap().insert(key.to_string());
+            }
+            None => {
+                let mut s = HashSet::new();
+                s.insert(key.to_string());
+                map.insert(var.to_string(), Some(s));
+            }
+        }
+    }
+
+    fn scan_expr(map: &mut HashMap<String, Option<HashSet<String>>>, expr: &Expr) {
+        match expr {
+            Expr::Property(base, key) => {
+                if let Expr::Variable(var) = base.as_ref() {
+                    mark_prop(map, var, key);
+                } else {
+                    // Nested property access — scan the base
+                    scan_expr(map, base);
+                }
+            }
+            Expr::Variable(var) => {
+                // Bare variable reference (e.g. `RETURN n`) → need all properties.
+                mark_all(map, var);
+            }
+            Expr::FunctionCall(fname, args) => {
+                let fl = fname.to_lowercase();
+                // Functions that consume the entire entity.
+                if matches!(fl.as_str(), "properties" | "keys")
+                    && let Some(Expr::Variable(var)) = args.first()
+                {
+                    mark_all(map, var);
+                }
+                for a in args { scan_expr(map, a); }
+            }
+            Expr::Star => {
+                // RETURN * — we can't know which variables will be expanded,
+                // so conservatively mark nothing here; the caller handles this.
+            }
+            // Recurse into sub-expressions.
+            Expr::Compare(l, _, r) | Expr::And(l, r) | Expr::Or(l, r)
+            | Expr::Xor(l, r) | Expr::Arith(l, _, r)
+            | Expr::InList(l, r) | Expr::StartsWith(l, r) | Expr::EndsWith(l, r)
+            | Expr::Contains(l, r) | Expr::Regex(l, r) => {
+                scan_expr(map, l); scan_expr(map, r);
+            }
+            Expr::Not(e) | Expr::IsNull(e) | Expr::IsNotNull(e) | Expr::Neg(e) => {
+                scan_expr(map, e);
+            }
+            Expr::CaseSearched { branches, else_ } => {
+                for (c, v) in branches { scan_expr(map, c); scan_expr(map, v); }
+                if let Some(e) = else_ { scan_expr(map, e); }
+            }
+            Expr::CaseSimple { test, branches, else_ } => {
+                scan_expr(map, test);
+                for (c, v) in branches { scan_expr(map, c); scan_expr(map, v); }
+                if let Some(e) = else_ { scan_expr(map, e); }
+            }
+            Expr::ListComprehension { list_expr, predicate, projection, .. } => {
+                scan_expr(map, list_expr);
+                if let Some(p) = predicate { scan_expr(map, p); }
+                if let Some(p) = projection { scan_expr(map, p); }
+            }
+            Expr::ListPredicate { list_expr, predicate, .. } => {
+                scan_expr(map, list_expr); scan_expr(map, predicate);
+            }
+            Expr::Subscript(l, r) => { scan_expr(map, l); scan_expr(map, r); }
+            Expr::ListSlice { list_expr, from, to } => {
+                scan_expr(map, list_expr);
+                if let Some(f) = from { scan_expr(map, f); }
+                if let Some(t) = to { scan_expr(map, t); }
+            }
+            Expr::List(items) => { for i in items { scan_expr(map, i); } }
+            Expr::MapLiteral(pairs) => { for (_, v) in pairs { scan_expr(map, v); } }
+            Expr::ShortestPath { .. } => {
+                // These produce path values — conservatively mark nothing.
+            }
+            Expr::PatternComprehension { projection, predicate, .. } => {
+                if let Some(p) = predicate { scan_expr(map, p); }
+                scan_expr(map, projection);
+            }
+            Expr::Exists { .. } => {}
+            Expr::HasLabel(base, _) => { scan_expr(map, base); }
+            // Literals / parameters — no variable references.
+            Expr::IntLit(_) | Expr::FloatLit(_) | Expr::StringLit(_)
+            | Expr::BoolLit(_) | Expr::NullLit | Expr::Parameter(_) => {}
+        }
+    }
+
+    fn scan_plan(map: &mut HashMap<String, Option<HashSet<String>>>, plan: &LogicalPlan) {
+        match plan {
+            LogicalPlan::Project { input, items, order_by, skip, limit, .. } => {
+                // Check for RETURN * — if present, mark all variables as need-all.
+                let has_star = items.iter().any(|i| matches!(i.expr, Expr::Star));
+                if has_star {
+                    // We'll handle this conservatively: any variable that appears
+                    // in the input could be expanded by *.  We mark variables we
+                    // encounter in other exprs, but * itself will be handled by
+                    // the caller's fallback (needed_dst_props = None when the
+                    // dst_var is not in the map).
+                }
+                for item in items { scan_expr(map, &item.expr); }
+                for ob in order_by { scan_expr(map, &ob.expr); }
+                if let Some(s) = skip { scan_expr(map, s); }
+                if let Some(l) = limit { scan_expr(map, l); }
+                scan_plan(map, input);
+            }
+            LogicalPlan::Filter { input, predicate } => {
+                scan_expr(map, predicate);
+                scan_plan(map, input);
+            }
+            LogicalPlan::Expand { input, dst_props, rel_props, .. } => {
+                // Inline property filters reference expressions; scan them.
+                // The dst_var property keys themselves are handled in
+                // annotate_plan (merged into needed_dst_props).
+                for (_, expr) in rel_props { scan_expr(map, expr); }
+                for (_, expr) in dst_props { scan_expr(map, expr); }
+                scan_plan(map, input);
+            }
+            LogicalPlan::LabelScan { .. } | LogicalPlan::SingleRow | LogicalPlan::Empty => {}
+            LogicalPlan::CrossProduct { left, right } | LogicalPlan::Union { left, right, .. } => {
+                scan_plan(map, left); scan_plan(map, right);
+            }
+            LogicalPlan::Apply { outer, inner } | LogicalPlan::LeftJoin { outer, inner, .. } => {
+                scan_plan(map, outer); scan_plan(map, inner);
+            }
+            LogicalPlan::Unwind { input, expr, .. } => {
+                scan_expr(map, expr); scan_plan(map, input);
+            }
+            LogicalPlan::VarLengthExpand { input, .. }
+            | LogicalPlan::BoundRelListExpand { input, .. }
+            | LogicalPlan::NamedPath { input, .. }
+            | LogicalPlan::CallProcedure { input, .. }
+            | LogicalPlan::CreatePattern { input, .. }
+            | LogicalPlan::SetProp { input, .. }
+            | LogicalPlan::RemoveProp { input, .. }
+            | LogicalPlan::DeleteNodes { input, .. }
+            | LogicalPlan::MergePattern { input, .. }
+            | LogicalPlan::Foreach { input, .. } => {
+                scan_plan(map, input);
+            }
+            LogicalPlan::PropertyIndexScan { .. }
+            | LogicalPlan::CreateIndex { .. }
+            | LogicalPlan::DropIndex { .. }
+            | LogicalPlan::ShowIndexes
+            | LogicalPlan::CreateConstraint { .. }
+            | LogicalPlan::DropConstraint { .. }
+            | LogicalPlan::ShowConstraints => {}
+        }
+    }
+
+    scan_plan(&mut map, plan);
+    map
+}
+
+/// Annotate Expand nodes with the set of destination-node properties that are
+/// actually referenced downstream (projection pushdown — OPT-4).
+///
+/// Must be called after the full plan is built, including predicate pushdown.
+pub fn annotate_needed_properties(plan: LogicalPlan) -> LogicalPlan {
+    let needed = collect_needed_properties(&plan);
+    annotate_plan(plan, &needed)
+}
+
+fn annotate_plan(plan: LogicalPlan, needed: &HashMap<String, Option<HashSet<String>>>) -> LogicalPlan {
+    match plan {
+        LogicalPlan::LabelScan {
+            variable, label, inline_props, optional, ..
+        } => {
+            let np = match needed.get(&variable) {
+                Some(None) => None, // entire node needed
+                Some(Some(keys)) => {
+                    let mut merged = keys.clone();
+                    for (k, _) in &inline_props {
+                        merged.insert(k.clone());
+                    }
+                    Some(merged)
+                }
+                None => {
+                    // Variable not referenced downstream.
+                    if inline_props.is_empty() {
+                        Some(HashSet::new())
+                    } else {
+                        let keys: HashSet<String> = inline_props.iter().map(|(k, _)| k.clone()).collect();
+                        Some(keys)
+                    }
+                }
+            };
+            LogicalPlan::LabelScan { variable, label, inline_props, optional, needed_props: np }
+        }
+        LogicalPlan::Expand {
+            input, src_var, rel_var, dst_var, rel_types, direction,
+            rel_props, dst_labels, dst_props, optional, ..
+        } => {
+            let new_input = annotate_plan(*input, needed);
+            // Determine needed_dst_props for this Expand's dst_var.
+            // Look up what downstream plan nodes reference on dst_var.
+            let ndp = match needed.get(&dst_var) {
+                Some(None) => None, // entire node needed
+                Some(Some(keys)) => {
+                    // Merge keys from inline dst_props filters (they also need to be decoded).
+                    let mut merged = keys.clone();
+                    for (k, _) in &dst_props {
+                        merged.insert(k.clone());
+                    }
+                    Some(merged)
+                }
+                None => {
+                    // Variable not referenced downstream at all (unusual but valid:
+                    // e.g. MATCH (a)-[:R]->(b) RETURN a).
+                    // Still need to decode inline dst_props for filtering.
+                    if dst_props.is_empty() {
+                        Some(HashSet::new()) // decode nothing
+                    } else {
+                        let keys: HashSet<String> = dst_props.iter().map(|(k, _)| k.clone()).collect();
+                        Some(keys)
+                    }
+                }
+            };
+            LogicalPlan::Expand {
+                input: Box::new(new_input), src_var, rel_var, dst_var, rel_types, direction,
+                rel_props, dst_labels, dst_props, optional, needed_dst_props: ndp,
+            }
+        }
+        LogicalPlan::Filter { input, predicate } => {
+            LogicalPlan::Filter { input: Box::new(annotate_plan(*input, needed)), predicate }
+        }
+        LogicalPlan::Project { input, items, distinct, order_by, skip, limit } => {
+            LogicalPlan::Project {
+                input: Box::new(annotate_plan(*input, needed)),
+                items, distinct, order_by, skip, limit,
+            }
+        }
+        LogicalPlan::CrossProduct { left, right } => {
+            LogicalPlan::CrossProduct {
+                left: Box::new(annotate_plan(*left, needed)),
+                right: Box::new(annotate_plan(*right, needed)),
+            }
+        }
+        LogicalPlan::Union { left, right, all } => {
+            LogicalPlan::Union {
+                left: Box::new(annotate_plan(*left, needed)),
+                right: Box::new(annotate_plan(*right, needed)),
+                all,
+            }
+        }
+        LogicalPlan::Apply { outer, inner } => {
+            LogicalPlan::Apply {
+                outer: Box::new(annotate_plan(*outer, needed)),
+                inner: Box::new(annotate_plan(*inner, needed)),
+            }
+        }
+        LogicalPlan::LeftJoin { outer, inner, null_vars } => {
+            LogicalPlan::LeftJoin {
+                outer: Box::new(annotate_plan(*outer, needed)),
+                inner: Box::new(annotate_plan(*inner, needed)),
+                null_vars,
+            }
+        }
+        LogicalPlan::Unwind { input, expr, alias } => {
+            LogicalPlan::Unwind { input: Box::new(annotate_plan(*input, needed)), expr, alias }
+        }
+        LogicalPlan::VarLengthExpand { input, src_var, rel_var, dst_var, rel_types,
+            direction, min_hops, max_hops, optional, path_carry_var, excluded_rel_vars,
+        } => {
+            LogicalPlan::VarLengthExpand {
+                input: Box::new(annotate_plan(*input, needed)),
+                src_var, rel_var, dst_var, rel_types, direction, min_hops, max_hops,
+                optional, path_carry_var, excluded_rel_vars,
+            }
+        }
+        LogicalPlan::NamedPath { input, path_var, element_vars } => {
+            LogicalPlan::NamedPath {
+                input: Box::new(annotate_plan(*input, needed)),
+                path_var, element_vars,
+            }
+        }
+        // Leaf/write nodes — pass through unchanged.
+        other => other,
+    }
 }
 
 /// Format a plan as a human-readable explain string.

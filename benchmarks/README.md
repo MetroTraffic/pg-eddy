@@ -465,3 +465,72 @@ Script: `benchmarks/run_prop_benchmark.pl`
 - **PB-2 parity confirmed**: 0.95× vs AGE on 20 filtered 1-hop queries with 7-property decode,
   consistent with v0.24.0 (0.94×). OPT-1 does not regress PB-2.
 
+---
+
+## v0.26.0 Property-Rich Benchmark (2026-05-14)
+
+### Purpose
+
+Re-run after OPT-4A (projection pushdown) + node materialization cache. These
+optimizations target PB-1 by:
+1. Selectively decoding only the 3 properties referenced in RETURN (out of 7)
+2. Skipping property decode entirely for source nodes whose properties are never accessed
+3. Caching decoded destination nodes so the same node isn't re-read on repeat edges
+4. Skipping overflow page reads when zero properties are needed
+
+Script: `benchmarks/run_prop_benchmark.pl`
+
+### Environment
+
+| Field | Value |
+|---|---|
+| Date | 2026-05-14 |
+| Hardware | dev container (Debian 11) |
+| PostgreSQL version | 18.3 |
+| pg_eddy version | 0.26.0 (OPT-4A projection pushdown + node cache) |
+| Apache AGE version | 1.7.0-rc0 |
+| `shared_buffers` | 256 MB |
+| `synchronous_commit` | off |
+| Dataset | 2 000 nodes (7 props each) / 10 000 edges |
+| Build | **release** (`cargo pgrx install --release --features pg18`) |
+
+### Results (best of 3 runs)
+
+| Benchmark | pg_eddy | AGE | Ratio | vs v0.25.0 |
+|---|---|---|---|---|
+| Node insert (nodes/s, 7 props) | 1 796 | 5 687 | 0.32× | — |
+| PB-1: full-graph expand (10 000 rows, total) | 65 ms | 73 ms | **0.89× (FASTER — PASS)** | **37% faster** (was 103 ms) |
+| PB-2: 1-hop+props (ms/query) | 12.80 ms | 12.80 ms | **1.00× (parity — PASS)** | parity |
+| PB-3: 2-hop+props (ms/query) | 15.04 ms | N/A | — | — |
+
+### Gate decision
+
+**PB-1 gate (pg_eddy ≤ 2× AGE on full-graph expand)**: ✅ **PASS — 0.89× (pg_eddy FASTER than AGE)**
+
+**PB-2 gate (pg_eddy ≤ 1.1× AGE — parity +10% noise tolerance)**: ✅ **PASS — 1.00×**
+
+### Notes
+
+- **PB-1 breakthrough**: pg_eddy is now **faster than AGE** on full-graph expand with
+  7-property nodes. From 1 944 ms (v0.24.0, 15× slower) → 103 ms (v0.25.0, 1.27×) →
+  65 ms (v0.26.0, 0.89× — faster). Two releases, 30× total improvement.
+- **Three optimizations compound**: (1) Projection pushdown decodes only 3 of 7 destination
+  properties (43% of work); (2) LabelScan pushdown skips all 7 source properties (not
+  referenced in RETURN); (3) Node cache avoids re-reading ~8 000 duplicate destination nodes.
+- **Variance note**: On a shared dev container, PB-1 varies between 65–106 ms (pg_eddy)
+  and 70–115 ms (AGE). pg_eddy wins 2 of 3 runs. On dedicated hardware, both should be
+  more consistent.
+
+---
+
+## v0.26.0 LDBC IS-1/IS-3 Benchmark (2026-05-14)
+
+### Results
+
+| Benchmark | pg_eddy | AGE | Ratio |
+|---|---|---|---|
+| IS-1: node lookup + index (ms/query) | 10.82 ms | 10.89 ms | **0.99× (PASS ≤2×)** |
+| IS-3: 1-hop expand (ms/query) | 11.91 ms | 171.97 ms | **0.07× (14.44× faster, PASS)** |
+
+No regressions from v0.25.0. Both gates pass.
+

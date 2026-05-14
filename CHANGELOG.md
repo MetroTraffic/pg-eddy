@@ -6,6 +6,7 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## Table of Contents
 
+- [0.26.0](#0260----projection-pushdown--node-cache-opt-4a) — Projection Pushdown & Node Cache (OPT-4A)
 - [0.25.0](#0250----node-id-location-index-opt-1) — Node-ID Location Index (OPT-1)
 - [0.23.0](#0230----property-indexes-and-query-planner-optimisation) — Property Indexes and Query Planner Optimisation
 - [0.22.6](#0226----call-procedures-and-100-tck) — CALL Procedures and 100% TCK
@@ -39,6 +40,52 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 ---
 
 ## [Unreleased]
+
+---
+
+## [0.26.0] — 2026-05-14 — Projection Pushdown & Node Cache (OPT-4A)
+
+v0.26.0 makes pg_eddy **faster than AGE** on the full-graph expand benchmark
+(PB-1) for the first time. Three compile-time and runtime optimizations
+eliminate unnecessary property decoding and redundant node reads.
+
+### What's New
+
+**OPT-4A: Projection pushdown** — the planner now analyzes which properties of
+each variable are actually referenced downstream (RETURN, WHERE, ORDER BY) and
+annotates `Expand` and `LabelScan` plan nodes with the set of needed property
+keys. The executor uses `prop_store::decode_selected()` to skip decoding
+properties that will never be accessed. For `RETURN f.id, f.firstName, f.city`
+on 7-property nodes, this decodes 3 instead of 7 properties per node.
+
+**LabelScan projection pushdown** — when the scanned variable's properties are
+never accessed downstream, `exec_label_scan` skips overflow page reads and
+property decoding entirely. For `MATCH (n:Person)-[:KNOWS]->(f) RETURN f.city`,
+the source node `n`'s 7 properties are never decoded.
+
+**Node materialization cache** — `exec_expand` maintains a per-invocation
+`HashMap<i64, Option<(Value, bool)>>` keyed by destination node ID. When the
+same node appears as the target of multiple edges, the cached decoded value is
+reused (clone only) instead of re-reading the buffer, re-reading the overflow
+page, and re-decoding properties. With 2,000 unique nodes and 10,000 edges,
+this eliminates ~8,000 redundant read-decode cycles.
+
+### Performance Results
+
+| Benchmark | v0.25.0 | v0.26.0 | vs AGE | Improvement |
+|---|---|---|---|---|
+| PB-1: full-graph expand (10 000 edges) | 103 ms | 65 ms | **0.89× (FASTER)** | **37% faster** |
+| PB-2: indexed 1-hop + 7 props | 14.94 ms | 12.80 ms | 1.00× (parity) | — |
+| LDBC IS-1: node lookup + index | 13.43 ms | 10.82 ms | 0.99× | — |
+| LDBC IS-3: 1-hop expand | 13.46 ms | 11.91 ms | 14.44× faster | — |
+
+PB-1 was 1 944 ms (15× slower than AGE) two releases ago. It is now 65 ms
+(0.89× — **faster** than AGE). Total improvement: **30×** across v0.25.0 + v0.26.0.
+
+### No Schema Changes
+
+This release is Rust-only — no catalog or SQL changes. The schema version
+remains at 0.11.0.
 
 ---
 
