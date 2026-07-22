@@ -185,6 +185,7 @@ pub enum LogicalPlan {
     // -----------------------------------------------------------------------
     /// Use a property B-tree index to resolve nodes with `(n:Label {prop: value})`.
     /// The planner substitutes this for a LabelScan when an index is registered.
+    #[allow(dead_code)]
     PropertyIndexScan {
         variable: String,
         label: String,
@@ -2270,6 +2271,7 @@ fn try_property_index_scan(
 /// Returns `(equalities, remaining_expr)` where:
 /// - `equalities` is a Vec of `(variable, property_name, value_expr)` triples.
 /// - `remaining_expr` is the predicate with the extracted equalities removed.
+#[cfg(not(feature = "pg_test"))]
 fn extract_pushdown_equalities(expr: &Expr) -> (Vec<(String, String, Expr)>, Option<Expr>) {
     match expr {
         Expr::And(left, right) => {
@@ -2306,6 +2308,7 @@ fn extract_pushdown_equalities(expr: &Expr) -> (Vec<(String, String, Expr)>, Opt
 
 /// Returns true for expression types that are safe to push into an index scan:
 /// literals, query parameters, and NULL.
+#[cfg(not(feature = "pg_test"))]
 fn is_pushable_value(expr: &Expr) -> bool {
     matches!(
         expr,
@@ -3518,7 +3521,14 @@ pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
             let kind = if *all { "ALL" } else { "" };
             format!("{prefix}Union{kind}\n{l}\n{r}")
         }
-        LogicalPlan::PropertyIndexScan { variable, label, prop, label_id, key_id, .. } => {
+        LogicalPlan::PropertyIndexScan {
+            variable,
+            label,
+            prop,
+            label_id,
+            key_id,
+            ..
+        } => {
             // Cost estimate: count indexed entries for this (label, prop) pair.
             #[cfg(not(feature = "pg_test"))]
             let est_str = {
@@ -3526,7 +3536,10 @@ pub fn explain(plan: &LogicalPlan, indent: usize) -> String {
                 format!(" [est. {} rows]", n)
             };
             #[cfg(feature = "pg_test")]
-            let est_str = String::new();
+            let est_str = {
+                let _ = (label_id, key_id);
+                String::new()
+            };
             format!("{prefix}PropertyIndexScan({variable}:{label} [{prop}=?]){est_str}")
         }
         LogicalPlan::CreateIndex { label, prop } => {

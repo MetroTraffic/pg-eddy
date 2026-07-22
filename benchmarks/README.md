@@ -1,5 +1,53 @@
 # pg_eddy Benchmark Results
 
+## IVM write overhead (2026-07-22)
+
+Measured against a release package with PostgreSQL 18.4 and the pinned
+`MetroTraffic/pg-trickle` v0.82.0 fork. All runs include pg_eddy's typed mirror
+write. The graph-view runs compare trigger CDC with the shared semantic-WAL
+connector (`decode => true`).
+
+| Configuration | Latency | Total (2,000 rows) |
+|---|---:|---:|
+| Typed mirror, no graph view | 77.77 us/row | 0.156 s |
+| Trigger CDC graph view | 106.16 us/row | 0.212 s |
+| Semantic-WAL graph view | 75.67 us/row | 0.151 s |
+| Trigger incremental overhead | +28.39 us/row | +36.5% |
+| Semantic-WAL incremental overhead | -2.10 us/row | -2.7% (noise) |
+
+Semantic WAL reduced total write latency by 1.40x versus trigger CDC. Its
+incremental overhead was below measurement noise.
+
+Run against a release build:
+
+```bash
+rm -rf tmp_check/t_run_ivm_write_benchmark_ivm_write_bench_data
+PG_REGRESS='/usr/lib/postgresql/18/lib/pgxs/src/test/regress/pg_regress' \
+PERL5LIB='/usr/lib/postgresql/18/lib/pgxs/src/test/perl' \
+PATH="/usr/lib/postgresql/18/bin:${PATH}" \
+perl benchmarks/run_ivm_write_benchmark.pl
+```
+
+Set `IVM_BENCH_ROWS`, `IVM_BENCH_WARMUP_ROWS`, or
+`IVM_MAX_TRIGGER_OVERHEAD_US` to change the scale or enforce a trigger ceiling.
+Use `IVM_MAX_WAL_OVERHEAD_US`, `IVM_MIN_WAL_SPEEDUP`, and `IVM_BENCH_OUTPUT`
+for semantic-WAL gates and a durable report file.
+
+## IVM release LDBC gate (2026-07-22)
+
+Release package on PostgreSQL 18.4, compared with Apache AGE 1.8.0-rc0 at
+1,000 nodes / 5,000 edges:
+
+| Benchmark | pg_eddy | AGE | Ratio | Gate |
+|---|---:|---:|---:|---|
+| Node insert | 5,047 nodes/s | 11,299 nodes/s | 0.45x | Informational |
+| Edge load | 7,696 edges/s | 812 edges/s | Different APIs | Informational |
+| IS-1: indexed node lookup | 9.51 ms | 8.33 ms | 1.14x | **PASS** (at most 2x AGE) |
+| IS-3: one-hop expand | 15.26 ms | 53.46 ms | 0.29x | **PASS** (3.50x faster) |
+
+Both required storage/executor regression gates pass after adding transactional
+typed mirrors and graph-view mutation synchronization.
+
 This file records the AGE benchmark baseline from v0.5.1.
 It is the **gate** for proceeding to the Cypher query engine (Phase 5 / v0.6.0).
 

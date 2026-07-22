@@ -48,6 +48,7 @@ pub fn clear_prop_index_cache() {
 // ---------------------------------------------------------------------------
 
 /// Return true if a property index exists for `(label_id, key_id)`.
+#[cfg(not(feature = "pg_test"))]
 pub fn has_property_index(label_id: i32, key_id: i32) -> bool {
     // We need to join label/key registries to check by id.
     // Efficient: the catalog table has a UNIQUE(label_name, prop_name) and we
@@ -114,7 +115,10 @@ pub fn count_index_entries(label_id: i32, key_id: i32) -> i64 {
 /// If an index already exists for this pair, this is a no-op (idempotent).
 /// Returns the `index_id` of the new (or existing) catalog entry.
 pub fn create_property_index(label_name: &str, prop_name: &str) -> i32 {
-    use crate::catalog::labels::{ensure_label, ensure_prop_key, prop_key_name};
+    use crate::catalog::labels::{ensure_label, ensure_prop_key};
+    #[cfg(not(feature = "pg_test"))]
+    use crate::catalog::labels::prop_key_name;
+    #[cfg(not(feature = "pg_test"))]
     use crate::storage::prop_store;
 
     // Upsert into catalog.

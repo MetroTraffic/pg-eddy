@@ -1,0 +1,4 @@
+[target.'cfg(target_os="linux")']
+# PostgreSQL provides these symbols when it loads the extension. Standalone
+# Rust test executables must defer their resolution until then.
+rustflags = ["-Clink-arg=-Wl,--unresolved-symbols=ignore-all"]

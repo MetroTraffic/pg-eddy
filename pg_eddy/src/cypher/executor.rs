@@ -485,10 +485,8 @@ fn parse_offset(s: &str) -> Option<i32> {
     if s == "Z" || s == "z" { return Some(0); }
     let (sign, rest) = if let Some(r) = s.strip_prefix('+') {
         (1i32, r)
-    } else if let Some(r) = s.strip_prefix('-') {
-        (-1i32, r)
     } else {
-        return None;
+        (-1i32, s.strip_prefix('-')?)
     };
     // HH:MM:SS or HH:MM or HHMM or HH
     let (h, m, s) = if rest.len() == 8 && rest.as_bytes()[2] == b':' && rest.as_bytes()[5] == b':' {
@@ -7436,7 +7434,7 @@ fn create_pattern_in_row(
     buf: &mut CatalogWriteBuffer,
 ) -> Result<(), ExecError> {
     use crate::catalog::labels::{ensure_label, ensure_prop_key, ensure_rel_type, next_node_id, next_edge_id};
-    use crate::storage::{prop_store, node_store, edge_store};
+    use crate::storage::prop_store;
 
     let mut last_node_id: Option<i64> = None;
     // Track whether the Relationship arm pre-created the destination node (anonymous or named).
@@ -7492,7 +7490,12 @@ fn create_pattern_in_row(
                 let node_id = next_node_id();
                 let (nloc_pg, nloc_off) = unsafe {
                     let rel = crate::open_nodes_relation();
-                    let loc = node_store::insert_node(rel, node_id, &label_ids, &prop_bytes);
+                    let loc = crate::storage::mutation::insert_node(
+                        rel,
+                        node_id,
+                        &label_ids,
+                        &prop_bytes,
+                    );
                     pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                     loc
                 };
@@ -7561,7 +7564,12 @@ fn create_pattern_in_row(
                                 let nid = next_node_id();
                                 let (nloc_pg, nloc_off) = unsafe {
                                     let rel = crate::open_nodes_relation();
-                                    let loc = node_store::insert_node(rel, nid, &label_ids, &prop_bytes);
+                                    let loc = crate::storage::mutation::insert_node(
+                                        rel,
+                                        nid,
+                                        &label_ids,
+                                        &prop_bytes,
+                                    );
                                     pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                                     loc
                                 };
@@ -7593,7 +7601,12 @@ fn create_pattern_in_row(
                             let nid = next_node_id();
                             let (nloc_pg, nloc_off) = unsafe {
                                 let rel = crate::open_nodes_relation();
-                                let loc = node_store::insert_node(rel, nid, &label_ids, &prop_bytes);
+                                let loc = crate::storage::mutation::insert_node(
+                                    rel,
+                                    nid,
+                                    &label_ids,
+                                    &prop_bytes,
+                                );
                                 pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                                 loc
                             };
@@ -7636,7 +7649,15 @@ fn create_pattern_in_row(
                 unsafe {
                     let node_rel = crate::open_nodes_relation();
                     let edge_rel = crate::open_edges_relation();
-                    edge_store::insert_edge(node_rel, edge_rel, edge_id, type_id, actual_src, actual_dst, &prop_bytes);
+                    crate::storage::mutation::insert_edge(
+                        node_rel,
+                        edge_rel,
+                        edge_id,
+                        type_id,
+                        actual_src,
+                        actual_dst,
+                        &prop_bytes,
+                    );
                     pgrx::pg_sys::table_close(edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                     pgrx::pg_sys::table_close(node_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                 }
@@ -7736,7 +7757,11 @@ fn exec_set_prop(
                         }).unwrap_or_default();
                         unsafe {
                             let edge_rel = crate::open_edges_relation();
-                            crate::storage::edge_store::update_edge_props(edge_rel, edge_id, &new_bytes);
+                            crate::storage::mutation::update_edge_props(
+                                edge_rel,
+                                edge_id,
+                                &new_bytes,
+                            );
                             pgrx::pg_sys::table_close(edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                         }
                         // Update in-memory row value.
@@ -7772,7 +7797,12 @@ fn exec_set_prop(
                     }).unwrap_or_default();
                     unsafe {
                         let rel = crate::open_nodes_relation();
-                        node_store::update_node(rel, node_id, &rec.label_ids, &new_bytes);
+                        crate::storage::mutation::update_node(
+                            rel,
+                            node_id,
+                            &rec.label_ids,
+                            &new_bytes,
+                        );
                         pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                     }
                     // Maintain property value index.
@@ -7812,7 +7842,11 @@ fn exec_set_prop(
                         let edge_id = *edge_id;
                         unsafe {
                             let edge_rel = crate::open_edges_relation();
-                            crate::storage::edge_store::update_edge_props(edge_rel, edge_id, &new_bytes);
+                            crate::storage::mutation::update_edge_props(
+                                edge_rel,
+                                edge_id,
+                                &new_bytes,
+                            );
                             pgrx::pg_sys::table_close(edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                         }
                         if let Some(Value::Edge { properties, .. }) = row.get_mut(var) {
@@ -7823,7 +7857,12 @@ fn exec_set_prop(
                         let rec = load_node(node_id)?;
                         unsafe {
                             let rel = crate::open_nodes_relation();
-                            node_store::update_node(rel, node_id, &rec.label_ids, &new_bytes);
+                            crate::storage::mutation::update_node(
+                                rel,
+                                node_id,
+                                &rec.label_ids,
+                                &new_bytes,
+                            );
                             pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                         }
                         // Maintain property value index.
@@ -7864,7 +7903,11 @@ fn exec_set_prop(
                         }).unwrap_or_default();
                         unsafe {
                             let edge_rel = crate::open_edges_relation();
-                            crate::storage::edge_store::update_edge_props(edge_rel, edge_id, &new_bytes);
+                            crate::storage::mutation::update_edge_props(
+                                edge_rel,
+                                edge_id,
+                                &new_bytes,
+                            );
                             pgrx::pg_sys::table_close(edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                         }
                         if let Some(Value::Edge { properties, .. }) = row.get_mut(var) {
@@ -7900,7 +7943,12 @@ fn exec_set_prop(
                         }).unwrap_or_default();
                         unsafe {
                             let rel = crate::open_nodes_relation();
-                            node_store::update_node(rel, node_id, &rec.label_ids, &new_bytes);
+                            crate::storage::mutation::update_node(
+                                rel,
+                                node_id,
+                                &rec.label_ids,
+                                &new_bytes,
+                            );
                             pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                         }
                         // Maintain property value index.
@@ -7945,7 +7993,12 @@ fn exec_set_prop(
                     }
                     unsafe {
                         let rel = crate::open_nodes_relation();
-                        node_store::update_node(rel, node_id, &label_ids, &rec.prop_bytes);
+                        crate::storage::mutation::update_node(
+                            rel,
+                            node_id,
+                            &label_ids,
+                            &rec.prop_bytes,
+                        );
                         pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                     }
                     // Update in-memory node labels.
@@ -8005,7 +8058,11 @@ fn exec_remove_prop(
                         }).unwrap_or_default();
                         unsafe {
                             let edge_rel = crate::open_edges_relation();
-                            crate::storage::edge_store::update_edge_props(edge_rel, edge_id, &new_bytes);
+                            crate::storage::mutation::update_edge_props(
+                                edge_rel,
+                                edge_id,
+                                &new_bytes,
+                            );
                             pgrx::pg_sys::table_close(edge_rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                         }
                         if let Some(Value::Edge { properties, .. }) = row.get_mut(var) {
@@ -8030,7 +8087,12 @@ fn exec_remove_prop(
                     }).unwrap_or_default();
                     unsafe {
                         let rel = crate::open_nodes_relation();
-                        node_store::update_node(rel, node_id, &rec.label_ids, &new_bytes);
+                        crate::storage::mutation::update_node(
+                            rel,
+                            node_id,
+                            &rec.label_ids,
+                            &new_bytes,
+                        );
                         pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                     }
                     if let Some(Value::Node { properties, .. }) = row.get_mut(var) {
@@ -8064,7 +8126,12 @@ fn exec_remove_prop(
                     }
                     unsafe {
                         let rel = crate::open_nodes_relation();
-                        node_store::update_node(rel, node_id, &label_ids, &rec.prop_bytes);
+                        crate::storage::mutation::update_node(
+                            rel,
+                            node_id,
+                            &label_ids,
+                            &rec.prop_bytes,
+                        );
                         pgrx::pg_sys::table_close(rel, pgrx::pg_sys::NoLock as pgrx::pg_sys::LOCKMODE);
                     }
                     if let Some(Value::Node { labels, .. }) = row.get_mut(var) {
@@ -8086,8 +8153,8 @@ fn exec_delete_nodes(
     params: &HashMap<String, serde_json::Value>,
 ) -> Result<Vec<Row>, ExecError> {
     use crate::catalog::labels::next_edge_id;
-    use crate::storage::edge_store::{Direction, adjacency_follow, delete_edge};
-    use crate::storage::node_store::delete_node_by_id;
+    use crate::storage::edge_store::{Direction, adjacency_follow};
+    use crate::storage::mutation::{delete_edge, delete_node_by_id};
     use std::collections::HashSet;
 
     let input_rows = execute(input, params)?;

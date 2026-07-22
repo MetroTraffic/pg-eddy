@@ -422,7 +422,7 @@ pub unsafe fn update_edge_props(
                 // Found the edge. Update prop bytes in-place.
                 let iid = pg_sys::PageGetItemId(page, off);
                 let item_len = (*iid).lp_len() as usize;
-                let item = pg_sys::PageGetItem(page as *const _, iid) as *mut u8;
+                let item = pg_sys::PageGetItem(page as *const _, iid);
                 let data = std::slice::from_raw_parts_mut(item.add(hdr_size), item_len - hdr_size);
 
                 // Ensure new prop bytes fit in the reserved space.
@@ -527,6 +527,41 @@ pub unsafe fn count_edges(
         pg_sys::UnlockReleaseBuffer(buf);
     }
     count
+}
+
+/// Return every visible edge in physical scan order.
+pub unsafe fn scan_all_edges(
+    edge_rel: pg_sys::Relation,
+    _snapshot: pg_sys::Snapshot,
+) -> Vec<EdgeRecord> {
+    let nblocks = unsafe {
+        pg_sys::RelationGetNumberOfBlocksInFork(
+            edge_rel,
+            pg_sys::ForkNumber::MAIN_FORKNUM,
+        )
+    };
+    let mut records = Vec::new();
+    for blkno in 0..nblocks {
+        let buf = unsafe {
+            pg_sys::ReadBufferExtended(
+                edge_rel,
+                pg_sys::ForkNumber::MAIN_FORKNUM,
+                blkno,
+                pg_sys::ReadBufferMode::RBM_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        unsafe { pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as i32) };
+        let page = unsafe { pg_sys::BufferGetPage(buf) };
+        let max_off = unsafe { pg_sys::PageGetMaxOffsetNumber(page as *const _) };
+        for offset in pg_sys::FirstOffsetNumber..=max_off {
+            if let Some(record) = unsafe { read_edge_at_offset(page, blkno, offset) } {
+                records.push(record);
+            }
+        }
+        unsafe { pg_sys::UnlockReleaseBuffer(buf) };
+    }
+    records
 }
 
 // ---------------------------------------------------------------------------
@@ -745,7 +780,7 @@ unsafe fn read_adj_header(page: pg_sys::Page, idx: usize) -> NodeAdjHeader {
 /// # Safety
 /// `page` must be an exclusively-locked node page.
 unsafe fn write_adj_header(page: pg_sys::Page, idx: usize, hdr: &NodeAdjHeader) {
-    let special = pg_sys::PageGetSpecialPointer(page) as *mut u8;
+    let special = pg_sys::PageGetSpecialPointer(page);
     let offset = idx * ADJ_HEADER_BYTES;
     std::ptr::copy_nonoverlapping(hdr.as_bytes().as_ptr(), special.add(offset), ADJ_HEADER_BYTES);
 }

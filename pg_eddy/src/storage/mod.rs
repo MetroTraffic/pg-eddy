@@ -1,7 +1,11 @@
 pub mod am;
+pub mod cdc_message;
+pub mod cdc_protocol;
 pub mod edge_store;
+pub mod mutation;
 pub mod node_store;
 pub mod page;
 pub mod prop_store;
 pub mod vacuum;
 pub mod wal;
+pub mod wal_decode;

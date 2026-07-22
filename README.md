@@ -76,6 +76,86 @@ CREATE EXTENSION pg_eddy;
 SELECT pg_eddy.health_check();  -- Should return 'pg_eddy OK'
 ```
 
+## Incremental Graph Views
+
+Graph views require the exact optional dependency
+`MetroTraffic/pg-trickle` (extension version `0.82.0`). The exact pinned git
+revision is reported by `graph_view_dependency_info()`. Configure and create
+both extensions:
+
+```ini
+shared_preload_libraries = 'pg_eddy,pg_trickle'
+```
+
+```sql
+CREATE EXTENSION pg_trickle;
+CREATE EXTENSION pg_eddy;
+
+SELECT create_graph_view(
+    name         => 'friends_of_alice',
+    cypher       => 'MATCH (a:Person {name: $name})-[:KNOWS]->(b:Person)
+                     RETURN b.name AS friend',
+    params       => '{"name":"Alice"}'::jsonb,
+    schedule     => '1s',
+    refresh_mode => 'DIFFERENTIAL'
+);
+
+SELECT * FROM _pg_eddy_views.friends_of_alice;
+SELECT * FROM list_graph_views();
+SELECT refresh_graph_view('friends_of_alice');
+SELECT drop_graph_view('friends_of_alice');
+```
+
+The supported compiler surface is deterministic, fixed-length, read-only
+Cypher: one or more mandatory `MATCH` clauses followed by `RETURN`, plus
+compatible `UNION`/`UNION ALL` branches. Labels, relationship types, constant
+or parameterized pattern properties, predicates, ordering, `SKIP`, `LIMIT`,
+and entity projection functions are supported. Unsupported constructs fail
+closed with `PE601`; graph views never silently use different semantics.
+
+Refresh modes are `AUTO`, `FULL`, `DIFFERENTIAL`, and `IMMEDIATE`.
+The graph store's custom AM remains authoritative; transactional typed heap
+mirrors expose node and edge rows to pg-trickle. By default graph views use
+trigger CDC. Deferred views may set `decode => true` to consume pg_eddy's
+semantic logical-message stream through one shared replication slot per
+database, avoiding row-trigger overhead. `decode => true` is asynchronous and
+therefore rejects `IMMEDIATE` and constraint views.
+
+The connector uses durable peek/apply/advance processing. Inspect it with
+`pgtrickle.pgt_cdc_connector_status`, pump it manually with
+`pgtrickle.poll_pg_eddy_connector()`, and retry a safely restored fallback with
+`pgtrickle.retry_pg_eddy_connector()`. A missing or repeatedly failing slot
+restores trigger capture and marks downstream views for reinitialization before
+the shared slot is retried.
+
+Constraint views use `IMMEDIATE` mode and reject a transaction when the final
+view contains any row:
+
+```sql
+SELECT create_graph_view(
+    name         => 'persons_without_email',
+    cypher       => 'MATCH (p:Person) WHERE p.email IS NULL RETURN p AS offender',
+    refresh_mode => 'IMMEDIATE',
+    constraint   => true
+);
+```
+
+Constraint checks are deferred until transaction end, so a temporarily invalid
+row may be repaired in the same transaction. A remaining violation raises
+SQLSTATE `23514` with stable code `PE607` and rolls back the graph mutation.
+
+For dependency diagnostics:
+
+```sql
+SELECT graph_view_dependency_info();
+```
+
+Graph-view output columns are JSONB projections in `_pg_eddy_views`. Internal
+`__pgeddy_*` relations are implementation details used by pg-trickle's DAG.
+Projection views grant `SELECT` to `PUBLIC` by design, matching pg_eddy's
+database-wide graph API. Deployments that require narrower access should revoke
+that grant after creation and grant it to an application role instead.
+
 ## Quick Start
 
 ### Create Nodes

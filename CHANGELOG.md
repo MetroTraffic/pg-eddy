@@ -43,6 +43,38 @@ For future plans and upcoming features, see [plans/implementation_plan.md](plans
 
 ## [Unreleased]
 
+### Incremental graph views
+
+- Added transactional typed node and edge mirrors while retaining the custom
+  table AM as authoritative storage.
+- Added `create_graph_view`, `drop_graph_view`, `list_graph_views`, and
+  `refresh_graph_view`, backed by the exact pinned MetroTraffic pg-trickle
+  v0.82.0 fork. Trigger CDC remains the default.
+- Added DIFFERENTIAL and IMMEDIATE maintenance, deferred constraint views with
+  stable `PE607` violations, graph-view DAG propagation, JSONB public
+  projections, and `0.11.0 -> 0.12.0` mirror backfill.
+- Added a fail-closed read-only Cypher-to-SQL compiler supporting fixed-length
+  mandatory MATCH chains and compatible UNION branches.
+- Added serial TAP coverage for lifecycle, rollback, upgrade, all mutation
+  routes, OLD-row CDC, differential frontiers, constraints, and DAG scheduling.
+- Added an IVM write benchmark. One DIFFERENTIAL graph view adds 33.43 us/row
+  over the always-on typed mirror in the 2,000-row release benchmark.
+- Added versioned semantic WAL frames, transactional logical-message emission,
+  the publication-free `pg_eddy` output plugin, and `decode => true` graph
+  views backed by pg-trickle's shared database-scoped connector.
+- Added durable peek/apply/advance cursoring, complete OLD/NEW node and edge
+  mapping, restart replay protection, graph-reset handling, trigger-covered
+  handoff, missing-slot fallback, operator retry, monitoring, and shared-slot
+  cleanup. The end-to-end connector gate passes 30 assertions.
+- At 2,000 rows, semantic WAL measured 75.67 us/row versus 106.16 us/row for
+  trigger CDC (1.40x lower total write latency); its incremental overhead was
+  below measurement noise versus 28.39 us/row for triggers.
+- Passed the post-change release gates: 96 pgrx tests, 64 TAP assertions,
+  3880/3880 TCK scenarios, IS-1 at 1.14x AGE latency, and IS-3 at 3.50x faster
+  than AGE.
+- Added a configurable concurrent drift soak harness; its default duration is
+  72 hours (`IVM_SOAK_SECONDS=259200`).
+
 ---
 
 ## [0.28.0] — 2026-05-14 — Catalog Write Caches (OPT-7 and OPT-10)

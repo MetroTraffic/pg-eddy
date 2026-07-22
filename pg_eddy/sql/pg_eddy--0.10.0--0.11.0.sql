@@ -21,4 +21,4 @@ CREATE TABLE _pg_eddy.node_location (
 -- Backfill: scan existing nodes and populate the table.
 -- rebuild_node_location_index() is a new Rust SQL function added in v0.25.0.
 -- ---------------------------------------------------------------------------
-SELECT pg_eddy.rebuild_node_location_index();
+SELECT rebuild_node_location_index();

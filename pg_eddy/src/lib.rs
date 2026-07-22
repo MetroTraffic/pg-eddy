@@ -12,6 +12,7 @@ use pgrx::datum::DatumWithOid;
 mod catalog;
 mod cypher;
 mod error;
+mod ivm;
 mod storage;
 
 pgrx::pg_module_magic!();
@@ -19,7 +20,7 @@ pgrx::pg_module_magic!();
 // ---------------------------------------------------------------------------
 // Extension SQL — schemas, registry tables, AM objects, and SQL functions.
 // ---------------------------------------------------------------------------
-extension_sql_file!("../sql/pg_eddy--0.11.0.sql", name = "pg_eddy_schema", finalize);
+extension_sql_file!("../sql/pg_eddy--0.12.0.sql", name = "pg_eddy_schema", finalize);
 
 // ---------------------------------------------------------------------------
 // _PG_init  — runs at postmaster start (shared_preload_libraries)
@@ -73,7 +74,7 @@ fn create_node(labels: Vec<String>, properties: pgrx::JsonB) -> i64 {
     let (blkno, off) = unsafe {
         use pgrx::pg_sys;
         let rel = open_nodes_relation();
-        let loc = crate::storage::node_store::insert_node(rel, node_id, &label_ids, &prop_bytes);
+        let loc = crate::storage::mutation::insert_node(rel, node_id, &label_ids, &prop_bytes);
         pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
         loc
     };
@@ -272,7 +273,7 @@ fn create_edge(
         use pgrx::pg_sys;
         let node_rel = open_nodes_relation();
         let edge_rel = open_edges_relation();
-        crate::storage::edge_store::insert_edge(
+        crate::storage::mutation::insert_edge(
             node_rel, edge_rel, edge_id, type_id, source, target, &prop_bytes,
         );
         pg_sys::table_close(edge_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
@@ -338,7 +339,7 @@ fn delete_edge(rel_id: i64) -> bool {
     let found = unsafe {
         use pgrx::pg_sys;
         let edge_rel = open_edges_relation();
-        let f = crate::storage::edge_store::delete_edge(edge_rel, rel_id);
+        let f = crate::storage::mutation::delete_edge(edge_rel, rel_id);
         pg_sys::table_close(edge_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
         f
     };
@@ -635,7 +636,7 @@ fn update_node(node_id: i64, labels: Vec<String>, properties: pgrx::JsonB) -> bo
     let found = unsafe {
         use pgrx::pg_sys;
         let rel = open_nodes_relation();
-        let f = crate::storage::node_store::update_node(rel, node_id, &label_ids, &prop_bytes);
+        let f = crate::storage::mutation::update_node(rel, node_id, &label_ids, &prop_bytes);
         pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
         f
     };
@@ -670,7 +671,7 @@ fn delete_node(node_id: i64) -> bool {
     let found = unsafe {
         use pgrx::pg_sys;
         let rel = open_nodes_relation();
-        let f = crate::storage::node_store::delete_node_by_id(rel, node_id);
+        let f = crate::storage::mutation::delete_node_by_id(rel, node_id);
         pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
         f
     };
@@ -735,7 +736,7 @@ fn add_label(node_id: i64, label: &str) -> bool {
     let found = unsafe {
         use pgrx::pg_sys;
         let rel = open_nodes_relation();
-        let f = crate::storage::node_store::update_node(rel, node_id, &new_labels, &r.prop_bytes);
+        let f = crate::storage::mutation::update_node(rel, node_id, &new_labels, &r.prop_bytes);
         pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
         f
     };
@@ -795,7 +796,7 @@ fn remove_label(node_id: i64, label: &str) -> bool {
     let found = unsafe {
         use pgrx::pg_sys;
         let rel = open_nodes_relation();
-        let f = crate::storage::node_store::update_node(rel, node_id, &new_labels, &r.prop_bytes);
+        let f = crate::storage::mutation::update_node(rel, node_id, &new_labels, &r.prop_bytes);
         pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
         f
     };
@@ -845,7 +846,7 @@ fn detach_delete_node(node_id: i64) -> bool {
         use pgrx::pg_sys;
         let edge_rel = open_edges_relation();
         for eid in &all_edge_ids {
-            crate::storage::edge_store::delete_edge(edge_rel, *eid);
+            crate::storage::mutation::delete_edge(edge_rel, *eid);
         }
         pg_sys::table_close(edge_rel, pg_sys::NoLock as pg_sys::LOCKMODE);
     }
@@ -870,7 +871,7 @@ fn detach_delete_node(node_id: i64) -> bool {
     let found = unsafe {
         use pgrx::pg_sys;
         let rel = open_nodes_relation();
-        let f = crate::storage::node_store::delete_node_by_id(rel, node_id);
+        let f = crate::storage::mutation::delete_node_by_id(rel, node_id);
         pg_sys::table_close(rel, pg_sys::NoLock as pg_sys::LOCKMODE);
         f
     };
@@ -1182,6 +1183,15 @@ fn rebuild_node_location_index() -> i64 {
     locations.len() as i64
 }
 
+/// Rebuild the typed node/edge mirrors consumed by trigger-based IVM.
+///
+/// Existing custom-AM rows remain authoritative. This function truncates the
+/// mirrors and repopulates them under the current transaction snapshot.
+#[pg_extern]
+fn rebuild_ivm_sources() -> i64 {
+    crate::ivm::mirror::rebuild()
+}
+
 /// List all registered property indexes.
 ///
 /// Returns one JSONB row per index: `{"label": "...", "prop": "..."}`.
@@ -1328,9 +1338,11 @@ fn is_write_only_plan(plan: &cypher::planner::LogicalPlan) -> bool {
 fn clear() {
     // 1. Truncate the catalog index tables (regular heap — TRUNCATE is fast).
     Spi::run(
-        "TRUNCATE _pg_eddy.label_index, _pg_eddy.edge_type_src, _pg_eddy.edge_type_dst, _pg_eddy.node_location",
+        "TRUNCATE _pg_eddy.label_index, _pg_eddy.edge_type_src, \
+         _pg_eddy.edge_type_dst, _pg_eddy.node_location",
     )
     .unwrap_or_else(|e| pgrx::error!("pg_eddy clear: catalog truncate failed: {e}"));
+    crate::ivm::mirror::clear();
 
     // 2. Reset ID sequences so subsequent inserts start from 1 again.
     Spi::run("ALTER SEQUENCE _pg_eddy.node_id_seq RESTART WITH 1")
@@ -1369,6 +1381,8 @@ fn clear() {
         pg_sys::RelationTruncate(edges_rel, 0);
         pg_sys::table_close(edges_rel, pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE);
     }
+
+    crate::storage::mutation::emit_graph_reset();
 }
 
 /// Return the logical execution plan for a Cypher query as text.
@@ -1472,6 +1486,53 @@ mod tests {
     }
 
     #[pg_test]
+    fn test_node_helper_keeps_ivm_mirror_in_sync() {
+        let node_id = crate::create_node(
+            vec!["IvmPerson".into()],
+            pgrx::JsonB(serde_json::json!({"name": "Alice", "age": 30})),
+        );
+
+        let mirrored: pgrx::JsonB = Spi::get_one_with_args(
+            "SELECT jsonb_build_object( \
+                 'labels', to_jsonb(labels), 'properties', properties \
+             ) FROM _pg_eddy.ivm_nodes WHERE node_id = $1",
+            &[node_id.into()],
+        )
+        .expect("mirror query should succeed")
+        .expect("node mirror row should exist");
+        assert_eq!(mirrored.0["labels"], serde_json::json!(["IvmPerson"]));
+        assert_eq!(mirrored.0["properties"]["name"], serde_json::json!("Alice"));
+
+        assert!(crate::update_node(
+            node_id,
+            vec!["IvmPerson".into(), "IvmEmployee".into()],
+            pgrx::JsonB(serde_json::json!({"name": "Alice", "age": 31})),
+        ));
+        let updated: pgrx::JsonB = Spi::get_one_with_args(
+            "SELECT jsonb_build_object( \
+                 'labels', to_jsonb(labels), 'properties', properties \
+             ) FROM _pg_eddy.ivm_nodes WHERE node_id = $1",
+            &[node_id.into()],
+        )
+        .expect("updated mirror query should succeed")
+        .expect("updated node mirror row should exist");
+        assert_eq!(
+            updated.0["labels"],
+            serde_json::json!(["IvmPerson", "IvmEmployee"])
+        );
+        assert_eq!(updated.0["properties"]["age"], serde_json::json!(31));
+
+        assert!(crate::delete_node(node_id));
+        let remaining: i64 = Spi::get_one_with_args(
+            "SELECT count(*) FROM _pg_eddy.ivm_nodes WHERE node_id = $1",
+            &[node_id.into()],
+        )
+        .expect("mirror count should succeed")
+        .unwrap_or_default();
+        assert_eq!(remaining, 0);
+    }
+
+    #[pg_test]
     fn test_node_count() {
         let before = crate::node_count();
         crate::create_node(vec![], pgrx::JsonB(serde_json::json!({})));
@@ -1508,6 +1569,41 @@ mod tests {
         assert_eq!(json["source_node_id"], serde_json::json!(src));
         assert_eq!(json["target_node_id"], serde_json::json!(tgt));
         assert_eq!(json["properties"]["since"], serde_json::json!(2020));
+    }
+
+    #[pg_test]
+    fn test_edge_helper_keeps_ivm_mirror_in_sync() {
+        let source = crate::create_node(vec![], pgrx::JsonB(serde_json::json!({})));
+        let target = crate::create_node(vec![], pgrx::JsonB(serde_json::json!({})));
+        let rel_id = crate::create_edge(
+            source,
+            target,
+            "IVM_LINK",
+            pgrx::JsonB(serde_json::json!({"weight": 7})),
+        );
+
+        let mirrored: pgrx::JsonB = Spi::get_one_with_args(
+            "SELECT jsonb_build_object( \
+                 'type', rel_type, 'source', source_node_id, \
+                 'target', target_node_id, 'properties', properties \
+             ) FROM _pg_eddy.ivm_edges WHERE rel_id = $1",
+            &[rel_id.into()],
+        )
+        .expect("edge mirror query should succeed")
+        .expect("edge mirror row should exist");
+        assert_eq!(mirrored.0["type"], serde_json::json!("IVM_LINK"));
+        assert_eq!(mirrored.0["source"], serde_json::json!(source));
+        assert_eq!(mirrored.0["target"], serde_json::json!(target));
+        assert_eq!(mirrored.0["properties"]["weight"], serde_json::json!(7));
+
+        assert!(crate::delete_edge(rel_id));
+        let remaining: i64 = Spi::get_one_with_args(
+            "SELECT count(*) FROM _pg_eddy.ivm_edges WHERE rel_id = $1",
+            &[rel_id.into()],
+        )
+        .expect("edge mirror count should succeed")
+        .unwrap_or_default();
+        assert_eq!(remaining, 0);
     }
 
     #[pg_test]
@@ -2054,51 +2150,6 @@ mod tests {
         // CASE WHEN with not and rand() > 0.5
         let q4 = parse("WITH CASE WHEN NOT (rand() > 0.5) THEN 1 ELSE 2 END AS n RETURN n");
         assert!(q4.is_ok(), "parse failed: {:?}", q4);
-        // Full Quantifier9[3]-like query with x < 7 predicate
-        let full = "UNWIND [{list: [2], fixed: true}, {list: [1, 2, 3, 4, 5, 6, 7, 8, 9], fixed: false}] AS input \
-            WITH CASE WHEN input.fixed THEN input.list ELSE null END AS fixedList, \
-                 CASE WHEN NOT input.fixed THEN input.list ELSE [1] END AS inputList \
-            UNWIND inputList AS x \
-            WITH fixedList, inputList, x, [ y IN inputList WHERE rand() > 0.5 | y] AS list \
-            WITH fixedList, inputList, CASE WHEN rand() < 0.5 THEN reverse(list) ELSE list END + x AS list \
-            WITH coalesce(fixedList, list) AS list \
-            WITH single(x IN list WHERE x < 7) = (size([x IN list WHERE x < 7 | x]) = 1) AS result, count(*) AS cnt \
-            RETURN result";
-        // Full Quantifier10[4]-like query (3x repetition) with x < 7 predicate
-        let full3 = "UNWIND [{list: [2], fixed: true}, {list: [1, 2, 3, 4, 5, 6, 7, 8, 9], fixed: false}] AS input \
-            WITH CASE WHEN input.fixed THEN input.list ELSE null END AS fixedList, \
-                 CASE WHEN NOT input.fixed THEN input.list ELSE [1] END AS inputList \
-            UNWIND inputList AS x \
-            WITH fixedList, inputList, x, [ y IN inputList WHERE rand() > 0.5 | y] AS list \
-            WITH fixedList, inputList, CASE WHEN rand() < 0.5 THEN reverse(list) ELSE list END + x AS list \
-            UNWIND inputList AS x \
-            WITH fixedList, inputList, x, [ y IN inputList WHERE rand() > 0.5 | y] AS list \
-            WITH fixedList, inputList, CASE WHEN rand() < 0.5 THEN reverse(list) ELSE list END + x AS list \
-            UNWIND inputList AS x \
-            WITH fixedList, inputList, x, [ y IN inputList WHERE rand() > 0.5 | y] AS list \
-            WITH fixedList, inputList, CASE WHEN rand() < 0.5 THEN reverse(list) ELSE list END + x AS list \
-            WITH coalesce(fixedList, list) AS list \
-            WITH single(x IN list WHERE x < 7) = (size([x IN list WHERE x < 7 | x]) = 1) AS result, count(*) AS cnt \
-            RETURN result";
-        // Exact Quantifier10[4] query with x < 7 predicate
-        let exact = r#"UNWIND [{list: [2], fixed: true},
-              {list: [6], fixed: true},
-              {list: [7], fixed: true},
-              {list: [1, 2, 3, 4, 5, 6, 7, 8, 9], fixed: false}] AS input
-      WITH CASE WHEN input.fixed THEN input.list ELSE null END AS fixedList,
-           CASE WHEN NOT input.fixed THEN input.list ELSE [1] END AS inputList
-      UNWIND inputList AS x
-      WITH fixedList, inputList, x, [ y IN inputList WHERE rand() > 0.5 | y] AS list
-      WITH fixedList, inputList, CASE WHEN rand() < 0.5 THEN reverse(list) ELSE list END + x AS list
-      UNWIND inputList AS x
-      WITH fixedList, inputList, x, [ y IN inputList WHERE rand() > 0.5 | y] AS list
-      WITH fixedList, inputList, CASE WHEN rand() < 0.5 THEN reverse(list) ELSE list END + x AS list
-      UNWIND inputList AS x
-      WITH fixedList, inputList, x, [ y IN inputList WHERE rand() > 0.5 | y] AS list
-      WITH fixedList, inputList, CASE WHEN rand() < 0.5 THEN reverse(list) ELSE list END + x AS list
-      WITH coalesce(fixedList, list) AS list
-      WITH single(x IN list WHERE x < 7) = (size([x IN list WHERE x < 7 | x]) = 1) AS result, count(*) AS cnt
-      RETURN result"#;
         // Exact Quantifier10[4] from feature file (with leading spaces as in actual docstring)
         let exact_with_spaces = "UNWIND [{list: [2], fixed: true},\n              {list: [6], fixed: true},\n              {list: [7], fixed: true},\n              {list: [1, 2, 3, 4, 5, 6, 7, 8, 9], fixed: false}] AS input\n      WITH CASE WHEN input.fixed THEN input.list ELSE null END AS fixedList,\n           CASE WHEN NOT input.fixed THEN input.list ELSE [1] END AS inputList\n      UNWIND inputList AS x\n      WITH fixedList, inputList, x, [ y IN inputList WHERE rand() > 0.5 | y] AS list\n      WITH fixedList, inputList, CASE WHEN rand() < 0.5 THEN reverse(list) ELSE list END + x AS list\n      UNWIND inputList AS x\n      WITH fixedList, inputList, x, [ y IN inputList WHERE rand() > 0.5 | y] AS list\n      WITH fixedList, inputList, CASE WHEN rand() < 0.5 THEN reverse(list) ELSE list END + x AS list\n      UNWIND inputList AS x\n      WITH fixedList, inputList, x, [ y IN inputList WHERE rand() > 0.5 | y] AS list\n      WITH fixedList, inputList, CASE WHEN rand() < 0.5 THEN reverse(list) ELSE list END + x AS list\n      WITH coalesce(fixedList, list) AS list\n      WITH single(x IN list WHERE x = 2) = (size([x IN list WHERE x = 2 | x]) = 1) AS result, count(*) AS cnt\n      RETURN result";
         // Check length and character at 1065
@@ -2141,6 +2192,69 @@ mod tests {
             "SELECT count(*) FROM cypher('MATCH (n:CypherSetTest) WHERE n.x = 99 RETURN n', NULL::jsonb)"
         ).unwrap().unwrap_or(0);
         assert!(count >= 1, "SET did not update property, count={count}");
+    }
+
+    #[pg_test]
+    fn test_cypher_writes_keep_ivm_mirrors_in_sync() {
+        Spi::run(
+            "SELECT * FROM cypher( \
+                 'CREATE (:IvmCypherA {value: 1})-[:IVM_CYPHER_REL {weight: 2}]->(:IvmCypherB)', \
+                 NULL::jsonb \
+             )",
+        )
+        .expect("Cypher CREATE should succeed");
+
+        let node_count: i64 = Spi::get_one(
+            "SELECT count(*) FROM _pg_eddy.ivm_nodes \
+             WHERE labels @> ARRAY['IvmCypherA']::text[] \
+                OR labels @> ARRAY['IvmCypherB']::text[]",
+        )
+        .expect("node mirror count should succeed")
+        .unwrap_or_default();
+        assert_eq!(node_count, 2);
+
+        let edge_count: i64 = Spi::get_one(
+            "SELECT count(*) FROM _pg_eddy.ivm_edges \
+             WHERE rel_type = 'IVM_CYPHER_REL' AND properties->'weight' = '2'::jsonb",
+        )
+        .expect("edge mirror count should succeed")
+        .unwrap_or_default();
+        assert_eq!(edge_count, 1);
+
+        Spi::run(
+            "SELECT * FROM cypher( \
+                 'MATCH (n:IvmCypherA) SET n.value = 9', NULL::jsonb \
+             )",
+        )
+        .expect("Cypher SET should succeed");
+        let updated: i64 = Spi::get_one(
+            "SELECT count(*) FROM _pg_eddy.ivm_nodes \
+             WHERE labels @> ARRAY['IvmCypherA']::text[] \
+               AND properties->'value' = '9'::jsonb",
+        )
+        .expect("updated mirror count should succeed")
+        .unwrap_or_default();
+        assert_eq!(updated, 1);
+
+        Spi::run(
+            "SELECT * FROM cypher( \
+                 'MATCH (n:IvmCypherA) DETACH DELETE n', NULL::jsonb \
+             )",
+        )
+        .expect("Cypher DETACH DELETE should succeed");
+        let deleted_nodes: i64 = Spi::get_one(
+            "SELECT count(*) FROM _pg_eddy.ivm_nodes \
+             WHERE labels @> ARRAY['IvmCypherA']::text[]",
+        )
+        .expect("deleted mirror count should succeed")
+        .unwrap_or_default();
+        let deleted_edges: i64 = Spi::get_one(
+            "SELECT count(*) FROM _pg_eddy.ivm_edges WHERE rel_type = 'IVM_CYPHER_REL'",
+        )
+        .expect("deleted edge mirror count should succeed")
+        .unwrap_or_default();
+        assert_eq!(deleted_nodes, 0);
+        assert_eq!(deleted_edges, 0);
     }
 
     #[pg_test]

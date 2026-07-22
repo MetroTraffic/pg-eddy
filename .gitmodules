@@ -1,3 +1,6 @@
 [submodule "vendor/opencypher"]
 	path = vendor/opencypher
 	url = https://github.com/opencypher/openCypher
+[submodule "vendor/pg-trickle"]
+	path = vendor/pg-trickle
+	url = https://github.com/MetroTraffic/pg-trickle.git

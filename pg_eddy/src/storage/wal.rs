@@ -639,7 +639,7 @@ unsafe fn redo_adj_update(record: *mut pg_sys::XLogReaderState) {
 
     if action == pg_sys::XLogRedoAction::BLK_NEEDS_REDO {
         let page = unsafe { pg_sys::BufferGetPage(buf) };
-        let special = unsafe { pg_sys::PageGetSpecialPointer(page) as *mut u8 };
+                let special = unsafe { pg_sys::PageGetSpecialPointer(page) };
         let offset = adj_slot_idx * ADJ_HEADER_BYTES;
         unsafe {
             std::ptr::copy_nonoverlapping(new_adj_bytes.as_ptr(), special.add(offset), ADJ_HEADER_BYTES);

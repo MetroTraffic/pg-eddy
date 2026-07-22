@@ -171,7 +171,7 @@ pub unsafe fn insert_node(
     let adj_slot_idx = (off - pg_sys::FirstOffsetNumber) as u16;
     unsafe {
         let iid = pg_sys::PageGetItemId(page, off);
-        let item_in_page = pg_sys::PageGetItem(page as *const _, iid) as *mut u8;
+        let item_in_page = pg_sys::PageGetItem(page as *const _, iid);
         let hdr_size = size_of::<pg_sys::HeapTupleHeaderData>();
         let data_ptr = item_in_page.add(hdr_size);
         std::ptr::copy_nonoverlapping(
@@ -496,7 +496,7 @@ pub unsafe fn init_node_page(page: pg_sys::Page) {
             PD_NODE_SPECIAL_SIZE as pg_sys::Size,
         );
         // Zero out the pd_special area (adjacency headers — Region 1).
-        let special = pg_sys::PageGetSpecialPointer(page) as *mut u8;
+        let special = pg_sys::PageGetSpecialPointer(page);
         std::ptr::write_bytes(special, 0, PD_NODE_SPECIAL_SIZE);
     }
 }
@@ -688,7 +688,7 @@ pub unsafe fn compact_node_page(
 
     // Clear adj headers for each dead item (zero the pd_special entry).
     if !dead_adj_slots.is_empty() {
-        let special = pg_sys::PageGetSpecialPointer(page) as *mut u8;
+        let special = pg_sys::PageGetSpecialPointer(page);
         for &slot in dead_adj_slots {
             let offset = slot * crate::storage::page::ADJ_HEADER_BYTES;
             std::ptr::write_bytes(special.add(offset), 0, crate::storage::page::ADJ_HEADER_BYTES);
