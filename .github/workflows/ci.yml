@@ -17,6 +17,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Verify pinned pg-trickle fork
+        run: ./scripts/verify_pg_trickle.sh
 
       - name: Install PostgreSQL 18 dev headers
         run: |

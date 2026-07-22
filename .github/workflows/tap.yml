@@ -16,6 +16,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Verify pinned pg-trickle fork
+        run: ./scripts/verify_pg_trickle.sh
 
       - name: Install PostgreSQL 18 + dev headers
         run: |
@@ -59,6 +64,10 @@ jobs:
         working-directory: pg_eddy
         run: cargo pgrx package --pg-config /usr/lib/postgresql/18/bin/pg_config
 
+      - name: Build pinned pg-trickle extension
+        working-directory: vendor/pg-trickle
+        run: cargo pgrx package --pg-config /usr/lib/postgresql/18/bin/pg_config
+
       - name: Install extension into system PostgreSQL
         run: |
           # pgrx package puts files under target/release/pg_eddy-pg18/
@@ -67,6 +76,9 @@ jobs:
           sudo cp target/release/pg_eddy-pg18/usr/lib/postgresql/18/lib/pg_eddy.so "$PG_LIB/"
           sudo cp target/release/pg_eddy-pg18/usr/share/postgresql/18/extension/pg_eddy*.sql "$PG_EXT/"
           sudo cp target/release/pg_eddy-pg18/usr/share/postgresql/18/extension/pg_eddy.control "$PG_EXT/"
+          sudo cp vendor/pg-trickle/target/release/pg_trickle-pg18/usr/lib/postgresql/18/lib/pg_trickle.so "$PG_LIB/"
+          sudo cp vendor/pg-trickle/target/release/pg_trickle-pg18/usr/share/postgresql/18/extension/pg_trickle*.sql "$PG_EXT/"
+          sudo cp vendor/pg-trickle/target/release/pg_trickle-pg18/usr/share/postgresql/18/extension/pg_trickle.control "$PG_EXT/"
 
       - name: Run TAP tests
         env:
